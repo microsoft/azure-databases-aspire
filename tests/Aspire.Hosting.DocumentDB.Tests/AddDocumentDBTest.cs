@@ -3,6 +3,7 @@
 
 using System.Net.Sockets;
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
@@ -91,56 +92,56 @@ public class AddDocumentDBTests
         Assert.Equal("mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydatabase?authSource=admin&authMechanism=SCRAM-SHA-256", connectionStringResource.ConnectionStringExpression.ValueExpression);
     }
 
-    // [Fact]
-    // public async Task VerifyManifest()
-    // {
-    //     var appBuilder = DistributedApplication.CreateBuilder();
-    //     var DocumentDB = appBuilder.AddDocumentDB("DocumentDB");
-    //     var db = DocumentDB.AddDatabase("mydb");
+    [Fact]
+    public async Task VerifyManifest()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var DocumentDB = appBuilder.AddDocumentDB("DocumentDB");
+        var db = DocumentDB.AddDatabase("mydb");
 
-    //     var DocumentDBManifest = await ManifestUtils.GetManifest(DocumentDB.Resource);
-    //     var dbManifest = await ManifestUtils.GetManifest(db.Resource);
+        var DocumentDBManifest = await ManifestUtils.GetManifest(DocumentDB.Resource);
+        var dbManifest = await ManifestUtils.GetManifest(db.Resource);
 
-    //     var expectedManifest = $$"""
-    //         {
-    //           "type": "container.v0",
-    //           "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256",
-    //           "image": "{{DocumentDBContainerImageTags.Registry}}/{{DocumentDBContainerImageTags.Image}}:{{DocumentDBContainerImageTags.Tag}}",
-    //           "env": {
-    //             "USERNAME": "admin",
-    //             "PASSWORD": "{DocumentDB-password.value}"
-    //           },
-    //           "bindings": {
-    //             "tcp": {
-    //               "scheme": "tcp",
-    //               "protocol": "tcp",
-    //               "transport": "tcp",
-    //               "targetPort": 10260
-    //             }
-    //           }
-    //         }
-    //         """;
-    //     Assert.Equal(expectedManifest, DocumentDBManifest.ToString());
+        var expectedManifest = $$"""
+            {
+              "type": "container.v0",
+              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256",
+              "image": "{{DocumentDBContainerImageTags.Registry}}/{{DocumentDBContainerImageTags.Image}}:{{DocumentDBContainerImageTags.Tag}}",
+              "env": {
+                "USERNAME": "admin",
+                "PASSWORD": "{DocumentDB-password.value}"
+              },
+              "bindings": {
+                "tcp": {
+                  "scheme": "tcp",
+                  "protocol": "tcp",
+                  "transport": "tcp",
+                  "targetPort": 10260
+                }
+              }
+            }
+            """;
+        Assert.Equal(expectedManifest, DocumentDBManifest.ToString());
 
-    //     expectedManifest = """
-    //         {
-    //           "type": "value.v0",
-    //           "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256"
-    //         }
-    //         """;
-    //     Assert.Equal(expectedManifest, dbManifest.ToString());
-    // }
+        expectedManifest = """
+            {
+              "type": "value.v0",
+              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256"
+            }
+            """;
+        Assert.Equal(expectedManifest, dbManifest.ToString());
+    }
 
-    // [Fact]
-    // public void ThrowsWithIdenticalChildResourceNames()
-    // {
-    //     using var builder = TestDistributedApplicationBuilder.Create();
+    [Fact]
+    public void ThrowsWithIdenticalChildResourceNames()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
 
-    //     var db = builder.AddDocumentDB("DocumentDB1");
-    //     db.AddDatabase("db");
+        var db = builder.AddDocumentDB("DocumentDB1");
+        db.AddDatabase("db");
 
-    //     Assert.Throws<DistributedApplicationException>(() => db.AddDatabase("db"));
-    // }
+        Assert.Throws<DistributedApplicationException>(() => db.AddDatabase("db"));
+    }
 
     // [Fact]
     // public void ThrowsWithIdenticalChildResourceNamesDifferentParents()
