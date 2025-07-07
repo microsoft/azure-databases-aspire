@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>$(DefaultTargetFramework)</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Aspire.Hosting.DocumentDB\Aspire.Hosting.DocumentDB.csproj" />
+    <PackageReference Include="Aspire.MongoDB.Driver" />
+    <PackageReference Include="Aspire.Hosting.Testing" />
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
+    <PackageReference Include="xunit.abstractions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="$(RepoRoot)src\Aspire.Hosting.DocumentDB\DocumentDBContainerImageTags.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="DocumentDBFunctionalTests.cs" />
+  </ItemGroup>
+
+</Project>

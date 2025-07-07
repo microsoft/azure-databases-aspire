@@ -1,0 +1,10 @@
+<Project>
+  <!-- Test-specific packages are imported only for test projects. -->
+  <ItemGroup Condition=" '$(IsTestProject)' == 'true' ">
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.core"  />
+    <PackageReference Include="xunit.analyzers" />
+    <PackageReference Include="xunit.assert" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+</Project>
