@@ -143,50 +143,50 @@ public class AddDocumentDBTests
         Assert.Throws<DistributedApplicationException>(() => db.AddDatabase("db"));
     }
 
-    // [Fact]
-    // public void ThrowsWithIdenticalChildResourceNamesDifferentParents()
-    // {
-    //     using var builder = TestDistributedApplicationBuilder.Create();
+    [Fact]
+    public void ThrowsWithIdenticalChildResourceNamesDifferentParents()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
 
-    //     builder.AddDocumentDB("DocumentDB1")
-    //         .AddDatabase("db");
+        builder.AddDocumentDB("DocumentDB1")
+            .AddDatabase("db");
 
-    //     var db = builder.AddDocumentDB("DocumentDB2");
-    //     Assert.Throws<DistributedApplicationException>(() => db.AddDatabase("db"));
-    // }
+        var db = builder.AddDocumentDB("DocumentDB2");
+        Assert.Throws<DistributedApplicationException>(() => db.AddDatabase("db"));
+    }
 
-    // [Fact]
-    // public void CanAddDatabasesWithDifferentNamesOnSingleServer()
-    // {
-    //     using var builder = TestDistributedApplicationBuilder.Create();
+    [Fact]
+    public void CanAddDatabasesWithDifferentNamesOnSingleServer()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
 
-    //     var DocumentDB1 = builder.AddDocumentDB("DocumentDB1");
+        var DocumentDB1 = builder.AddDocumentDB("DocumentDB1");
 
-    //     var db1 = DocumentDB1.AddDatabase("db1", "customers1");
-    //     var db2 = DocumentDB1.AddDatabase("db2", "customers2");
+        var db1 = DocumentDB1.AddDatabase("db1", "customers1");
+        var db2 = DocumentDB1.AddDatabase("db2", "customers2");
 
-    //     Assert.Equal("customers1", db1.Resource.DatabaseName);
-    //     Assert.Equal("customers2", db2.Resource.DatabaseName);
+        Assert.Equal("customers1", db1.Resource.DatabaseName);
+        Assert.Equal("customers2", db2.Resource.DatabaseName);
 
-    //     Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers1?authSource=admin&authMechanism=SCRAM-SHA-256", db1.Resource.ConnectionStringExpression.ValueExpression);
-    //     Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers2?authSource=admin&authMechanism=SCRAM-SHA-256", db2.Resource.ConnectionStringExpression.ValueExpression);
-    // }
+        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers1?authSource=admin&authMechanism=SCRAM-SHA-256", db1.Resource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers2?authSource=admin&authMechanism=SCRAM-SHA-256", db2.Resource.ConnectionStringExpression.ValueExpression);
+    }
 
-    // [Fact]
-    // public void CanAddDatabasesWithTheSameNameOnMultipleServers()
-    // {
-    //     using var builder = TestDistributedApplicationBuilder.Create();
+    [Fact]
+    public void CanAddDatabasesWithTheSameNameOnMultipleServers()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
 
-    //     var db1 = builder.AddDocumentDB("DocumentDB1")
-    //         .AddDatabase("db1", "imports");
+        var db1 = builder.AddDocumentDB("DocumentDB1")
+            .AddDatabase("db1", "imports");
 
-    //     var db2 = builder.AddDocumentDB("DocumentDB2")
-    //         .AddDatabase("db2", "imports");
+        var db2 = builder.AddDocumentDB("DocumentDB2")
+            .AddDatabase("db2", "imports");
 
-    //     Assert.Equal("imports", db1.Resource.DatabaseName);
-    //     Assert.Equal("imports", db2.Resource.DatabaseName);
+        Assert.Equal("imports", db1.Resource.DatabaseName);
+        Assert.Equal("imports", db2.Resource.DatabaseName);
 
-    //     Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256", db1.Resource.ConnectionStringExpression.ValueExpression);
-    //     Assert.Equal("mongodb://admin:{DocumentDB2-password.value}@{DocumentDB2.bindings.tcp.host}:{DocumentDB2.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256", db2.Resource.ConnectionStringExpression.ValueExpression);
-    // }
+        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256", db1.Resource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal("mongodb://admin:{DocumentDB2-password.value}@{DocumentDB2.bindings.tcp.host}:{DocumentDB2.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256", db2.Resource.ConnectionStringExpression.ValueExpression);
+    }
 }

@@ -50,6 +50,12 @@ public static class TestDistributedApplicationBuilder
     {
         var builder = DistributedApplication.CreateBuilder(args);
 
+        // Apply configuration options if provided
+        if (configureOptions != null)
+        {
+            builder.Services.Configure(configureOptions);
+        }
+
         // Configure HTTP client defaults with resilience handler
         builder.Services.ConfigureHttpClientDefaults(http => http.AddStandardResilienceHandler());
 
@@ -110,5 +116,22 @@ public static class DisposableDistributedApplicationBuilderExtensions
         int? port)
     {
         return builder.Builder.AddDocumentDB(name, port);
+    }
+
+    public static IResourceBuilder<ParameterResource> AddParameter(
+        this DisposableDistributedApplicationBuilder builder,
+        string name,
+        string value)
+    {
+        // Use the CreateDefaultPasswordParameter approach but with a fixed value
+        return builder.Builder.AddParameter(name, false);
+    }
+
+    public static IResourceBuilder<ParameterResource> AddParameter(
+        this DisposableDistributedApplicationBuilder builder,
+        string name,
+        bool secret = false)
+    {
+        return builder.Builder.AddParameter(name, secret);
     }
 }
