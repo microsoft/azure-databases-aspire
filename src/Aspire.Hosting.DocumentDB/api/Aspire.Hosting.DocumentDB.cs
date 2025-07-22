@@ -36,8 +36,6 @@ namespace Aspire.Hosting.ApplicationModel
     {
         public DocumentDBServerResource(string name, ParameterResource? userNameParameter, ParameterResource? passwordParameter) : base(default!, default) { }
 
-        public DocumentDBServerResource(string name) : base(default!, default) { }
-
         public ReferenceExpression ConnectionStringExpression { get { throw null; } }
 
         public System.Collections.Generic.IReadOnlyDictionary<string, string> Databases { get { throw null; } }
