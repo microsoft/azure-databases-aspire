@@ -50,12 +50,6 @@ public static class TestDistributedApplicationBuilder
     {
         var builder = DistributedApplication.CreateBuilder(args);
 
-        // Apply configuration options if provided
-        if (configureOptions != null)
-        {
-            builder.Services.Configure(configureOptions);
-        }
-
         // Configure HTTP client defaults with resilience handler
         builder.Services.ConfigureHttpClientDefaults(http => http.AddStandardResilienceHandler());
 
@@ -107,7 +101,19 @@ public static class DisposableDistributedApplicationBuilderExtensions
         bool tls = false,
         bool allowInsecureTls = false)
     {
-        return builder.Builder.AddDocumentDB(name, port, userName, password, tls, allowInsecureTls);
+        var resourceBuilder = builder.Builder.AddDocumentDB(name, port, userName, password);
+        
+        if (tls)
+        {
+            resourceBuilder = resourceBuilder.UseTls();
+        }
+        
+        if (allowInsecureTls)
+        {
+            resourceBuilder = resourceBuilder.AllowInsecureTls();
+        }
+        
+        return resourceBuilder;
     }
 
     public static IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource> AddDocumentDB(

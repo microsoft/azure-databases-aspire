@@ -16,7 +16,7 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
 
-        appBuilder.AddDocumentDB("DocumentDB", tls: true, allowInsecureTls: true);
+        appBuilder.AddDocumentDB("DocumentDB").UseTls().AllowInsecureTls();
 
         using var app = appBuilder.Build();
 

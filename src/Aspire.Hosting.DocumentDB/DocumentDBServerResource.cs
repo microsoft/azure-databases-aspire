@@ -22,14 +22,10 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// <param name="name">The name of the resource.</param>
     /// <param name="userNameParameter">A parameter that contains the DocumentDB server user name, or <see langword="null"/> to use a default value.</param>
     /// <param name="passwordParameter">A parameter that contains the DocumentDB server password.</param>
-    /// <param name="tls">A value indicating whether to use TLS.</param>
-    /// <param name="allowInsecureTls">A value indicating whether to allow invalid certificates.</param>
-    public DocumentDBServerResource(string name, ParameterResource? userNameParameter, ParameterResource? passwordParameter, bool tls = false, bool allowInsecureTls = false) : this(name)
+    public DocumentDBServerResource(string name, ParameterResource? userNameParameter, ParameterResource? passwordParameter) : this(name)
     {
         UserNameParameter = userNameParameter;
         PasswordParameter = passwordParameter;
-        TLS = tls;
-        AllowInsecureTls = allowInsecureTls;
     }
 
     /// <summary>
@@ -41,7 +37,7 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// Gets the parameter that contains the DocumentDB server password.
     /// </summary>
     public ParameterResource? PasswordParameter { get; }
-        
+
     /// <summary>
     /// Gets the parameter that contains the DocumentDB server username.
     /// </summary>
@@ -50,12 +46,12 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// <summary>
     /// Gets a value indicating whether to use TLS.
     /// </summary>
-    public bool TLS { get; }
+    internal bool TLS { get; set; }
 
     /// <summary>
     /// Gets a value indicating whether to allow invalid certificates.
     /// </summary>
-    public bool AllowInsecureTls { get; }
+    internal bool AllowInsecureTls { get; set; }
 
     internal ReferenceExpression UserNameReference =>
         UserNameParameter is not null ?
@@ -116,5 +112,15 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     internal void AddDatabase(string name, string databaseName)
     {
         _databases.TryAdd(name, databaseName);
+    }
+
+    public void SetUseTls(bool useTls)
+    {
+        TLS = useTls;
+    }
+
+    public void SetAllowInsecureTls(bool allowInsecureTls)
+    {
+        AllowInsecureTls = allowInsecureTls;
     }
 }

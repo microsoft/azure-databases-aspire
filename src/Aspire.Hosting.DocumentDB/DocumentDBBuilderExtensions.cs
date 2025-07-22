@@ -42,23 +42,19 @@ public static class DocumentDBBuilderExtensions
     /// <param name="port">The host port for DocumentDB.</param>
     /// <param name="userName">A parameter that contains the DocumentDB server user name, or <see langword="null"/> to use a default value.</param>
     /// <param name="password">A parameter that contains the DocumentDB server password, or <see langword="null"/> to use a generated password.</param>
-    /// <param name="tls">A flag that indicates if TLS should be used for the connection.</param>
-    /// <param name="allowInsecureTls">A flag that indicates if invalid TLS certificates should be accepted.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
     public static IResourceBuilder<DocumentDBServerResource> AddDocumentDB(this IDistributedApplicationBuilder builder,
         string name,
         int? port = null,
         IResourceBuilder<ParameterResource>? userName = null,
-        IResourceBuilder<ParameterResource>? password = null,
-        bool tls = false,
-        bool allowInsecureTls = false)
+        IResourceBuilder<ParameterResource>? password = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrEmpty(name);
 
         var passwordParameter = password?.Resource ?? ParameterResourceBuilderExtensions.CreateDefaultPasswordParameter(builder, $"{name}-password", special: false);
 
-        var DocumentDBContainer = new DocumentDBServerResource(name, userName?.Resource, passwordParameter, tls, allowInsecureTls);
+        var DocumentDBContainer = new DocumentDBServerResource(name, userName?.Resource, passwordParameter);
 
         string? connectionString = null;
 
@@ -82,7 +78,7 @@ public static class DocumentDBBuilderExtensions
                 context.EnvironmentVariables[UserEnvVarName] = DocumentDBContainer.UserNameReference;
                 context.EnvironmentVariables[PasswordEnvVarName] = DocumentDBContainer.PasswordParameter!;
             });
-            //.WithHealthCheck(healthCheckKey);
+        //.WithHealthCheck(healthCheckKey);
     }
 
     /// <summary>
@@ -112,7 +108,8 @@ public static class DocumentDBBuilderExtensions
             if (connectionString == null)
             {
                 throw new DistributedApplicationException($"ConnectionStringAvailableEvent was published for the '{DocumentDBDatabase.Name}' resource but the connection string was null.");
-            }        });
+            }
+        });
 
         // var healthCheckKey = $"{name}_check";
         // // cache the database client so it is reused on subsequent calls to the health check
@@ -190,5 +187,21 @@ public static class DocumentDBBuilderExtensions
             {
                 context.EnvironmentVariables["DATA_PATH"] = targetPath;
             });
+    }
+
+    public static IResourceBuilder<DocumentDBServerResource> UseTls(this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        builder.Resource.SetUseTls(true);
+        return builder;
+    }
+
+    public static IResourceBuilder<DocumentDBServerResource> AllowInsecureTls(this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        builder.Resource.SetAllowInsecureTls(true);
+        return builder;
     }
 }
