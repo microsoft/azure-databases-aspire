@@ -38,7 +38,7 @@ namespace Aspire.Hosting.ApplicationModel
 
         public ReferenceExpression ConnectionStringExpression { get { throw null; } }
 
-        public System.Collections.Generic.IReadOnlyDictionary<string, string> Databases { get { throw null; } }
+    public System.Collections.Generic.IReadOnlyList<ApplicationModel.DocumentDBDatabaseResource> Databases { get { throw null; } }
 
         public ParameterResource? PasswordParameter { get { throw null; } }
 

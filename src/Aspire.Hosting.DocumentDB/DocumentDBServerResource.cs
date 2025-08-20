@@ -102,24 +102,25 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
         return builder.Build();
     }
 
-    private readonly Dictionary<string, string> _databases = new Dictionary<string, string>(StringComparers.ResourceName);
+    private readonly List<DocumentDBDatabaseResource> _databases = new();
 
     /// <summary>
-    /// A dictionary where the key is the resource name and the value is the database name.
+    /// The databases created under this server.
     /// </summary>
-    public IReadOnlyDictionary<string, string> Databases => _databases;
+    public IReadOnlyList<DocumentDBDatabaseResource> Databases => _databases;
 
-    internal void AddDatabase(string name, string databaseName)
+    internal void AddDatabase(DocumentDBDatabaseResource database)
     {
-        _databases.TryAdd(name, databaseName);
+        ArgumentNullException.ThrowIfNull(database);
+        _databases.Add(database);
     }
 
-    public void SetUseTls(bool useTls)
+    internal void SetUseTls(bool useTls)
     {
         TLS = useTls;
     }
 
-    public void SetAllowInsecureTls(bool allowInsecureTls)
+    internal void SetAllowInsecureTls(bool allowInsecureTls)
     {
         AllowInsecureTls = allowInsecureTls;
     }

@@ -96,8 +96,8 @@ public static class DocumentDBBuilderExtensions
         // Use the resource name as the database name if it's not provided
         databaseName ??= name;
 
-        builder.Resource.AddDatabase(name, databaseName);
-        var DocumentDBDatabase = new DocumentDBDatabaseResource(name, databaseName, builder.Resource);
+    var DocumentDBDatabase = new DocumentDBDatabaseResource(name, databaseName, builder.Resource);
+    builder.Resource.AddDatabase(DocumentDBDatabase);
 
         string? connectionString = null;
 
