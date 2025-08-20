@@ -1,0 +1,67 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <DefaultTargetFramework>net9.0</DefaultTargetFramework>
+    <RepoRoot>$(MSBuildThisFileDirectory)</RepoRoot>
+
+    <LangVersion>latest</LangVersion>
+    <SuppressNETCoreSdkPreviewMessage>true</SuppressNETCoreSdkPreviewMessage>
+
+    <WarnOnPackingNonPackableProject>false</WarnOnPackingNonPackableProject>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <DebugType>embedded</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UsePublicApiAnalyzers>true</UsePublicApiAnalyzers>
+    <SharedDir>$(MSBuildThisFileDirectory)/src/Shared/</SharedDir>
+
+    <!-- Issue: https://github.com/dotnet/aspire/issues/8488 -->
+    <!-- xUnit2031: Do not use Where clause with Assert.Single -->
+    <!-- xUnit1051: Calls to methods which accept CancellationToken should use TestContext.Current.CancellationToken to allow test cancellation to be more responsive. -->
+    <!-- TODO: Re-enable and remove this. -->
+    <NoWarn>$(NoWarn);xUnit2031;xUnit1051</NoWarn>
+  </PropertyGroup>
+
+  <!--
+    Test project convention:
+      - unit test projects end with .Tests or .UnitTests
+      - integration test projects end with .IntegrationTests
+      - performance test projects end with .PerformanceTests
+
+    Test-specific packages are imported only for test projects.
+    -->
+  <PropertyGroup Condition=" '$(IsPerformanceTestProject)' == '' ">
+    <IsPerformanceTestProject>false</IsPerformanceTestProject>
+    <IsPerformanceTestProject Condition="$(MSBuildProjectName.EndsWith('.PerformanceTests'))">true</IsPerformanceTestProject>
+  </PropertyGroup>
+  
+  <PropertyGroup Condition=" '$(IsIntegrationTestProject)' == ''">
+    <IsIntegrationTestProject>false</IsIntegrationTestProject>
+    <IsIntegrationTestProject Condition="$(MSBuildProjectName.EndsWith('.IntegrationTests'))">true</IsIntegrationTestProject>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(IsUnitTestProject)' == ''">
+    <IsUnitTestProject>false</IsUnitTestProject>
+    <IsUnitTestProject Condition="$(MSBuildProjectName.EndsWith('.UnitTests')) or $(MSBuildProjectName.EndsWith('.Tests'))">true</IsUnitTestProject>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsTestProject>false</IsTestProject>
+    <IsTestProject Condition="'$(IsUnitTestProject)' == 'true' or '$(IsIntegrationTestProject)' == 'true' or '$(IsPerformanceTestProject)' == 'true'">true</IsTestProject>
+
+    <!-- Disable building Integration Test projects in LUT. -->
+    <BuildForLiveUnitTesting Condition="'$(BuildForLiveUnitTesting)' == '' and '$(IsIntegrationTestProject)' == 'true'">false</BuildForLiveUnitTesting>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(IsTestProject)' != 'true'">
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;IDE0022</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(IsTestProject)' == 'true'">
+    <NoWarn>$(NoWarn);IDE0007;IDE0008;IDE0021;IDE0022</NoWarn>
+  </PropertyGroup>
+
+</Project>
