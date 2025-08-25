@@ -1,6 +1,6 @@
 # Aspire.Hosting.DocumentDB library
 
-Provides extension methods and resource definitions for a .NET Aspire AppHost to configure a DocumentDB resource.
+[DocumentDB](https://github.com/documentdb/documentdb) is a MongoDB compatible open source document database built on PostgreSQL. This provides extension methods and resource definitions for a .NET Aspire AppHost to configure a DocumentDB resource.
 
 ## Getting started
 
@@ -79,10 +79,6 @@ public class MyDocument
 ```
 
 The client integration handles connection string resolution and provides features like health checks, logging, and telemetry automatically.
-
-## Additional documentation
------TODO-------
-//https://learn.microsoft.com/dotnet/aspire/database/DocumentDB-component
 
 ## Feedback & contributing
 
