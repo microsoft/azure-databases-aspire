@@ -87,7 +87,13 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
             hasQuery = true;
         }
 
-        // Conditionally add TLS and AllowInsecureTls
+        // Conditionally add TLS and AllowInsecureTls.
+        // NOTE: We use "tlsInsecure=true" rather than the upstream-documented
+        // "tlsAllowInvalidCertificates=true" because the .NET MongoDB driver
+        // does not fully honour tlsAllowInvalidCertificates for self-signed
+        // certificates and raises UntrustedRoot errors. tlsInsecure=true
+        // disables both certificate validation and hostname verification,
+        // which is the correct setting for local DocumentDB containers.
         if (TLS)
         {
             builder.Append($"{(hasQuery ? "&" : "?")}tls=true");
