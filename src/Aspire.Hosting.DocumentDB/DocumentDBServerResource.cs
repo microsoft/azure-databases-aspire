@@ -98,11 +98,11 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
         {
             builder.Append($"{(hasQuery ? "&" : "?")}tls=true");
             hasQuery = true;
-        }
 
-        if (AllowInsecureTls)
-        {
-            builder.Append($"{(hasQuery ? "&" : "?")}tlsInsecure=true");
+            if (AllowInsecureTls)
+            {
+                builder.Append($"&tlsInsecure=true");
+            }
         }
 
         return builder.Build();
