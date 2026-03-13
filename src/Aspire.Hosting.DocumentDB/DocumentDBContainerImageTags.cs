@@ -11,6 +11,6 @@ internal static class DocumentDBContainerImageTags
     /// <remarks>documentdb/documentdb-local</remarks>
     public const string Image = "documentdb/documentdb-local";
 
-    /// <remarks>latest</remarks>
-    public const string Tag = "latest";
+    /// <remarks>pg17-0.109.0</remarks>
+    public const string Tag = "pg17-0.109.0";
 }
