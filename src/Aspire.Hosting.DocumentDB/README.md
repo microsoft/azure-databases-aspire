@@ -23,6 +23,8 @@ var myService = builder.AddProject<Projects.MyService>()
                        .WithReference(db);
 ```
 
+For local development, the generated DocumentDB connection strings enable TLS and allow the self-signed local certificate automatically so client applications can connect without extra manual connection string settings.
+
 ## Connecting from client applications
 
 To connect to DocumentDB from your application services, you'll need to install the MongoDB client integration package:

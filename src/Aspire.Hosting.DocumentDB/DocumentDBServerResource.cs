@@ -46,12 +46,12 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// <summary>
     /// Gets a value indicating whether to use TLS.
     /// </summary>
-    internal bool TLS { get; set; }
+    internal bool TLS { get; set; } = true;
 
     /// <summary>
     /// Gets a value indicating whether to allow invalid certificates.
     /// </summary>
-    internal bool AllowInsecureTls { get; set; }
+    internal bool AllowInsecureTls { get; set; } = true;
 
     internal ReferenceExpression UserNameReference =>
         UserNameParameter is not null ?
