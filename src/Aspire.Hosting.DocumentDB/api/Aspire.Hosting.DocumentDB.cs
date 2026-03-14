@@ -12,9 +12,9 @@ namespace Aspire.Hosting
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithDataVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string? name = null, bool isReadOnly = false) { throw null; }
 
-        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> UseTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder) { throw null; }
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> UseTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool useTls = true) { throw null; }
 
-        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> AllowInsecureTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder) { throw null; }
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> AllowInsecureTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool allowInsecureTls = true) { throw null; }
 
     }
 }

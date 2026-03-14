@@ -5,12 +5,12 @@ namespace Aspire.Hosting.DocumentDB;
 
 internal static class DocumentDBContainerImageTags
 {
-    /// <remarks>ghcr.io/microsoft/documentdb</remarks>
-    public const string Registry = "ghcr.io/microsoft";
+    /// <remarks>ghcr.io/documentdb</remarks>
+    public const string Registry = "ghcr.io/documentdb";
 
     /// <remarks>documentdb/documentdb-local</remarks>
     public const string Image = "documentdb/documentdb-local";
 
-    /// <remarks>latest</remarks>
-    public const string Tag = "latest";
+    /// <remarks>pg17-0.109.0</remarks>
+    public const string Tag = "pg17-0.109.0";
 }

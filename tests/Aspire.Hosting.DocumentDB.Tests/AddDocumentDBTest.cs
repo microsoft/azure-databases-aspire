@@ -16,7 +16,7 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
 
-        appBuilder.AddDocumentDB("DocumentDB").UseTls().AllowInsecureTls();
+        appBuilder.AddDocumentDB("DocumentDB");
 
         using var app = appBuilder.Build();
 
@@ -85,11 +85,13 @@ public class AddDocumentDBTests
         var serverResource = dbResource.Parent as IResourceWithConnectionString;
         var connectionStringResource = dbResource as IResourceWithConnectionString;
         Assert.NotNull(connectionStringResource);
+        var passwordParameter = Assert.IsType<ParameterResource>(dbResource.Parent.PasswordParameter);
+        var password = await passwordParameter.GetValueAsync(default);
         var connectionString = await connectionStringResource.GetConnectionStringAsync();
-        Assert.Equal($"mongodb://admin:{dbResource.Parent.PasswordParameter?.Value}@localhost:10260?authSource=admin&authMechanism=SCRAM-SHA-256", await serverResource.GetConnectionStringAsync());
-        Assert.Equal("mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin&authMechanism=SCRAM-SHA-256", serverResource.ConnectionStringExpression.ValueExpression);
-        Assert.Equal($"mongodb://admin:{dbResource.Parent.PasswordParameter?.Value}@localhost:10260/mydatabase?authSource=admin&authMechanism=SCRAM-SHA-256", connectionString);
-        Assert.Equal("mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydatabase?authSource=admin&authMechanism=SCRAM-SHA-256", connectionStringResource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal($"mongodb://admin:{password}@localhost:10260?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", await serverResource.GetConnectionStringAsync());
+        Assert.Equal("mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", serverResource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal($"mongodb://admin:{password}@localhost:10260/mydatabase?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", connectionString);
+        Assert.Equal("mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydatabase?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", connectionStringResource.ConnectionStringExpression.ValueExpression);
     }
 
     [Fact]
@@ -105,7 +107,7 @@ public class AddDocumentDBTests
         var expectedManifest = $$"""
             {
               "type": "container.v0",
-              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256",
+              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true",
               "image": "{{DocumentDBContainerImageTags.Registry}}/{{DocumentDBContainerImageTags.Image}}:{{DocumentDBContainerImageTags.Tag}}",
               "env": {
                 "USERNAME": "admin",
@@ -126,7 +128,7 @@ public class AddDocumentDBTests
         expectedManifest = """
             {
               "type": "value.v0",
-              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256"
+              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true"
             }
             """;
         Assert.Equal(expectedManifest, dbManifest.ToString());
@@ -168,8 +170,8 @@ public class AddDocumentDBTests
         Assert.Equal("customers1", db1.Resource.DatabaseName);
         Assert.Equal("customers2", db2.Resource.DatabaseName);
 
-        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers1?authSource=admin&authMechanism=SCRAM-SHA-256", db1.Resource.ConnectionStringExpression.ValueExpression);
-        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers2?authSource=admin&authMechanism=SCRAM-SHA-256", db2.Resource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers1?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db1.Resource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers2?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db2.Resource.ConnectionStringExpression.ValueExpression);
     }
 
     [Fact]
@@ -186,7 +188,7 @@ public class AddDocumentDBTests
         Assert.Equal("imports", db1.Resource.DatabaseName);
         Assert.Equal("imports", db2.Resource.DatabaseName);
 
-        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256", db1.Resource.ConnectionStringExpression.ValueExpression);
-        Assert.Equal("mongodb://admin:{DocumentDB2-password.value}@{DocumentDB2.bindings.tcp.host}:{DocumentDB2.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256", db2.Resource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db1.Resource.ConnectionStringExpression.ValueExpression);
+        Assert.Equal("mongodb://admin:{DocumentDB2-password.value}@{DocumentDB2.bindings.tcp.host}:{DocumentDB2.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db2.Resource.ConnectionStringExpression.ValueExpression);
     }
 }

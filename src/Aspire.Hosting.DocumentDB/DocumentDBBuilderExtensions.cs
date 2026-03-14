@@ -189,19 +189,36 @@ public static class DocumentDBBuilderExtensions
             });
     }
 
-    public static IResourceBuilder<DocumentDBServerResource> UseTls(this IResourceBuilder<DocumentDBServerResource> builder)
+    /// <summary>
+    /// Enables TLS for the DocumentDB connection string. TLS is enabled by default
+    /// because the DocumentDB Local container requires TLS connections.
+    /// Call <c>UseTls(false)</c> to disable TLS if connecting to a non-TLS endpoint.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="useTls">Whether to enable TLS. Defaults to <see langword="true"/>.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> UseTls(this IResourceBuilder<DocumentDBServerResource> builder, bool useTls = true)
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        builder.Resource.SetUseTls(true);
+        builder.Resource.SetUseTls(useTls);
         return builder;
     }
 
-    public static IResourceBuilder<DocumentDBServerResource> AllowInsecureTls(this IResourceBuilder<DocumentDBServerResource> builder)
+    /// <summary>
+    /// Allows insecure TLS connections by adding <c>tlsInsecure=true</c> to the connection string.
+    /// This is enabled by default so the .NET MongoDB driver can connect to the self-signed
+    /// certificate used by the DocumentDB Local container.
+    /// Call <c>AllowInsecureTls(false)</c> to require valid certificates.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="allowInsecureTls">Whether to allow insecure TLS. Defaults to <see langword="true"/>.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> AllowInsecureTls(this IResourceBuilder<DocumentDBServerResource> builder, bool allowInsecureTls = true)
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        builder.Resource.SetAllowInsecureTls(true);
+        builder.Resource.SetAllowInsecureTls(allowInsecureTls);
         return builder;
     }
 }
