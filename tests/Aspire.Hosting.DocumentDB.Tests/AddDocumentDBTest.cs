@@ -191,4 +191,55 @@ public class AddDocumentDBTests
         Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db1.Resource.ConnectionStringExpression.ValueExpression);
         Assert.Equal("mongodb://admin:{DocumentDB2-password.value}@{DocumentDB2.bindings.tcp.host}:{DocumentDB2.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db2.Resource.ConnectionStringExpression.ValueExpression);
     }
+
+    [Fact]
+    public void DefaultImageTagUsesPG17()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB");
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var containerAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerImageAnnotation>());
+
+        Assert.Equal("pg17-0.109.0", containerAnnotation.Tag);
+    }
+
+    [Theory]
+    [InlineData(DocumentDBPostgreSqlVersion.PG16, "pg16-0.109.0")]
+    [InlineData(DocumentDBPostgreSqlVersion.PG17, "pg17-0.109.0")]
+    [InlineData(DocumentDBPostgreSqlVersion.PG18, "pg18-0.109.0")]
+    public void WithPostgreSqlVersionSetsCorrectImageTag(DocumentDBPostgreSqlVersion version, string expectedTag)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithPostgreSqlVersion(version);
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var containerAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerImageAnnotation>());
+
+        Assert.Equal(expectedTag, containerAnnotation.Tag);
+    }
+
+    [Fact]
+    public async Task WithPostgreSqlVersionReflectsInManifest()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgreSqlVersion(DocumentDBPostgreSqlVersion.PG16);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Contains("pg16-0.109.0", manifest.ToString());
+    }
+
+    [Fact]
+    public void WithPostgreSqlVersionThrowsForInvalidEnumValue()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var builder = appBuilder.AddDocumentDB("DocumentDB");
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithPostgreSqlVersion((DocumentDBPostgreSqlVersion)999));
+    }
 }
