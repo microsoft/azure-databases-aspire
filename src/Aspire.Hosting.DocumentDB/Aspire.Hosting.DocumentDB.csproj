@@ -3,11 +3,23 @@
   <PropertyGroup>
     <TargetFramework>$(DefaultTargetFramework)</TargetFramework>
     <IsPackable>true</IsPackable>
-    <PackageTags>aspire integration hosting DocumentDB</PackageTags>
-    <PackageIconFullPath>$(SharedDir)AzureCosmosDB_256x.png</PackageIconFullPath>
-    <Description>DocumentDB support for .NET Aspire.</Description>
     <NoWarn>$(NoWarn);CS8002</NoWarn>
     <EnablePackageValidation>false</EnablePackageValidation>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata -->
+  <PropertyGroup>
+    <Description>DocumentDB support for .NET Aspire. Provides extension methods and resource definitions for a .NET Aspire AppHost to configure a DocumentDB resource.</Description>
+    <Authors>Microsoft</Authors>
+    <Copyright>Copyright (c) Microsoft 2025</Copyright>
+    <PackageTags>aspire integration hosting documentdb mongodb cosmosdb azure database</PackageTags>
+    <PackageProjectUrl>https://github.com/microsoft/azure-databases-aspire</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/microsoft/azure-databases-aspire</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>AzureCosmosDB_256x.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <MinVerTagPrefix>v</MinVerTagPrefix>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,10 +31,13 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting" />
+    <None Include="$(SharedDir)AzureCosmosDB_256x.png" Pack="true" PackagePath="\" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Aspire.Hosting" />
     <PackageReference Include="AspNetCore.HealthChecks.MongoDb" />
+    <PackageReference Include="MinVer" PrivateAssets="all" />
   </ItemGroup>
 </Project>
