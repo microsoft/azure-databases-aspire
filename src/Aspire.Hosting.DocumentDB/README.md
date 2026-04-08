@@ -23,6 +23,16 @@ var myService = builder.AddProject<Projects.MyService>()
                        .WithReference(db);
 ```
 
+To select a specific PostgreSQL major version for the backing DocumentDB Local container, call `WithPostgreSqlVersion(...)` before adding references or child resources:
+
+```csharp
+var db = builder.AddDocumentDB("DocumentDB")
+                .WithPostgreSqlVersion(DocumentDBPostgreSqlVersion.PG18)
+                .AddDatabase("mydb");
+```
+
+Supported values are `PG16`, `PG17`, and `PG18`. If you do not specify a version, the hosting integration uses `PG17`.
+
 For local development, the generated DocumentDB connection strings enable TLS and allow the self-signed local certificate automatically so client applications can connect without extra manual connection string settings.
 
 ## Connecting from client applications

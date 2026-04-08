@@ -52,7 +52,26 @@ public class DocumentDBIntegrationTests
     }
 
     [Fact]
-    public async Task EndToEndAppCanConnectWithPG16()
+    public Task EndToEndAppCanConnectWithPG16() =>
+        EndToEndAppCanConnectWithExplicitPostgreSqlVersion(
+            DocumentDBPostgreSqlVersion.PG16,
+            "documentdb-pg16",
+            "appdb-pg16",
+            "widget-pg16");
+
+    [RequiresPublishedDocumentDBImage(DocumentDBPostgreSqlVersion.PG18)]
+    public Task EndToEndAppCanConnectWithPG18() =>
+        EndToEndAppCanConnectWithExplicitPostgreSqlVersion(
+            DocumentDBPostgreSqlVersion.PG18,
+            "documentdb-pg18",
+            "appdb-pg18",
+            "widget-pg18");
+
+    private static async Task EndToEndAppCanConnectWithExplicitPostgreSqlVersion(
+        DocumentDBPostgreSqlVersion version,
+        string resourceName,
+        string databaseName,
+        string documentName)
     {
         if (!RequiresDockerAttribute.IsSupported)
         {
@@ -62,17 +81,16 @@ public class DocumentDBIntegrationTests
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Aspire.Hosting.DocumentDB.EndToEndApp.Program>(cts.Token);
-        appHost.AddDocumentDB("documentdb-pg16")
-            .WithPostgreSqlVersion(DocumentDBPostgreSqlVersion.PG16)
-            .AddDatabase("appdb-pg16");
+        appHost.AddDocumentDB(resourceName)
+            .WithPostgreSqlVersion(version)
+            .AddDatabase(databaseName);
 
         await using var app = await appHost.BuildAsync(cts.Token);
         await app.StartAsync(cts.Token);
 
-        var connectionString = await app.GetConnectionStringAsync("appdb-pg16", cts.Token);
+        var connectionString = await app.GetConnectionStringAsync(databaseName, cts.Token);
         Assert.False(string.IsNullOrWhiteSpace(connectionString));
 
-        const string databaseName = "appdb-pg16";
         var database = await ConnectAsync(connectionString!, databaseName, cts.Token);
         var collection = database.GetCollection<BsonDocument>("widgets");
 
@@ -81,7 +99,7 @@ public class DocumentDBIntegrationTests
         var document = new BsonDocument
         {
             ["_id"] = id,
-            ["name"] = "widget-pg16"
+            ["name"] = documentName
         };
 
         await collection.InsertOneAsync(document, cancellationToken: cts.Token);
