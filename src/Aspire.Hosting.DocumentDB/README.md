@@ -25,6 +25,31 @@ var myService = builder.AddProject<Projects.MyService>()
 
 For local development, the generated DocumentDB connection strings enable TLS and allow the self-signed local certificate automatically so client applications can connect without extra manual connection string settings.
 
+## Additional container configuration
+
+The hosting integration also exposes several DocumentDB Local container options for debugging, seeding, and closer-to-production local setups:
+
+```csharp
+var documentdb = builder.AddDocumentDB("documentdb")
+    .WithLogLevel(DocumentDBLogLevel.Debug)
+    .WithInitData("../seed")
+    .WithTlsCertificate("../certs/documentdb.pem", "../certs/documentdb.key")
+    .WithTelemetry(enabled: false)
+    .WithoutExtendedRum()
+    .WithOwner("documentdb");
+
+var db = documentdb.AddDatabase("mydb");
+```
+
+Use `WithoutSampleData()` when you want to disable the built-in sample collections without mounting custom initialization scripts:
+
+```csharp
+var documentdb = builder.AddDocumentDB("documentdb")
+    .WithoutSampleData();
+```
+
+`WithInitData(...)` mounts a host directory into `/init_doc_db.d` and also disables the built-in sample data so your custom scripts are the only initialization source.
+
 ## Connecting from client applications
 
 To connect to DocumentDB from your application services, you'll need to install the MongoDB client integration package:

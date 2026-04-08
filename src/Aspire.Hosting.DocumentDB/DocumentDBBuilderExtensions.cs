@@ -15,9 +15,20 @@ public static class DocumentDBBuilderExtensions
 {
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
-
     private const string UserEnvVarName = "USERNAME";
     private const string PasswordEnvVarName = "PASSWORD";
+    private const string LogLevelEnvVarName = "LOG_LEVEL";
+    private const string InitDataPathEnvVarName = "INIT_DATA_PATH";
+    private const string SkipInitDataEnvVarName = "SKIP_INIT_DATA";
+    private const string CertPathEnvVarName = "CERT_PATH";
+    private const string KeyFileEnvVarName = "KEY_FILE";
+    private const string EnableTelemetryEnvVarName = "ENABLE_TELEMETRY";
+    private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
+    private const string OwnerEnvVarName = "OWNER";
+    private const string DataPathEnvVarName = "DATA_PATH";
+
+    private const string DataPath = "/home/documentdb/postgresql/data";
+    private const string InitDataPath = "/init_doc_db.d";
 
     /// <summary>
     /// Adds a DocumentDB resource to the application model. A container is used for local development.
@@ -157,13 +168,13 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        targetPath ??= "/home/documentdb/postgresql/data";
+        targetPath ??= DataPath;
 
         return builder
             .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly)
             .WithEnvironment(context =>
             {
-                context.EnvironmentVariables["DATA_PATH"] = targetPath;
+                context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
             });
     }
 
@@ -179,14 +190,137 @@ public static class DocumentDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrEmpty(source);
 
-        const string targetPath = "/home/documentdb/postgresql/data";
-
         return builder
-            .WithBindMount(source, targetPath, isReadOnly)
+            .WithBindMount(source, DataPath, isReadOnly)
             .WithEnvironment(context =>
             {
-                context.EnvironmentVariables["DATA_PATH"] = targetPath;
+                context.EnvironmentVariables[DataPathEnvVarName] = DataPath;
             });
+    }
+
+    /// <summary>
+    /// Configures the DocumentDB Local container log level.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="logLevel">The log level to configure.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithLogLevel(this IResourceBuilder<DocumentDBServerResource> builder, DocumentDBLogLevel logLevel)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[LogLevelEnvVarName] = logLevel.ToEnvironmentValue();
+        });
+    }
+
+    /// <summary>
+    /// Mounts custom initialization scripts into the DocumentDB Local container.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="source">The source directory on the host to mount into the container.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithInitData(this IResourceBuilder<DocumentDBServerResource> builder, string source)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentException.ThrowIfNullOrEmpty(source);
+
+        return builder
+            .WithBindMount(source, InitDataPath, isReadOnly: true)
+            .WithEnvironment(context =>
+            {
+                context.EnvironmentVariables[InitDataPathEnvVarName] = InitDataPath;
+                context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
+            });
+    }
+
+    /// <summary>
+    /// Disables the built-in sample data initialization performed by the DocumentDB Local container.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithoutSampleData(this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
+        });
+    }
+
+    /// <summary>
+    /// Mounts a custom TLS certificate and key into the DocumentDB Local container.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="certPath">The certificate file to mount into the container.</param>
+    /// <param name="keyPath">The private key file to mount into the container.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithTlsCertificate(this IResourceBuilder<DocumentDBServerResource> builder, string certPath, string keyPath)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentException.ThrowIfNullOrEmpty(certPath);
+        ArgumentException.ThrowIfNullOrEmpty(keyPath);
+
+        var certTargetPath = GetMountedFilePath(certPath, nameof(certPath), "documentdb-cert-");
+        var keyTargetPath = GetMountedFilePath(keyPath, nameof(keyPath), "documentdb-key-");
+
+        return builder
+            .WithBindMount(certPath, certTargetPath, isReadOnly: true)
+            .WithBindMount(keyPath, keyTargetPath, isReadOnly: true)
+            .WithEnvironment(context =>
+            {
+                context.EnvironmentVariables[CertPathEnvVarName] = certTargetPath;
+                context.EnvironmentVariables[KeyFileEnvVarName] = keyTargetPath;
+            });
+    }
+
+    /// <summary>
+    /// Enables or disables DocumentDB Local telemetry.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="enabled">Whether telemetry should be enabled.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithTelemetry(this IResourceBuilder<DocumentDBServerResource> builder, bool enabled = true)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[EnableTelemetryEnvVarName] = enabled ? "true" : "false";
+        });
+    }
+
+    /// <summary>
+    /// Disables the DocumentDB Local extended RUM index support.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithoutExtendedRum(this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[DisableExtendedRumEnvVarName] = "true";
+        });
+    }
+
+    /// <summary>
+    /// Configures the owner used by the DocumentDB Local container.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="owner">The owner value to configure.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithOwner(this IResourceBuilder<DocumentDBServerResource> builder, string owner)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentException.ThrowIfNullOrEmpty(owner);
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[OwnerEnvVarName] = owner;
+        });
     }
 
     /// <summary>
@@ -220,5 +354,17 @@ public static class DocumentDBBuilderExtensions
 
         builder.Resource.SetAllowInsecureTls(allowInsecureTls);
         return builder;
+    }
+
+    private static string GetMountedFilePath(string source, string paramName, string prefix)
+    {
+        var fileName = Path.GetFileName(source);
+
+        if (string.IsNullOrEmpty(fileName))
+        {
+            throw new ArgumentException("The path must include a file name.", paramName);
+        }
+
+        return $"/{prefix}{fileName}";
     }
 }

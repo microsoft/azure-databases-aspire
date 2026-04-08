@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace Aspire.Hosting.DocumentDB.Tests;
@@ -190,5 +191,223 @@ public class AddDocumentDBTests
 
         Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db1.Resource.ConnectionStringExpression.ValueExpression);
         Assert.Equal("mongodb://admin:{DocumentDB2-password.value}@{DocumentDB2.bindings.tcp.host}:{DocumentDB2.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db2.Resource.ConnectionStringExpression.ValueExpression);
+    }
+
+    [Theory]
+    [InlineData(DocumentDBLogLevel.Quiet, "quiet")]
+    [InlineData(DocumentDBLogLevel.Error, "error")]
+    [InlineData(DocumentDBLogLevel.Warn, "warn")]
+    [InlineData(DocumentDBLogLevel.Info, "info")]
+    [InlineData(DocumentDBLogLevel.Debug, "debug")]
+    [InlineData(DocumentDBLogLevel.Trace, "trace")]
+    public async Task WithLogLevelAddsEnvironmentVariable(DocumentDBLogLevel logLevel, string expectedValue)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel(logLevel);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal(expectedValue, env["LOG_LEVEL"]);
+    }
+
+    [Fact]
+    public async Task WithInitDataAddsReadOnlyBindMountAndDisablesSampleData()
+    {
+        var source = Path.GetFullPath(Path.Combine("TestData", "init"));
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithInitData(source);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        Assert.True(containerResource.TryGetContainerMounts(out var mounts));
+        var mount = Assert.Single(mounts);
+        Assert.Equal(source, mount.Source);
+        Assert.Equal("/init_doc_db.d", mount.Target);
+        Assert.Equal(ContainerMountType.BindMount, mount.Type);
+        Assert.True(mount.IsReadOnly);
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("/init_doc_db.d", env["INIT_DATA_PATH"]);
+        Assert.Equal("true", env["SKIP_INIT_DATA"]);
+    }
+
+    [Fact]
+    public async Task WithoutSampleDataAddsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithoutSampleData();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["SKIP_INIT_DATA"]);
+    }
+
+    [Fact]
+    public async Task WithTlsCertificateAddsReadOnlyBindMountsAndEnvironmentVariables()
+    {
+        var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.pem"));
+        var keyPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.key"));
+        var expectedCertTarget = $"/documentdb-cert-{Path.GetFileName(certPath)}";
+        var expectedKeyTarget = $"/documentdb-key-{Path.GetFileName(keyPath)}";
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTlsCertificate(certPath, keyPath);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        Assert.True(containerResource.TryGetContainerMounts(out var mounts));
+        var certMount = Assert.Single(mounts, mount => mount.Source == certPath);
+        Assert.Equal(expectedCertTarget, certMount.Target);
+        Assert.Equal(ContainerMountType.BindMount, certMount.Type);
+        Assert.True(certMount.IsReadOnly);
+
+        var keyMount = Assert.Single(mounts, mount => mount.Source == keyPath);
+        Assert.Equal(expectedKeyTarget, keyMount.Target);
+        Assert.Equal(ContainerMountType.BindMount, keyMount.Type);
+        Assert.True(keyMount.IsReadOnly);
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expectedCertTarget, env["CERT_PATH"]);
+        Assert.Equal(expectedKeyTarget, env["KEY_FILE"]);
+    }
+
+    [Theory]
+    [InlineData(true, "true")]
+    [InlineData(false, "false")]
+    public async Task WithTelemetryAddsEnvironmentVariable(bool enabled, string expectedValue)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTelemetry(enabled);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expectedValue, env["ENABLE_TELEMETRY"]);
+    }
+
+    [Fact]
+    public async Task WithoutExtendedRumAddsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithoutExtendedRum();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["DISABLE_EXTENDED_RUM"]);
+    }
+
+    [Fact]
+    public async Task WithOwnerAddsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOwner("contoso");
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("contoso", env["OWNER"]);
+    }
+
+    [Fact]
+    public async Task VerifyManifestIncludesAdditionalConfigurationOptions()
+    {
+        var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.pem"));
+        var keyPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.key"));
+        var initDataPath = Path.GetFullPath(Path.Combine("TestData", "init"));
+        var expectedCertTarget = $"/documentdb-cert-{Path.GetFileName(certPath)}";
+        var expectedKeyTarget = $"/documentdb-key-{Path.GetFileName(keyPath)}";
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithInitData(initDataPath)
+            .WithTlsCertificate(certPath, keyPath)
+            .WithTelemetry(enabled: false)
+            .WithoutExtendedRum()
+            .WithOwner("contoso");
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("debug", manifest["env"]?["LOG_LEVEL"]?.GetValue<string>());
+        Assert.Equal("/init_doc_db.d", manifest["env"]?["INIT_DATA_PATH"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
+        Assert.Equal(expectedCertTarget, manifest["env"]?["CERT_PATH"]?.GetValue<string>());
+        Assert.Equal(expectedKeyTarget, manifest["env"]?["KEY_FILE"]?.GetValue<string>());
+        Assert.Equal("false", manifest["env"]?["ENABLE_TELEMETRY"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["DISABLE_EXTENDED_RUM"]?.GetValue<string>());
+        Assert.Equal("contoso", manifest["env"]?["OWNER"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task WithTlsCertificateUsesDistinctTargetsWhenFileNamesMatch()
+    {
+        var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "shared.pem"));
+        var keyPath = Path.GetFullPath(Path.Combine("TestData", "keys", "shared.pem"));
+        var expectedCertTarget = "/documentdb-cert-shared.pem";
+        var expectedKeyTarget = "/documentdb-key-shared.pem";
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTlsCertificate(certPath, keyPath);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        Assert.True(containerResource.TryGetContainerMounts(out var mounts));
+        var certMount = Assert.Single(mounts, mount => mount.Source == certPath);
+        var keyMount = Assert.Single(mounts, mount => mount.Source == keyPath);
+
+        Assert.Equal(expectedCertTarget, certMount.Target);
+        Assert.Equal(expectedKeyTarget, keyMount.Target);
+        Assert.NotEqual(certMount.Target, keyMount.Target);
+
+        var env = await GetEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expectedCertTarget, env["CERT_PATH"]);
+        Assert.Equal(expectedKeyTarget, env["KEY_FILE"]);
+    }
+
+    private static async Task<Dictionary<string, string>> GetEnvironmentVariablesAsync(DocumentDBServerResource resource)
+    {
+        var configuration = await ExecutionConfigurationBuilder
+            .Create(resource)
+            .WithEnvironmentVariablesConfig()
+            .BuildAsync(new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish), NullLogger.Instance, default);
+
+        return configuration.EnvironmentVariables.ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.Ordinal);
     }
 }
