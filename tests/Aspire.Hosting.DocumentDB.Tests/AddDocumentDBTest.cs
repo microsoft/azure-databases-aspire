@@ -5,12 +5,51 @@ using System.Net.Sockets;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace Aspire.Hosting.DocumentDB.Tests;
 
 public class AddDocumentDBTests
 {
+    [Fact]
+    public void AddDocumentDBAddsHealthCheckAnnotationToResource()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+
+        var documentDB = appBuilder.AddDocumentDB("documentdb");
+
+        Assert.Single(documentDB.Resource.Annotations, a => a is HealthCheckAnnotation hca && hca.Key == "documentdb_check");
+    }
+
+    [Fact]
+    public void AddDatabaseAddsHealthCheckAnnotationToResource()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+
+        var database = appBuilder.AddDocumentDB("documentdb")
+            .AddDatabase("appdb");
+
+        Assert.Single(database.Resource.Annotations, a => a is HealthCheckAnnotation hca && hca.Key == "appdb_check");
+    }
+
+    [Fact]
+    public void AddDocumentDBRegistersServerAndDatabaseHealthChecks()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("documentdb")
+            .AddDatabase("appdb");
+
+        using var app = appBuilder.Build();
+
+        var healthCheckOptions = app.Services.GetRequiredService<IOptions<HealthCheckServiceOptions>>().Value;
+
+        Assert.Contains(healthCheckOptions.Registrations, registration => registration.Name == "documentdb_check");
+        Assert.Contains(healthCheckOptions.Registrations, registration => registration.Name == "appdb_check");
+        Assert.NotNull(app.Services.GetRequiredService<HealthCheckService>());
+    }
+
     [Fact]
     public void AddDocumentDBContainerWithDefaultsAddsAnnotationMetadata()
     {
