@@ -25,11 +25,15 @@ internal static class DocumentDBContainerImageTags
 
     public static string GetTag(DocumentDBPostgreSqlVersion pgVersion)
     {
+        if (string.Equals(Enum.GetName(pgVersion), "PG18", StringComparison.Ordinal))
+        {
+            throw new NotSupportedException("PostgreSQL 18 is not supported yet. It will be enabled once the matching DocumentDB Local image is published.");
+        }
+
         var prefix = pgVersion switch
         {
             DocumentDBPostgreSqlVersion.PG16 => "pg16",
             DocumentDBPostgreSqlVersion.PG17 => "pg17",
-            DocumentDBPostgreSqlVersion.PG18 => "pg18",
             _ => throw new ArgumentOutOfRangeException(nameof(pgVersion), pgVersion, "Unsupported PostgreSQL version.")
         };
         return $"{prefix}-{DocumentDBVersion}";

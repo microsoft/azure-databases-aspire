@@ -59,14 +59,6 @@ public class DocumentDBIntegrationTests
             "appdb-pg16",
             "widget-pg16");
 
-    [RequiresPublishedDocumentDBImage(DocumentDBPostgreSqlVersion.PG18)]
-    public Task EndToEndAppCanConnectWithPG18() =>
-        EndToEndAppCanConnectWithExplicitPostgreSqlVersion(
-            DocumentDBPostgreSqlVersion.PG18,
-            "documentdb-pg18",
-            "appdb-pg18",
-            "widget-pg18");
-
     private static async Task EndToEndAppCanConnectWithExplicitPostgreSqlVersion(
         DocumentDBPostgreSqlVersion version,
         string resourceName,

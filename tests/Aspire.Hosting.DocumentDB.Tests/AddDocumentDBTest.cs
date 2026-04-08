@@ -223,7 +223,6 @@ public class AddDocumentDBTests
     [Theory]
     [InlineData(DocumentDBPostgreSqlVersion.PG16, "pg16-0.109.0")]
     [InlineData(DocumentDBPostgreSqlVersion.PG17, "pg17-0.109.0")]
-    [InlineData(DocumentDBPostgreSqlVersion.PG18, "pg18-0.109.0")]
     public void WithPostgreSqlVersionSetsCorrectImageTag(DocumentDBPostgreSqlVersion version, string expectedTag)
     {
         var appBuilder = DistributedApplication.CreateBuilder();
@@ -246,6 +245,18 @@ public class AddDocumentDBTests
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
         Assert.Contains("pg16-0.109.0", manifest.ToString());
+    }
+
+    [Fact]
+    public void WithPostgreSqlVersionThrowsForDisabledPG18()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var builder = appBuilder.AddDocumentDB("DocumentDB");
+        var pg18 = Enum.Parse<DocumentDBPostgreSqlVersion>("PG18");
+
+        var exception = Assert.Throws<NotSupportedException>(() => builder.WithPostgreSqlVersion(pg18));
+
+        Assert.Contains("PostgreSQL 18 is not supported yet", exception.Message);
     }
 
     [Fact]

@@ -14,6 +14,7 @@ public enum DocumentDBPostgreSqlVersion
     /// <summary>PostgreSQL 16.</summary>
     PG16 = 1,
 
-    /// <summary>PostgreSQL 18.</summary>
+    /// <summary>PostgreSQL 18. Reserved for future support.</summary>
+    [Obsolete("PG18 is not supported yet. It will be enabled once the matching DocumentDB Local image is published.", error: true)]
     PG18 = 2,
 }
