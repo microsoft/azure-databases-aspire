@@ -136,6 +136,146 @@ public class DocumentDBPublicApiTests
         Assert.Equal(nameof(source), exception.ParamName);
     }
 
+    [Fact]
+    public void WithLogLevelShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithLogLevel(DocumentDBLogLevel.Info);
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Fact]
+    public void WithInitDataShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+        const string source = "/DocumentDB/init";
+
+        var action = () => builder.WithInitData(source);
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void WithInitDataShouldThrowWhenSourceIsNullOrEmpty(bool isNull)
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+        var source = isNull ? null! : string.Empty;
+
+        var action = () => builder.WithInitData(source);
+
+        var exception = isNull
+            ? Assert.Throws<ArgumentNullException>(action)
+            : Assert.Throws<ArgumentException>(action);
+        Assert.Equal(nameof(source), exception.ParamName);
+    }
+
+    [Fact]
+    public void WithoutSampleDataShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithoutSampleData();
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Fact]
+    public void WithTlsCertificateShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+        const string certPath = "/DocumentDB/cert.pem";
+        const string keyPath = "/DocumentDB/key.pem";
+
+        var action = () => builder.WithTlsCertificate(certPath, keyPath);
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData(true, false, "certPath")]
+    [InlineData(false, true, "certPath")]
+    [InlineData(false, false, "keyPath")]
+    public void WithTlsCertificateShouldThrowWhenPathIsNullOrEmpty(bool certIsNull, bool certIsEmpty, string expectedParamName)
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+        var certPath = certIsNull ? null! : certIsEmpty ? string.Empty : "/DocumentDB/cert.pem";
+        var keyPath = certIsNull || certIsEmpty ? "/DocumentDB/key.pem" : null!;
+
+        if (expectedParamName == "keyPath")
+        {
+            certPath = "/DocumentDB/cert.pem";
+            keyPath = string.Empty;
+        }
+
+        var action = () => builder.WithTlsCertificate(certPath, keyPath);
+
+        var exception = certIsNull
+            ? Assert.Throws<ArgumentNullException>(action)
+            : Assert.Throws<ArgumentException>(action);
+        Assert.Equal(expectedParamName, exception.ParamName);
+    }
+
+    [Fact]
+    public void WithTelemetryShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithTelemetry();
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Fact]
+    public void WithoutExtendedRumShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithoutExtendedRum();
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Fact]
+    public void WithOwnerShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+        const string owner = "documentdb";
+
+        var action = () => builder.WithOwner(owner);
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void WithOwnerShouldThrowWhenOwnerIsNullOrEmpty(bool isNull)
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+        var owner = isNull ? null! : string.Empty;
+
+        var action = () => builder.WithOwner(owner);
+
+        var exception = isNull
+            ? Assert.Throws<ArgumentNullException>(action)
+            : Assert.Throws<ArgumentException>(action);
+        Assert.Equal(nameof(owner), exception.ParamName);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
