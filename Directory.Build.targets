@@ -1,4 +1,11 @@
 <Project>
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>DocumentDBLocalImageVersion</_Parameter1>
+      <_Parameter2>$(DocumentDBLocalImageVersion)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
   <!-- Test-specific packages are imported only for test projects. -->
   <ItemGroup Condition=" '$(IsTestProject)' == 'true' ">
     <PackageReference Include="Microsoft.NET.Test.Sdk" />

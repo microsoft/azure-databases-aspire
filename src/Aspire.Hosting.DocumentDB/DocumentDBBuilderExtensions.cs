@@ -221,4 +221,23 @@ public static class DocumentDBBuilderExtensions
         builder.Resource.SetAllowInsecureTls(allowInsecureTls);
         return builder;
     }
+
+    /// <summary>
+    /// Selects the PostgreSQL major version that backs the DocumentDB instance.
+    /// If not called, the default is <see cref="DocumentDBPostgreSqlVersion.PG17"/>.
+    /// </summary>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="version">The PostgreSQL version to use.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithPostgreSqlVersion(this IResourceBuilder<DocumentDBServerResource> builder, DocumentDBPostgreSqlVersion version)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        if (!global::System.Enum.IsDefined(typeof(DocumentDBPostgreSqlVersion), version))
+        {
+            throw new ArgumentOutOfRangeException(nameof(version), version, "Unsupported PostgreSQL version.");
+        }
+
+        return builder.WithImageTag(DocumentDBContainerImageTags.GetTag(version));
+    }
 }

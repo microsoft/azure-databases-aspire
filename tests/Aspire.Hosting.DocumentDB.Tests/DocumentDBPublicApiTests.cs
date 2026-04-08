@@ -197,4 +197,15 @@ public class DocumentDBPublicApiTests
             : Assert.Throws<ArgumentException>(action);
         Assert.Equal(nameof(name), exception.ParamName);
     }
+
+    [Fact]
+    public void WithPostgreSqlVersionShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithPostgreSqlVersion(DocumentDBPostgreSqlVersion.PG17);
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
 }

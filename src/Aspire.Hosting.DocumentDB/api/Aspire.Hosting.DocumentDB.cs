@@ -16,6 +16,8 @@ namespace Aspire.Hosting
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> AllowInsecureTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool allowInsecureTls = true) { throw null; }
 
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithPostgreSqlVersion(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, ApplicationModel.DocumentDBPostgreSqlVersion version) { throw null; }
+
     }
 }
 
@@ -30,6 +32,13 @@ namespace Aspire.Hosting.ApplicationModel
         public string DatabaseName { get { throw null; } }
 
         public DocumentDBServerResource Parent { get { throw null; } }
+    }
+
+    public enum DocumentDBPostgreSqlVersion
+    {
+        PG17 = 0,
+        PG16 = 1,
+        PG18 = 2,
     }
 
     public partial class DocumentDBServerResource : ContainerResource, IResourceWithConnectionString, IResource, IManifestExpressionProvider, IValueProvider, IValueWithReferences
