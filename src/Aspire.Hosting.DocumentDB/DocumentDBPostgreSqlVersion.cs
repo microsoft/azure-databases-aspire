@@ -8,12 +8,12 @@ namespace Aspire.Hosting.ApplicationModel;
 /// </summary>
 public enum DocumentDBPostgreSqlVersion
 {
-    /// <summary>PostgreSQL 16.</summary>
-    PG16,
-
     /// <summary>PostgreSQL 17 (default).</summary>
-    PG17,
+    PG17 = 0,
+
+    /// <summary>PostgreSQL 16.</summary>
+    PG16 = 1,
 
     /// <summary>PostgreSQL 18.</summary>
-    PG18,
+    PG18 = 2,
 }

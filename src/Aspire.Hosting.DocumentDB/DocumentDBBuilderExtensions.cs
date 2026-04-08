@@ -233,6 +233,11 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
+        if (!global::System.Enum.IsDefined(typeof(DocumentDBPostgreSqlVersion), version))
+        {
+            throw new ArgumentOutOfRangeException(nameof(version), version, "Unsupported PostgreSQL version.");
+        }
+
         return builder.WithImageTag(DocumentDBContainerImageTags.GetTag(version));
     }
 }

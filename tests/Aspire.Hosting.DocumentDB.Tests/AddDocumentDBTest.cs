@@ -206,6 +206,20 @@ public class AddDocumentDBTests
         Assert.Equal("pg17-0.109.0", containerAnnotation.Tag);
     }
 
+    [Fact]
+    public void WithPostgreSqlVersionDefaultEnumUsesPG17()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithPostgreSqlVersion(default(DocumentDBPostgreSqlVersion));
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var containerAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerImageAnnotation>());
+
+        Assert.Equal("pg17-0.109.0", containerAnnotation.Tag);
+    }
+
     [Theory]
     [InlineData(DocumentDBPostgreSqlVersion.PG16, "pg16-0.109.0")]
     [InlineData(DocumentDBPostgreSqlVersion.PG17, "pg17-0.109.0")]
@@ -240,6 +254,8 @@ public class AddDocumentDBTests
         var appBuilder = DistributedApplication.CreateBuilder();
         var builder = appBuilder.AddDocumentDB("DocumentDB");
 
-        Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithPostgreSqlVersion((DocumentDBPostgreSqlVersion)999));
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithPostgreSqlVersion((DocumentDBPostgreSqlVersion)999));
+
+        Assert.Equal("version", exception.ParamName);
     }
 }
