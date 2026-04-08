@@ -3,6 +3,7 @@
     <TargetFramework>net9.0</TargetFramework>
     <DefaultTargetFramework>net9.0</DefaultTargetFramework>
     <RepoRoot>$(MSBuildThisFileDirectory)</RepoRoot>
+    <DocumentDBLocalImageVersion>0.109.0</DocumentDBLocalImageVersion>
 
     <LangVersion>latest</LangVersion>
     <SuppressNETCoreSdkPreviewMessage>true</SuppressNETCoreSdkPreviewMessage>
