@@ -84,8 +84,9 @@ public class Program
             {
                 Directory.Delete(path, recursive: true);
             }
-            catch
+            catch (Exception ex)
             {
+                Console.Error.WriteLine($"Failed to delete temporary directory '{path}': {ex.Message}");
             }
         }
     }

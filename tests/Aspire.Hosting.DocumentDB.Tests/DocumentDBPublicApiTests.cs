@@ -201,25 +201,18 @@ public class DocumentDBPublicApiTests
     }
 
     [Theory]
-    [InlineData(true, false, "certPath")]
-    [InlineData(false, true, "certPath")]
-    [InlineData(false, false, "keyPath")]
-    public void WithTlsCertificateShouldThrowWhenPathIsNullOrEmpty(bool certIsNull, bool certIsEmpty, string expectedParamName)
+    [InlineData(null, "/DocumentDB/key.pem", "certPath", true)]
+    [InlineData("", "/DocumentDB/key.pem", "certPath", false)]
+    [InlineData("/DocumentDB/cert.pem", null, "keyPath", true)]
+    [InlineData("/DocumentDB/cert.pem", "", "keyPath", false)]
+    public void WithTlsCertificateShouldThrowWhenPathIsNullOrEmpty(string? certPath, string? keyPath, string expectedParamName, bool expectNull)
     {
         var builder = TestDistributedApplicationBuilder.Create()
             .AddDocumentDB("DocumentDB");
-        var certPath = certIsNull ? null! : certIsEmpty ? string.Empty : "/DocumentDB/cert.pem";
-        var keyPath = certIsNull || certIsEmpty ? "/DocumentDB/key.pem" : null!;
 
-        if (expectedParamName == "keyPath")
-        {
-            certPath = "/DocumentDB/cert.pem";
-            keyPath = string.Empty;
-        }
+        var action = () => builder.WithTlsCertificate(certPath!, keyPath!);
 
-        var action = () => builder.WithTlsCertificate(certPath, keyPath);
-
-        var exception = certIsNull
+        var exception = expectNull
             ? Assert.Throws<ArgumentNullException>(action)
             : Assert.Throws<ArgumentException>(action);
         Assert.Equal(expectedParamName, exception.ParamName);

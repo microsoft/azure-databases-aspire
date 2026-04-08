@@ -25,6 +25,7 @@ public static class DocumentDBBuilderExtensions
     private const string EnableTelemetryEnvVarName = "ENABLE_TELEMETRY";
     private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
     private const string OwnerEnvVarName = "OWNER";
+    private const string DataPathEnvVarName = "DATA_PATH";
 
     private const string DataPath = "/home/documentdb/postgresql/data";
     private const string InitDataPath = "/init_doc_db.d";
@@ -173,7 +174,7 @@ public static class DocumentDBBuilderExtensions
             .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly)
             .WithEnvironment(context =>
             {
-                context.EnvironmentVariables["DATA_PATH"] = targetPath;
+                context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
             });
     }
 
@@ -193,7 +194,7 @@ public static class DocumentDBBuilderExtensions
             .WithBindMount(source, DataPath, isReadOnly)
             .WithEnvironment(context =>
             {
-                context.EnvironmentVariables["DATA_PATH"] = DataPath;
+                context.EnvironmentVariables[DataPathEnvVarName] = DataPath;
             });
     }
 
