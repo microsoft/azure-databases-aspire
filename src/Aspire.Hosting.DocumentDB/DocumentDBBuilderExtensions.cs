@@ -77,7 +77,7 @@ public static class DocumentDBBuilderExtensions
         IMongoDatabase? database = null;
         builder.Services.AddHealthChecks()
             .AddMongoDb(
-                sp => database ??=
+                _ => database ??=
                     new MongoClient(connectionString ?? throw new InvalidOperationException("Connection string is unavailable"))
                         .GetDatabase(DefaultHealthCheckDatabaseName),
                 name: healthCheckKey);
@@ -131,11 +131,11 @@ public static class DocumentDBBuilderExtensions
         });
 
         var healthCheckKey = $"{name}_check";
-        // cache the database client so it is reused on subsequent calls to the health check
+        // cache the database instance so it is reused on subsequent calls to the health check
         IMongoDatabase? database = null;
         builder.ApplicationBuilder.Services.AddHealthChecks()
             .AddMongoDb(
-                sp => database ??=
+                _ => database ??=
                     new MongoClient(connectionString ?? throw new InvalidOperationException("Connection string is unavailable"))
                         .GetDatabase(databaseName),
                 name: healthCheckKey);
