@@ -156,8 +156,6 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | `tls` | `true` | Controlled by `UseTls()` |
 | `tlsInsecure` | `true` | Controlled by `AllowInsecureTls()` |
 
-When no credentials are provided, the username/password and auth parameters are omitted from the connection string.
-
 ## Defaults Summary
 
 | Setting | Default Value |

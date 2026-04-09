@@ -55,10 +55,11 @@ Common causes:
 
 1. Verify you are referencing the resource correctly: `.WithReference(db)` where `db` is the database resource from `AddDatabase()`.
 2. If you manually constructed a connection string, add `tlsInsecure=true` (not `tlsAllowInvalidCertificates=true` -- the .NET driver does not fully honor the latter for self-signed certificates).
-3. If connecting from a tool outside of Aspire, use this format:
+3. If connecting from `mongosh` or another MongoDB CLI tool outside of Aspire, use this format:
    ```
    mongodb://admin:<password>@localhost:<port>/?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsAllowInvalidCertificates=true
    ```
+   `mongosh` accepts `tlsAllowInvalidCertificates=true`. For .NET applications, prefer `tlsInsecure=true`.
 
 ### Connection refused / timeout
 
@@ -138,6 +139,7 @@ mongosh "mongodb://admin:<password>@localhost:<port>/?authSource=admin&authMecha
 ```
 
 Replace `<password>` and `<port>` with the values from the Aspire dashboard (click on the resource to see its connection string).
+For `mongosh`, `tlsAllowInvalidCertificates=true` matches the upstream DocumentDB documentation. For .NET applications, use the Aspire-generated connection string, which uses `tlsInsecure=true`.
 
 Useful mongosh commands:
 

@@ -9,7 +9,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Added
 - NuGet package metadata (description, tags, icon, license, project URL)
 - NuGet publish workflow for automated releases on version tags
-- `WithDataVolume` now accepts a `targetPath` parameter for custom mount paths
 - `UseTls()` and `AllowInsecureTls()` extension methods for explicit TLS control
 
 ### Changed
