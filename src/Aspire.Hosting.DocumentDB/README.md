@@ -1,87 +1,107 @@
-# Aspire.Hosting.DocumentDB library
+# Aspire.Hosting.DocumentDB
 
-[DocumentDB](https://github.com/documentdb/documentdb) is a MongoDB compatible open source document database built on PostgreSQL. This provides extension methods and resource definitions for a .NET Aspire AppHost to configure a DocumentDB resource.
+[DocumentDB](https://github.com/documentdb/documentdb) is an open-source, MongoDB-compatible document database built on PostgreSQL. This package provides .NET Aspire hosting integration to configure and run a DocumentDB container as part of your distributed application.
 
-## Getting started
+## Getting Started
+
+### Prerequisites
+
+- [.NET 9 SDK](https://dotnet.microsoft.com/download) or later with the Aspire workload: `dotnet workload install aspire`
+- [Docker](https://www.docker.com/products/docker-desktop/) (DocumentDB runs as a Linux container)
 
 ### Install the package
 
-In your AppHost project, install the .NET Aspire DocumentDB Hosting library with [NuGet](https://www.nuget.org):
+In your AppHost project:
 
 ```dotnetcli
 dotnet add package Aspire.Hosting.DocumentDB
 ```
 
-## Usage example
+### Add a DocumentDB resource
 
-Then, in the _AppHost.cs_ file of `AppHost`, add a DocumentDB resource and consume the connection using the following methods:
+In the AppHost `Program.cs`:
 
 ```csharp
-var db = builder.AddDocumentDB("DocumentDB").AddDatabase("mydb");
+var builder = DistributedApplication.CreateBuilder(args);
 
-var myService = builder.AddProject<Projects.MyService>()
-                       .WithReference(db);
+var db = builder.AddDocumentDB("documentdb")
+                .AddDatabase("mydb");
+
+builder.AddProject<Projects.MyService>()
+       .WithReference(db)
+       .WaitFor(db);
+
+builder.Build().Run();
 ```
 
-For local development, the generated DocumentDB connection strings enable TLS and allow the self-signed local certificate automatically so client applications can connect without extra manual connection string settings.
+### Connect from your service
 
-## Connecting from client applications
-
-To connect to DocumentDB from your application services, you'll need to install the MongoDB client integration package:
-
-### Install the client package
-
-In your service project, install the .NET Aspire MongoDB Driver component with [NuGet](https://www.nuget.org):
+In your service project, install the Aspire MongoDB driver integration:
 
 ```dotnetcli
 dotnet add package Aspire.MongoDB.Driver
 ```
 
-### Register the MongoDB client
-
-In your service's `Program.cs` file, register the MongoDB client:
+Register the client in `Program.cs`:
 
 ```csharp
-builder.AddMongoDBClient("DocumentDB");
+builder.AddMongoDBClient("mydb");
 ```
 
-### Use the MongoDB client
-
-Inject and use the MongoDB client in your services:
+Inject and use the MongoDB client:
 
 ```csharp
-public class MyService
+public class MyService(IMongoClient mongoClient)
 {
-    private readonly IMongoDatabase _database;
+    private readonly IMongoDatabase _database = mongoClient.GetDatabase("mydb");
 
-    public MyService(IMongoClient mongoClient)
+    public async Task<List<BsonDocument>> GetDocumentsAsync()
     {
-        _database = mongoClient.GetDatabase("mydb");
+        var collection = _database.GetCollection<BsonDocument>("mycollection");
+        return await collection.Find(FilterDefinition<BsonDocument>.Empty).ToListAsync();
     }
-
-    public async Task<List<MyDocument>> GetDocumentsAsync()
-    {
-        var collection = _database.GetCollection<MyDocument>("mycollection");
-        return await collection.Find(FilterDefinition<MyDocument>.Empty).ToListAsync();
-    }
-
-    public async Task InsertDocumentAsync(MyDocument document)
-    {
-        var collection = _database.GetCollection<MyDocument>("mycollection");
-        await collection.InsertOneAsync(document);
-    }
-}
-
-public class MyDocument
-{
-    public ObjectId Id { get; set; }
-    public string Name { get; set; } = string.Empty;
-    public DateTime CreatedAt { get; set; }
 }
 ```
 
-The client integration handles connection string resolution and provides features like health checks, logging, and telemetry automatically.
+The Aspire integration handles connection string resolution, TLS configuration, and credential management automatically.
 
-## Feedback & contributing
+## Configuration
 
-https://github.com/dotnet/aspire
+| Method | Description |
+|---|---|
+| `AddDocumentDB(name, port?, userName?, password?)` | Add a DocumentDB server container |
+| `.AddDatabase(name, databaseName?)` | Add a named database |
+| `.WithHostPort(port)` | Bind to a fixed host port (default: random) |
+| `.WithDataVolume(name?)` | Persist data with a Docker volume |
+| `.WithDataBindMount(source)` | Persist data with a host directory mount |
+| `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
+| `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |
+
+### Connection strings
+
+The extension generates MongoDB connection strings automatically:
+
+```
+mongodb://admin:<password>@<host>:<port>/<database>?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true
+```
+
+TLS and insecure TLS are enabled by default so the .NET MongoDB driver can connect to the self-signed certificate used by the DocumentDB Local container.
+
+### Data persistence
+
+By default, data is stored inside the container and lost on restart. Use `WithDataVolume()` to persist:
+
+```csharp
+builder.AddDocumentDB("documentdb")
+       .WithDataVolume()
+       .AddDatabase("mydb");
+```
+
+## More information
+
+- [Getting started guide](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/getting-started.md) -- detailed step-by-step setup
+- [Configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md) -- all methods, parameters, defaults, and connection string details
+- [Troubleshooting](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/troubleshooting.md) -- TLS errors, Docker issues, connection failures, debugging
+- [Changelog](https://github.com/microsoft/azure-databases-aspire/blob/main/CHANGELOG.md) -- release history
+- [DocumentDB project](https://github.com/documentdb/documentdb) -- the database itself
+- [.NET Aspire documentation](https://learn.microsoft.com/en-us/dotnet/aspire/) -- Aspire framework docs

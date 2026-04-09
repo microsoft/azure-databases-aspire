@@ -29,6 +29,11 @@ public static class DocumentDBBuilderExtensions
     /// <param name="name">The name of the resource. This name will be used as the connection string name when referenced in a dependency.</param>
     /// <param name="port">The host port for DocumentDB.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb", port: 10260);
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBServerResource> AddDocumentDB(this IDistributedApplicationBuilder builder, [ResourceName] string name, int? port)
     {
         return AddDocumentDB(builder, name, port, null, null);
@@ -43,6 +48,17 @@ public static class DocumentDBBuilderExtensions
     /// <param name="userName">A parameter that contains the DocumentDB server user name, or <see langword="null"/> to use a default value.</param>
     /// <param name="password">A parameter that contains the DocumentDB server password, or <see langword="null"/> to use a generated password.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// // Minimal usage with generated credentials:
+    /// var db = builder.AddDocumentDB("documentdb").AddDatabase("mydb");
+    ///
+    /// // With custom credentials:
+    /// var user = builder.AddParameter("db-user");
+    /// var pass = builder.AddParameter("db-pass", secret: true);
+    /// var db = builder.AddDocumentDB("documentdb", userName: user, password: pass);
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBServerResource> AddDocumentDB(this IDistributedApplicationBuilder builder,
         string name,
         int? port = null,
@@ -80,10 +96,21 @@ public static class DocumentDBBuilderExtensions
     /// <summary>
     /// Adds a DocumentDB database to the application model.
     /// </summary>
+    /// <remarks>
+    /// The database resource inherits the parent server's connection string and appends the database name.
+    /// Services should reference the database resource (not the server) via <c>.WithReference(db)</c>.
+    /// </remarks>
     /// <param name="builder">The DocumentDB server resource builder.</param>
     /// <param name="name">The name of the resource. This name will be used as the connection string name when referenced in a dependency.</param>
     /// <param name="databaseName">The name of the database. If not provided, this defaults to the same value as <paramref name="name"/>.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb");
+    /// var ordersDb = server.AddDatabase("orders");
+    /// var usersDb = server.AddDatabase("users");
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBDatabaseResource> AddDatabase(this IResourceBuilder<DocumentDBServerResource> builder, [ResourceName] string name, string? databaseName = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -123,6 +150,12 @@ public static class DocumentDBBuilderExtensions
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="port">The port to bind on the host. If <see langword="null"/> is used random port will be assigned.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .WithHostPort(10260);
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBServerResource> WithHostPort(this IResourceBuilder<DocumentDBServerResource> builder, int? port)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -136,11 +169,21 @@ public static class DocumentDBBuilderExtensions
     /// <summary>
     /// Adds a named volume for the data folder to a DocumentDB container resource.
     /// </summary>
+    /// <remarks>
+    /// Without a volume, all data is stored inside the container and lost when it stops.
+    /// The <c>DATA_PATH</c> environment variable is set to <paramref name="targetPath"/> inside the container.
+    /// </remarks>
     /// <param name="builder">The resource builder.</param>
     /// <param name="name">The name of the volume. Defaults to an auto-generated name based on the application and resource names.</param>
     /// <param name="isReadOnly">A flag that indicates if this is a read-only volume.</param>
     /// <param name="targetPath">The target path inside the container. Defaults to /home/documentdb/postgresql/data.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .WithDataVolume();
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBServerResource> WithDataVolume(
         this IResourceBuilder<DocumentDBServerResource> builder,
         string? name = null,
@@ -162,10 +205,21 @@ public static class DocumentDBBuilderExtensions
     /// <summary>
     /// Adds a bind mount for the data folder to a DocumentDB container resource.
     /// </summary>
+    /// <remarks>
+    /// Prefer <see cref="WithDataVolume"/> for most cases. Bind mounts are useful when you need
+    /// direct access to the data files on the host filesystem.
+    /// The <c>DATA_PATH</c> environment variable is set inside the container.
+    /// </remarks>
     /// <param name="builder">The resource builder.</param>
     /// <param name="source">The source directory on the host to mount into the container.</param>
     /// <param name="isReadOnly">A flag that indicates if this is a read-only mount.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .WithDataBindMount("./data/documentdb");
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBServerResource> WithDataBindMount(this IResourceBuilder<DocumentDBServerResource> builder, string source, bool isReadOnly = false)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -189,6 +243,13 @@ public static class DocumentDBBuilderExtensions
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="useTls">Whether to enable TLS. Defaults to <see langword="true"/>.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// // Disable TLS for a non-TLS endpoint:
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .UseTls(false);
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBServerResource> UseTls(this IResourceBuilder<DocumentDBServerResource> builder, bool useTls = true)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -203,9 +264,21 @@ public static class DocumentDBBuilderExtensions
     /// certificate used by the DocumentDB Local container.
     /// Call <c>AllowInsecureTls(false)</c> to require valid certificates.
     /// </summary>
+    /// <remarks>
+    /// The extension uses <c>tlsInsecure=true</c> rather than <c>tlsAllowInvalidCertificates=true</c>
+    /// because the .NET MongoDB driver does not fully honor <c>tlsAllowInvalidCertificates</c> for
+    /// self-signed certificates and raises <c>UntrustedRoot</c> errors.
+    /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="allowInsecureTls">Whether to allow insecure TLS. Defaults to <see langword="true"/>.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// // Require valid certificates (e.g., production with real certs):
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .AllowInsecureTls(false);
+    /// </code>
+    /// </example>
     public static IResourceBuilder<DocumentDBServerResource> AllowInsecureTls(this IResourceBuilder<DocumentDBServerResource> builder, bool allowInsecureTls = true)
     {
         ArgumentNullException.ThrowIfNull(builder);
