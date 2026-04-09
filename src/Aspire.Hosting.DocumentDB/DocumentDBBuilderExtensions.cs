@@ -51,12 +51,13 @@ public static class DocumentDBBuilderExtensions
     /// <example>
     /// <code>
     /// // Minimal usage with generated credentials:
-    /// var db = builder.AddDocumentDB("documentdb").AddDatabase("mydb");
+    /// var server = builder.AddDocumentDB("documentdb");
+    /// var database = server.AddDatabase("mydb");
     ///
     /// // With custom credentials:
     /// var user = builder.AddParameter("db-user");
     /// var pass = builder.AddParameter("db-pass", secret: true);
-    /// var db = builder.AddDocumentDB("documentdb", userName: user, password: pass);
+    /// var securedServer = builder.AddDocumentDB("documentdb", userName: user, password: pass);
     /// </code>
     /// </example>
     public static IResourceBuilder<DocumentDBServerResource> AddDocumentDB(this IDistributedApplicationBuilder builder,

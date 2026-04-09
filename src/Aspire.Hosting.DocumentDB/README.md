@@ -72,8 +72,8 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `AddDocumentDB(name, port?, userName?, password?)` | Add a DocumentDB server container |
 | `.AddDatabase(name, databaseName?)` | Add a named database |
 | `.WithHostPort(port)` | Bind to a fixed host port (default: random) |
-| `.WithDataVolume(name?)` | Persist data with a Docker volume |
-| `.WithDataBindMount(source)` | Persist data with a host directory mount |
+| `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume |
+| `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |
 

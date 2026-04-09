@@ -66,7 +66,7 @@ Common causes:
 **Symptom:** `MongoConnectionException` with "connection refused" or timeout.
 
 **Causes and solutions:**
-1. **Container not ready yet.** DocumentDB takes a few seconds to initialize. Use `.WaitFor(db)` in your AppHost to ensure the service waits for DocumentDB to be healthy before starting.
+1. **Container not ready yet.** DocumentDB takes a few seconds to initialize. Use `.WaitFor(db)` in your AppHost to improve startup ordering, but note that this integration does not currently register health checks, so your service should still handle transient connection failures with retry/backoff until DocumentDB is ready.
 2. **Wrong port.** By default, Aspire assigns a random host port. Do not hardcode ports in your service -- use `WithReference()` to inject the connection string automatically.
 3. **Firewall or network issue.** If running Docker in a VM or WSL2, ensure port forwarding is configured.
 
