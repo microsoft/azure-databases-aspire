@@ -181,7 +181,7 @@ The extension passes these environment variables to the DocumentDB container:
 |---|---|---|
 | `USERNAME` | The configured username | Container creates this user on startup |
 | `PASSWORD` | The configured password | Password for the created user |
-| `DATA_PATH` | `/home/documentdb/postgresql/data` | Only set when using `WithDataVolume` or `WithDataBindMount` |
+| `DATA_PATH` | Path inside the container for the data directory (default: `/home/documentdb/postgresql/data`) | Only set when using `WithDataVolume` or `WithDataBindMount` |
 
 ## Resource model
 

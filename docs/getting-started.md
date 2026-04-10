@@ -13,10 +13,10 @@ This guide walks you through adding [DocumentDB](https://github.com/documentdb/d
 
 ## Create or open an Aspire project
 
-If you already have an Aspire project, skip to step 2.
+If you already have an Aspire project, skip to [Install the package](#install-the-package).
 
 ```bash
-dotnet new aspire-starter -n MyApp
+dotnet new aspire-starter -o MyApp
 cd MyApp
 ```
 
@@ -43,7 +43,7 @@ var db = builder.AddDocumentDB("documentdb")
                 .AddDatabase("mydb");
 
 // Wire the database into your service
-var api = builder.AddProject<Projects.MyApp_ApiService>()
+var api = builder.AddProject<Projects.MyApp_ApiService>("apiservice")
                  .WithReference(db)
                  .WaitFor(db);
 

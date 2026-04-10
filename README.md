@@ -31,7 +31,7 @@ var builder = DistributedApplication.CreateBuilder(args);
 var db = builder.AddDocumentDB("documentdb")
                 .AddDatabase("mydb");
 
-builder.AddProject<Projects.MyService>()
+builder.AddProject<Projects.MyService>("myservice")
        .WithReference(db)
        .WaitFor(db);
 
