@@ -18,6 +18,7 @@ public static class DocumentDBBuilderExtensions
 
     private const string UserEnvVarName = "USERNAME";
     private const string PasswordEnvVarName = "PASSWORD";
+    private const string DefaultMountedDataPath = "/home/documentdb/postgresql/data";
 
     /// <summary>
     /// Adds a DocumentDB resource to the application model. A container is used for local development.
@@ -172,12 +173,14 @@ public static class DocumentDBBuilderExtensions
     /// </summary>
     /// <remarks>
     /// Without a volume, all data is stored inside the container and lost when it stops.
-    /// The <c>DATA_PATH</c> environment variable is set to <paramref name="targetPath"/> inside the container.
+    /// The bare DocumentDB container defaults <c>DATA_PATH</c> to <c>/data</c>.
+    /// This helper mounts the volume at <paramref name="targetPath"/> and sets
+    /// <c>DATA_PATH</c> to the same value so DocumentDB writes to the mounted directory.
     /// </remarks>
     /// <param name="builder">The resource builder.</param>
     /// <param name="name">The name of the volume. Defaults to an auto-generated name based on the application and resource names.</param>
     /// <param name="isReadOnly">A flag that indicates if this is a read-only volume.</param>
-    /// <param name="targetPath">The target path inside the container. Defaults to /home/documentdb/postgresql/data.</param>
+    /// <param name="targetPath">The target path inside the container. Defaults to /home/documentdb/postgresql/data when this helper is used.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
     /// <example>
     /// <code>
@@ -193,7 +196,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        targetPath ??= "/home/documentdb/postgresql/data";
+        targetPath ??= DefaultMountedDataPath;
 
         return builder
             .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly)
@@ -209,7 +212,9 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// Prefer <see cref="WithDataVolume"/> for most cases. Bind mounts are useful when you need
     /// direct access to the data files on the host filesystem.
-    /// The <c>DATA_PATH</c> environment variable is set inside the container.
+    /// The bare DocumentDB container defaults <c>DATA_PATH</c> to <c>/data</c>.
+    /// This helper mounts the directory at <c>/home/documentdb/postgresql/data</c> and sets
+    /// <c>DATA_PATH</c> to the same value so DocumentDB writes to the mounted directory.
     /// </remarks>
     /// <param name="builder">The resource builder.</param>
     /// <param name="source">The source directory on the host to mount into the container.</param>
@@ -226,7 +231,7 @@ public static class DocumentDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrEmpty(source);
 
-        const string targetPath = "/home/documentdb/postgresql/data";
+        const string targetPath = DefaultMountedDataPath;
 
         return builder
             .WithBindMount(source, targetPath, isReadOnly)

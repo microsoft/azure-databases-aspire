@@ -80,9 +80,9 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `name` | `string?` | Auto-generated | Docker volume name. When `null`, a name is generated from the application and resource names. |
 | `isReadOnly` | `bool` | `false` | Mount the volume as read-only. |
-| `targetPath` | `string?` | `/home/documentdb/postgresql/data` | Path inside the container where the volume is mounted. |
+| `targetPath` | `string?` | `/home/documentdb/postgresql/data` | Path inside the container where the volume is mounted when this helper is used. |
 
-The method also sets the `DATA_PATH` environment variable inside the container to match `targetPath`.
+The bare DocumentDB container defaults `DATA_PATH` to `/data`. This method mounts the volume at `targetPath` and sets the `DATA_PATH` environment variable to match, overriding the container default so DocumentDB writes to the mounted directory.
 
 ## WithDataBindMount
 
@@ -98,7 +98,7 @@ var server = builder.AddDocumentDB("documentdb")
 | `source` | `string` | (required) | Path on the host machine to mount. |
 | `isReadOnly` | `bool` | `false` | Mount as read-only. |
 
-The data is mounted at `/home/documentdb/postgresql/data` inside the container. The `DATA_PATH` environment variable is set accordingly.
+By default, this helper mounts data at `/home/documentdb/postgresql/data` inside the container and sets `DATA_PATH` accordingly. Without `WithDataVolume()` or `WithDataBindMount()`, the underlying DocumentDB container keeps its own default data path of `/data`.
 
 ## UseTls
 
@@ -169,7 +169,8 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Password | Auto-generated (no special characters) |
 | TLS | Enabled |
 | Insecure TLS | Enabled (allows self-signed certificates) |
-| Data path (in container) | `/home/documentdb/postgresql/data` |
+| Container default data path | `/data` |
+| Persistence helper default path | `/home/documentdb/postgresql/data` |
 | Auth mechanism | `SCRAM-SHA-256` |
 | Auth database | `admin` |
 
@@ -181,7 +182,7 @@ The extension passes these environment variables to the DocumentDB container:
 |---|---|---|
 | `USERNAME` | The configured username | Container creates this user on startup |
 | `PASSWORD` | The configured password | Password for the created user |
-| `DATA_PATH` | Path inside the container for the data directory (default: `/home/documentdb/postgresql/data`) | Only set when using `WithDataVolume` or `WithDataBindMount` |
+| `DATA_PATH` | Path inside the container for the mounted data directory | Only set when using `WithDataVolume` or `WithDataBindMount`; otherwise the container uses its default `/data` |
 
 ## Resource model
 
