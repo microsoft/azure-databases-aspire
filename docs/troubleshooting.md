@@ -95,6 +95,26 @@ Common causes:
    netstat -ano | findstr :10260   # Windows
    ```
 
+## Wrong resource reference
+
+**Symptom:** MongoDB operations fail with errors about missing database name, or data is written to an unexpected database.
+
+**Cause:** You are referencing the *server* resource instead of the *database* resource. The server connection string does not include a database name in the path.
+
+**Solution:** Always reference the database resource returned by `AddDatabase()`:
+
+```csharp
+var server = builder.AddDocumentDB("documentdb");
+var db = server.AddDatabase("mydb");
+
+builder.AddProject<Projects.MyService>("myservice")
+       // Correct -- connection string includes /mydb
+       .WithReference(db);
+
+       // Wrong -- connection string has no database name
+       // .WithReference(server);
+```
+
 ## Data persistence
 
 ### Data lost after container restart

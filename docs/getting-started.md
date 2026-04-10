@@ -56,6 +56,9 @@ This tells Aspire to:
 2. Generate credentials and a connection string
 3. Pass the connection string to your service as a named connection
 
+> [!NOTE]
+> `WaitFor` sequences container startup but does not perform a readiness health check. Your service should handle transient connection failures with retry logic during the first few seconds while DocumentDB initializes.
+
 ## Install the MongoDB client package
 
 In your **service** project (for example, `MyApp.ApiService`), add the Aspire MongoDB driver integration:

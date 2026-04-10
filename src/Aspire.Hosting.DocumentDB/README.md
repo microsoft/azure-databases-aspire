@@ -82,7 +82,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 The extension generates MongoDB connection strings automatically:
 
 ```
-mongodb://admin:<password>@<host>:<port>/<database>?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true
+mongodb://admin:<password>@<host>:<port>[/<database>]?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true
 ```
 
 TLS and insecure TLS are enabled by default so the .NET MongoDB driver can connect to the self-signed certificate used by the DocumentDB Local container.

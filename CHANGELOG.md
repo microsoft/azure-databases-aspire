@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 - Connection string TLS handling for .NET MongoDB driver self-signed certificate validation
+- `WithHostPort()` now updates the correct `tcp` endpoint (previously referenced `http`)
 
 ## [0.1.0] - 2025-08-20
 
