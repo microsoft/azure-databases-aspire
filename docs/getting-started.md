@@ -1,4 +1,4 @@
-# Getting Started
+# Getting started
 
 This guide walks you through adding [DocumentDB](https://github.com/documentdb/documentdb) to a .NET Aspire application. By the end, you will have a running Aspire app with a DocumentDB container that your services can connect to using the MongoDB driver.
 
@@ -11,7 +11,7 @@ This guide walks you through adding [DocumentDB](https://github.com/documentdb/d
 | Docker | DocumentDB runs as a Linux container. [Docker Desktop](https://www.docker.com/products/docker-desktop/) or any Docker-compatible runtime works. |
 | IDE (optional) | Visual Studio 2022 17.9+, VS Code with C# Dev Kit, or JetBrains Rider |
 
-## 1. Create or open an Aspire project
+## Create or open an Aspire project
 
 If you already have an Aspire project, skip to step 2.
 
@@ -22,7 +22,7 @@ cd MyApp
 
 This creates a solution with an AppHost project and a service project.
 
-## 2. Install the package
+## Install the package
 
 In your **AppHost** project, add the DocumentDB hosting package:
 
@@ -31,7 +31,7 @@ cd MyApp.AppHost
 dotnet add package Aspire.Hosting.DocumentDB
 ```
 
-## 3. Configure the AppHost
+## Configure the AppHost
 
 In your AppHost's `Program.cs`, add a DocumentDB server and a database:
 
@@ -56,16 +56,16 @@ This tells Aspire to:
 2. Generate credentials and a connection string
 3. Pass the connection string to your service as a named connection
 
-## 4. Install the MongoDB client package
+## Install the MongoDB client package
 
-In your **service** project (e.g. `MyApp.ApiService`), add the Aspire MongoDB driver integration:
+In your **service** project (for example, `MyApp.ApiService`), add the Aspire MongoDB driver integration:
 
 ```bash
 cd MyApp.ApiService
 dotnet add package Aspire.MongoDB.Driver
 ```
 
-## 5. Register and use the MongoDB client
+## Register and use the MongoDB client
 
 In your service's `Program.cs`, register the client using the same connection name you used in the AppHost:
 
@@ -88,7 +88,7 @@ app.MapGet("/documents", async (IMongoClient client) =>
 });
 ```
 
-## 6. Run the application
+## Run the application
 
 ```bash
 cd MyApp.AppHost
@@ -111,5 +111,5 @@ You can find the generated connection string in the Aspire dashboard under the r
 
 ## Next steps
 
-- [Configuration Reference](configuration.md) -- all available methods and options
-- [Troubleshooting](troubleshooting.md) -- common issues and solutions
+- [Configuration reference](configuration.md) — all available methods and options
+- [Troubleshooting](troubleshooting.md) — common issues and solutions

@@ -2,7 +2,7 @@
 
 [DocumentDB](https://github.com/documentdb/documentdb) is an open-source, MongoDB-compatible document database built on PostgreSQL. This package provides .NET Aspire hosting integration to configure and run a DocumentDB container as part of your distributed application.
 
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
@@ -99,9 +99,9 @@ builder.AddDocumentDB("documentdb")
 
 ## More information
 
-- [Getting started guide](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/getting-started.md) -- detailed step-by-step setup
-- [Configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md) -- all methods, parameters, defaults, and connection string details
-- [Troubleshooting](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/troubleshooting.md) -- TLS errors, Docker issues, connection failures, debugging
-- [Changelog](https://github.com/microsoft/azure-databases-aspire/blob/main/CHANGELOG.md) -- release history
-- [DocumentDB project](https://github.com/documentdb/documentdb) -- the database itself
-- [.NET Aspire documentation](https://learn.microsoft.com/en-us/dotnet/aspire/) -- Aspire framework docs
+- [Getting started guide](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/getting-started.md) — detailed step-by-step setup
+- [Configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md) — all methods, parameters, defaults, and connection string details
+- [Troubleshooting](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/troubleshooting.md) — TLS errors, Docker issues, connection failures, debugging
+- [Changelog](https://github.com/microsoft/azure-databases-aspire/blob/main/CHANGELOG.md) — release history
+- [DocumentDB project](https://github.com/documentdb/documentdb) — the database itself
+- [.NET Aspire documentation](https://learn.microsoft.com/en-us/dotnet/aspire/) — Aspire framework docs

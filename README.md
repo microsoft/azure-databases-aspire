@@ -7,7 +7,7 @@ A [.NET Aspire](https://learn.microsoft.com/en-us/dotnet/aspire/fundamentals/int
 
 This package lets you add a DocumentDB container to your Aspire AppHost with a single line of code. Connection strings, credentials, TLS, and container lifecycle are managed automatically.
 
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
@@ -15,7 +15,7 @@ This package lets you add a DocumentDB container to your Aspire AppHost with a s
 - [.NET Aspire workload](https://learn.microsoft.com/en-us/dotnet/aspire/fundamentals/setup-tooling): `dotnet workload install aspire`
 - [Docker](https://www.docker.com/products/docker-desktop/) (DocumentDB runs as a Linux container)
 
-### 1. Install the package
+### Install the package
 
 In your Aspire **AppHost** project:
 
@@ -23,7 +23,7 @@ In your Aspire **AppHost** project:
 dotnet add package Aspire.Hosting.DocumentDB
 ```
 
-### 2. Add DocumentDB to your AppHost
+### Add DocumentDB to your AppHost
 
 ```csharp
 var builder = DistributedApplication.CreateBuilder(args);
@@ -38,7 +38,7 @@ builder.AddProject<Projects.MyService>()
 builder.Build().Run();
 ```
 
-### 3. Use MongoDB client in your service
+### Use MongoDB client in your service
 
 In your service project, install and register the MongoDB driver:
 
@@ -52,7 +52,7 @@ builder.AddMongoDBClient("mydb");
 
 Then inject `IMongoClient` wherever you need it. The connection string is resolved automatically.
 
-## Configuration Methods
+## Configuration methods
 
 | Method | Description |
 |---|---|

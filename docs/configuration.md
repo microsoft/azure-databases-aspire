@@ -1,10 +1,10 @@
-# Configuration Reference
+# Configuration reference
 
 This page documents every public API method in `Aspire.Hosting.DocumentDB` with usage examples and default values.
 
 ## AddDocumentDB
 
-Adds a DocumentDB server resource to the Aspire application model. A container is started for local development.
+The extension adds a DocumentDB server resource to the Aspire application model. A container is started for local development.
 
 ```csharp
 // Minimal -- random port, generated credentials
@@ -105,7 +105,7 @@ The data is mounted at `/home/documentdb/postgresql/data` inside the container. 
 Controls whether TLS is included in the generated connection string. TLS is **enabled by default** because the DocumentDB Local container requires TLS connections.
 
 ```csharp
-// Disable TLS (e.g., connecting to a non-TLS endpoint)
+// Disable TLS (for example, connecting to a non-TLS endpoint)
 var server = builder.AddDocumentDB("documentdb")
                     .UseTls(false);
 
@@ -123,7 +123,7 @@ var server = builder.AddDocumentDB("documentdb")
 Controls whether `tlsInsecure=true` is added to the connection string, which disables certificate validation. This is **enabled by default** so the .NET MongoDB driver can connect to the self-signed certificate used by the DocumentDB Local container.
 
 ```csharp
-// Require valid certificates (e.g., production with real certs)
+// Require valid certificates (for example, production with real certs)
 var server = builder.AddDocumentDB("documentdb")
                     .AllowInsecureTls(false);
 ```
@@ -132,9 +132,10 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `allowInsecureTls` | `bool` | `true` | Whether to add `tlsInsecure=true` to the connection string. |
 
-> **Note:** The extension uses `tlsInsecure=true` rather than `tlsAllowInvalidCertificates=true` because the .NET MongoDB driver does not fully honor `tlsAllowInvalidCertificates` for self-signed certificates and raises `UntrustedRoot` errors. `tlsInsecure=true` disables both certificate validation and hostname verification, which is the correct setting for local development containers.
+> [!NOTE]
+> The extension uses `tlsInsecure=true` rather than `tlsAllowInvalidCertificates=true` because the .NET MongoDB driver does not fully honor `tlsAllowInvalidCertificates` for self-signed certificates and raises `UntrustedRoot` errors. `tlsInsecure=true` disables both certificate validation and hostname verification, which is the correct setting for local development containers.
 
-## Connection String Format
+## Connection string format
 
 The extension generates a MongoDB connection string with the following format:
 
@@ -156,7 +157,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | `tls` | `true` | Controlled by `UseTls()` |
 | `tlsInsecure` | `true` | Controlled by `AllowInsecureTls()` |
 
-## Defaults Summary
+## Defaults summary
 
 | Setting | Default Value |
 |---|---|
@@ -172,7 +173,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Auth mechanism | `SCRAM-SHA-256` |
 | Auth database | `admin` |
 
-## Container Environment Variables
+## Container environment variables
 
 The extension passes these environment variables to the DocumentDB container:
 
@@ -182,7 +183,7 @@ The extension passes these environment variables to the DocumentDB container:
 | `PASSWORD` | The configured password | Password for the created user |
 | `DATA_PATH` | `/home/documentdb/postgresql/data` | Only set when using `WithDataVolume` or `WithDataBindMount` |
 
-## Resource Model
+## Resource model
 
 The extension defines two resource types:
 
@@ -198,10 +199,10 @@ IDistributedApplicationBuilder
                     +-- DocumentDBDatabaseResource  (child resource with connection string)
 ```
 
-- **DocumentDBServerResource** -- Represents the DocumentDB container. Implements `IResourceWithConnectionString`. The server-level connection string does not include a database name.
-- **DocumentDBDatabaseResource** -- A child resource that represents a specific database on the server. Its connection string includes the database name in the path. This is what services typically reference with `WithReference()`.
+- **DocumentDBServerResource** — Represents the DocumentDB container. Implements `IResourceWithConnectionString`. The server-level connection string does not include a database name.
+- **DocumentDBDatabaseResource** — A child resource that represents a specific database on the server. Its connection string includes the database name in the path. This is what services typically reference with `WithReference()`.
 
-## Chaining Methods
+## Chaining methods
 
 All configuration methods return the builder, so they can be chained:
 

@@ -54,7 +54,7 @@ Common causes:
 **Solution:** This should work automatically. The extension adds `tls=true&tlsInsecure=true` to the connection string by default. If you see this error:
 
 1. Verify you are referencing the resource correctly: `.WithReference(db)` where `db` is the database resource from `AddDatabase()`.
-2. If you manually constructed a connection string, add `tlsInsecure=true` (not `tlsAllowInvalidCertificates=true` -- the .NET driver does not fully honor the latter for self-signed certificates).
+2. If you manually constructed a connection string, add `tlsInsecure=true` (not `tlsAllowInvalidCertificates=true` — the .NET driver does not fully honor the latter for self-signed certificates).
 3. If connecting from `mongosh` or another MongoDB CLI tool outside of Aspire, use this format:
    ```
    mongodb://admin:<password>@localhost:<port>/?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsAllowInvalidCertificates=true
@@ -66,8 +66,11 @@ Common causes:
 **Symptom:** `MongoConnectionException` with "connection refused" or timeout.
 
 **Causes and solutions:**
-1. **Container not ready yet.** DocumentDB takes a few seconds to initialize. Use `.WaitFor(db)` in your AppHost to improve startup ordering, but note that this integration does not currently register health checks, so your service should still handle transient connection failures with retry/backoff until DocumentDB is ready.
-2. **Wrong port.** By default, Aspire assigns a random host port. Do not hardcode ports in your service -- use `WithReference()` to inject the connection string automatically.
+1. **Container not ready yet.** DocumentDB takes a few seconds to initialize. Use `.WaitFor(db)` in your AppHost to improve startup ordering.
+
+> [!IMPORTANT]
+> This integration does not currently register health checks. Your service should handle transient connection failures with retry/backoff until DocumentDB is ready.
+2. **Wrong port.** By default, Aspire assigns a random host port. Do not hardcode ports in your service — use `WithReference()` to inject the connection string automatically.
 3. **Firewall or network issue.** If running Docker in a VM or WSL2, ensure port forwarding is configured.
 
 ### Authentication failures
@@ -98,7 +101,7 @@ Common causes:
 
 **Symptom:** All documents disappear when the Aspire application or Docker restarts.
 
-**Cause:** By default, DocumentDB data is stored inside the container filesystem, which is ephemeral.
+**Cause:** By default, DocumentDB stores data inside the container filesystem. This storage is ephemeral.
 
 **Solution:** Use `WithDataVolume()` to persist data in a Docker named volume:
 
@@ -174,7 +177,7 @@ DocumentDB container logs can help diagnose startup and runtime issues:
    docker logs -f <container-id>
    ```
 
-## Known Limitations
+## Known limitations
 
 - **Health checks are not enabled by default.** The health check integration is present in the code but commented out. Use `.WaitFor()` to sequence resource startup.
 - **No built-in backup/restore.** For development data, use `WithDataVolume()` for persistence. For important data, use `mongodump` / `mongorestore` manually.

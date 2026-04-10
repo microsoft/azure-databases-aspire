@@ -275,7 +275,7 @@ public static class DocumentDBBuilderExtensions
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
     /// <example>
     /// <code>
-    /// // Require valid certificates (e.g., production with real certs):
+    /// // Require valid certificates (for example, production with real certs):
     /// var server = builder.AddDocumentDB("documentdb")
     ///                     .AllowInsecureTls(false);
     /// </code>
