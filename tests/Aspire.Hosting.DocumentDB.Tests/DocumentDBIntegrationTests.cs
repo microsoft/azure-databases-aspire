@@ -12,6 +12,9 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 
 public class DocumentDBIntegrationTests
 {
+    private const string EndToEndTimeoutEnvironmentVariable = "DOCUMENTDB_E2E_TIMEOUT_SECONDS";
+    private static readonly TimeSpan DefaultEndToEndTimeout = TimeSpan.FromMinutes(5);
+
     [Fact]
     public async Task EndToEndAppCanInsertAndDeleteDocument()
     {
@@ -20,7 +23,7 @@ public class DocumentDBIntegrationTests
             throw SkipException.ForSkip("Docker is required for DocumentDB end-to-end validation.");
         }
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        using var cts = CreateEndToEndTimeoutSource();
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Aspire.Hosting.DocumentDB.EndToEndApp.Program>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -58,7 +61,7 @@ public class DocumentDBIntegrationTests
             throw SkipException.ForSkip("Docker is required for DocumentDB end-to-end validation.");
         }
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        using var cts = CreateEndToEndTimeoutSource();
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Aspire.Hosting.DocumentDB.ConfiguredEndToEndApp.Program>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -120,5 +123,24 @@ public class DocumentDBIntegrationTests
         }
 
         throw new InvalidOperationException("DocumentDB did not become reachable in time.", lastException);
+    }
+
+    private static CancellationTokenSource CreateEndToEndTimeoutSource() => new(GetEndToEndTimeout());
+
+    private static TimeSpan GetEndToEndTimeout()
+    {
+        var configuredTimeout = Environment.GetEnvironmentVariable(EndToEndTimeoutEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(configuredTimeout))
+        {
+            return DefaultEndToEndTimeout;
+        }
+
+        if (!int.TryParse(configuredTimeout, out var timeoutSeconds) || timeoutSeconds <= 0)
+        {
+            throw new InvalidOperationException(
+                $"{EndToEndTimeoutEnvironmentVariable} must be a positive integer number of seconds, but was '{configuredTimeout}'.");
+        }
+
+        return TimeSpan.FromSeconds(timeoutSeconds);
     }
 }
