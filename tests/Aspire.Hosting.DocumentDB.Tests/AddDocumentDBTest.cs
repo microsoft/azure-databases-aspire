@@ -5,7 +5,6 @@ using System.Net.Sockets;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
-using MongoDB.Driver;
 using Xunit;
 
 namespace Aspire.Hosting.DocumentDB.Tests;
@@ -70,6 +69,25 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public void WithHostPortConfiguresPrimaryEndpointPort()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder
+            .AddDocumentDB("DocumentDB")
+            .WithHostPort(10261);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var endpoint = Assert.Single(containerResource.Annotations.OfType<EndpointAnnotation>());
+        Assert.Equal("tcp", endpoint.Name);
+        Assert.Equal(10260, endpoint.TargetPort);
+        Assert.Equal(10261, endpoint.Port);
+    }
+
+    [Fact]
     public async Task DocumentDBCreatesConnectionString()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
@@ -101,7 +119,14 @@ public class AddDocumentDBTests
             ("authMechanism", "SCRAM-SHA-256"),
             ("tls", "true"),
             ("tlsInsecure", "true"));
-        Assert.Equal("mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", serverResource.ConnectionStringExpression.ValueExpression);
+        AssertConnectionStringExpression(
+            serverResource.ConnectionStringExpression.ValueExpression,
+            resourceName: "DocumentDB",
+            expectedDatabaseName: null,
+            ("authSource", "admin"),
+            ("authMechanism", "SCRAM-SHA-256"),
+            ("tls", "true"),
+            ("tlsInsecure", "true"));
 
         AssertConnectionString(
             connectionString!,
@@ -111,7 +136,14 @@ public class AddDocumentDBTests
             ("authMechanism", "SCRAM-SHA-256"),
             ("tls", "true"),
             ("tlsInsecure", "true"));
-        Assert.Equal("mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydatabase?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", connectionStringResource.ConnectionStringExpression.ValueExpression);
+        AssertConnectionStringExpression(
+            connectionStringResource.ConnectionStringExpression.ValueExpression,
+            resourceName: "DocumentDB",
+            expectedDatabaseName: "mydatabase",
+            ("authSource", "admin"),
+            ("authMechanism", "SCRAM-SHA-256"),
+            ("tls", "true"),
+            ("tlsInsecure", "true"));
     }
 
     [Fact]
@@ -190,8 +222,22 @@ public class AddDocumentDBTests
         Assert.Equal("customers1", db1.Resource.DatabaseName);
         Assert.Equal("customers2", db2.Resource.DatabaseName);
 
-        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers1?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db1.Resource.ConnectionStringExpression.ValueExpression);
-        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/customers2?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db2.Resource.ConnectionStringExpression.ValueExpression);
+        AssertConnectionStringExpression(
+            db1.Resource.ConnectionStringExpression.ValueExpression,
+            resourceName: "DocumentDB1",
+            expectedDatabaseName: "customers1",
+            ("authSource", "admin"),
+            ("authMechanism", "SCRAM-SHA-256"),
+            ("tls", "true"),
+            ("tlsInsecure", "true"));
+        AssertConnectionStringExpression(
+            db2.Resource.ConnectionStringExpression.ValueExpression,
+            resourceName: "DocumentDB1",
+            expectedDatabaseName: "customers2",
+            ("authSource", "admin"),
+            ("authMechanism", "SCRAM-SHA-256"),
+            ("tls", "true"),
+            ("tlsInsecure", "true"));
     }
 
     [Fact]
@@ -208,8 +254,22 @@ public class AddDocumentDBTests
         Assert.Equal("imports", db1.Resource.DatabaseName);
         Assert.Equal("imports", db2.Resource.DatabaseName);
 
-        Assert.Equal("mongodb://admin:{DocumentDB1-password.value}@{DocumentDB1.bindings.tcp.host}:{DocumentDB1.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db1.Resource.ConnectionStringExpression.ValueExpression);
-        Assert.Equal("mongodb://admin:{DocumentDB2-password.value}@{DocumentDB2.bindings.tcp.host}:{DocumentDB2.bindings.tcp.port}/imports?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsInsecure=true", db2.Resource.ConnectionStringExpression.ValueExpression);
+        AssertConnectionStringExpression(
+            db1.Resource.ConnectionStringExpression.ValueExpression,
+            resourceName: "DocumentDB1",
+            expectedDatabaseName: "imports",
+            ("authSource", "admin"),
+            ("authMechanism", "SCRAM-SHA-256"),
+            ("tls", "true"),
+            ("tlsInsecure", "true"));
+        AssertConnectionStringExpression(
+            db2.Resource.ConnectionStringExpression.ValueExpression,
+            resourceName: "DocumentDB2",
+            expectedDatabaseName: "imports",
+            ("authSource", "admin"),
+            ("authMechanism", "SCRAM-SHA-256"),
+            ("tls", "true"),
+            ("tlsInsecure", "true"));
     }
 
     [Fact]
@@ -342,6 +402,27 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public async Task WithDataVolumeSupportsReadOnlyVolumes()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder
+            .AddDocumentDB("DocumentDB")
+            .WithDataVolume(isReadOnly: true);
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.Volume));
+        Assert.Equal("/home/documentdb/postgresql/data", volumeAnnotation.Target);
+        Assert.True(volumeAnnotation.IsReadOnly);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
+        Assert.Equal("/home/documentdb/postgresql/data", dataPath.Value);
+    }
+
+    [Fact]
     public async Task WithDataBindMountAddsBindMountAnnotation()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
@@ -364,7 +445,29 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public void AddDocumentDBWithCustomUserNameAndPassword()
+    public async Task WithDataBindMountSupportsReadOnlyBindMounts()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder
+            .AddDocumentDB("DocumentDB")
+            .WithDataBindMount("/host/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var bindMountAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.BindMount));
+        Assert.Equal("/host/data", bindMountAnnotation.Source);
+        Assert.Equal("/home/documentdb/postgresql/data", bindMountAnnotation.Target);
+        Assert.True(bindMountAnnotation.IsReadOnly);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
+        Assert.Equal("/home/documentdb/postgresql/data", dataPath.Value);
+    }
+
+    [Fact]
+    public async Task AddDocumentDBWithCustomUserNameAndPassword()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         var userName = appBuilder.AddParameter("user", secret: false);
@@ -382,9 +485,20 @@ public class AddDocumentDBTests
         Assert.NotNull(serverResource.PasswordParameter);
         Assert.Equal("pass", serverResource.PasswordParameter.Name);
 
-        var connectionStringExpr = serverResource.ConnectionStringExpression.ValueExpression;
-        Assert.Contains("{user.value}", connectionStringExpr);
-        Assert.Contains("{pass.value}", connectionStringExpr);
+        AssertConnectionStringExpression(
+            serverResource.ConnectionStringExpression.ValueExpression,
+            resourceName: "DocumentDB",
+            expectedDatabaseName: null,
+            expectedUserExpression: "{user.value}",
+            expectedPasswordExpression: "{pass.value}",
+            ("authSource", "admin"),
+            ("authMechanism", "SCRAM-SHA-256"),
+            ("tls", "true"),
+            ("tlsInsecure", "true"));
+
+        var env = await BuildEnvironmentVariablesAsync(serverResource);
+        Assert.Equal("{user.value}", Assert.IsType<ReferenceExpression>(env["USERNAME"]).ValueExpression);
+        Assert.Equal("pass", Assert.IsType<ParameterResource>(env["PASSWORD"]).Name);
     }
 
     [Fact]
@@ -441,6 +555,64 @@ public class AddDocumentDBTests
         foreach (var (name, value) in expectedQueryParameters)
         {
             Assert.True(queryParameters.TryGetValue(name, out var actualValue), $"Expected query parameter '{name}' in '{connectionString}'.");
+            Assert.Equal(value, actualValue);
+        }
+
+        return queryParameters;
+    }
+
+    private static Dictionary<string, string> AssertConnectionStringExpression(
+        string connectionStringExpression,
+        string resourceName,
+        string? expectedDatabaseName,
+        params (string Name, string Value)[] expectedQueryParameters)
+    {
+        return AssertConnectionStringExpression(
+            connectionStringExpression,
+            resourceName,
+            expectedDatabaseName,
+            expectedUserExpression: "admin",
+            expectedPasswordExpression: null,
+            expectedQueryParameters);
+    }
+
+    private static Dictionary<string, string> AssertConnectionStringExpression(
+        string connectionStringExpression,
+        string resourceName,
+        string? expectedDatabaseName,
+        string expectedUserExpression,
+        string? expectedPasswordExpression,
+        params (string Name, string Value)[] expectedQueryParameters)
+    {
+        Assert.StartsWith("mongodb://", connectionStringExpression);
+
+        expectedPasswordExpression ??= $"{{{resourceName}-password.value}}";
+
+        var valueWithoutScheme = connectionStringExpression["mongodb://".Length..];
+        var querySeparatorIndex = valueWithoutScheme.IndexOf('?');
+        var authorityAndPath = querySeparatorIndex >= 0 ? valueWithoutScheme[..querySeparatorIndex] : valueWithoutScheme;
+        var query = querySeparatorIndex >= 0 ? valueWithoutScheme[(querySeparatorIndex + 1)..] : string.Empty;
+
+        var userInfoSeparatorIndex = authorityAndPath.IndexOf('@');
+        Assert.True(userInfoSeparatorIndex >= 0, $"Expected user info in '{connectionStringExpression}'.");
+
+        var userInfo = authorityAndPath[..userInfoSeparatorIndex];
+        var hostAndPath = authorityAndPath[(userInfoSeparatorIndex + 1)..];
+        var userInfoSegments = userInfo.Split(':', 2);
+        Assert.Equal(2, userInfoSegments.Length);
+        Assert.Equal(expectedUserExpression, userInfoSegments[0]);
+        Assert.Equal(expectedPasswordExpression, userInfoSegments[1]);
+
+        var pathSeparatorIndex = hostAndPath.IndexOf('/');
+        var hostPort = pathSeparatorIndex >= 0 ? hostAndPath[..pathSeparatorIndex] : hostAndPath;
+        var databasePath = pathSeparatorIndex >= 0 ? hostAndPath[pathSeparatorIndex..] : string.Empty;
+        Assert.Equal($"{{{resourceName}.bindings.tcp.host}}:{{{resourceName}.bindings.tcp.port}}", hostPort);
+        Assert.Equal(expectedDatabaseName is null ? string.Empty : $"/{expectedDatabaseName}", databasePath);
+
+        var queryParameters = ParseQueryParameters(query);
+        foreach (var (name, value) in expectedQueryParameters)
+        {
+            Assert.True(queryParameters.TryGetValue(name, out var actualValue), $"Expected query parameter '{name}' in '{connectionStringExpression}'.");
             Assert.Equal(value, actualValue);
         }
 
