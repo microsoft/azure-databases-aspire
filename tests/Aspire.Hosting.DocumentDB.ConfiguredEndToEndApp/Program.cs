@@ -11,15 +11,7 @@ public class Program
     {
         var builder = DistributedApplication.CreateBuilder(args);
 
-        var documentDbPassword = builder.AddParameter(
-            "configured-documentdb-password",
-            "ConfiguredEndToEndPassword123",
-            publishValueAsDefault: false,
-            secret: true);
-
-        var documentDb = builder.AddDocumentDB("documentdb", password: documentDbPassword);
-        documentDb
-            .WithDataVolume(name: VolumeNameGenerator.Generate(documentDb, "configured-data"))
+        builder.AddDocumentDB("documentdb")
             .AddDatabase("configureddb");
 
         var app = builder.Build();
