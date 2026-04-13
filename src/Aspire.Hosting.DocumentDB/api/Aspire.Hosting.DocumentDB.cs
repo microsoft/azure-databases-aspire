@@ -10,7 +10,9 @@ namespace Aspire.Hosting
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithDataBindMount(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string source, bool isReadOnly = false) { throw null; }
 
-        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithDataVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string? name = null, bool isReadOnly = false) { throw null; }
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithDataVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string? name = null, bool isReadOnly = false, string? targetPath = null) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithHostPort(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, int? port) { throw null; }
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> UseTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool useTls = true) { throw null; }
 
