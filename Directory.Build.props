@@ -1,7 +1,7 @@
 <Project>
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
-    <DefaultTargetFramework>net9.0</DefaultTargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
+    <DefaultTargetFramework>net10.0</DefaultTargetFramework>
     <RepoRoot>$(MSBuildThisFileDirectory)</RepoRoot>
 
     <LangVersion>latest</LangVersion>
