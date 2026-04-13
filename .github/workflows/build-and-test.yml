@@ -33,7 +33,7 @@ jobs:
         run: dotnet build azure-databases-aspire.sln --no-restore
 
       - name: Unit Tests
-        run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build --filter "FullyQualifiedName!~IntegrationTests"
+        run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build --filter "Category=Unit"
 
   integration-test:
     runs-on: ubuntu-latest
@@ -54,4 +54,4 @@ jobs:
         run: dotnet build azure-databases-aspire.sln --no-restore
 
       - name: Integration Tests
-        run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build --filter "FullyQualifiedName~IntegrationTests"
+        run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build --filter "Category=Integration"

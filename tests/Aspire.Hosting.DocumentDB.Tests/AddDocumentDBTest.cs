@@ -9,6 +9,7 @@ using Xunit;
 
 namespace Aspire.Hosting.DocumentDB.Tests;
 
+[Trait("Category", "Unit")]
 public class AddDocumentDBTests
 {
     [Fact]

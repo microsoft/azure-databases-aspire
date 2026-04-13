@@ -4,6 +4,7 @@ using Xunit;
 
 namespace Aspire.Hosting.DocumentDB.Tests;
 
+[Trait("Category", "Unit")]
 public class DocumentDBPublicApiTests
 {
     [Fact]
