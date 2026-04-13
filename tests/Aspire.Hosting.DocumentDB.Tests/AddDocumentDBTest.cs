@@ -70,11 +70,10 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public void WithHostPortConfiguresPrimaryEndpointPort()
+    public void WithHostPortUpdatesExistingTcpEndpoint()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder
-            .AddDocumentDB("DocumentDB")
+        appBuilder.AddDocumentDB("DocumentDB")
             .WithHostPort(10261);
 
         using var app = appBuilder.Build();
@@ -83,9 +82,10 @@ public class AddDocumentDBTests
 
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
         var endpoint = Assert.Single(containerResource.Annotations.OfType<EndpointAnnotation>());
+
         Assert.Equal("tcp", endpoint.Name);
-        Assert.Equal(10260, endpoint.TargetPort);
         Assert.Equal(10261, endpoint.Port);
+        Assert.Equal(10260, endpoint.TargetPort);
     }
 
     [Fact]
