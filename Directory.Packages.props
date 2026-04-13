@@ -22,7 +22,7 @@
     <PackageVersion Include="JsonSchema.Net" Version="7.3.3" />
     <PackageVersion Include="Microsoft.DotNet.RemoteExecutor" Version="9.0.0-beta.25204.5" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.10.0" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.4.0" />
     <PackageVersion Include="OpenTelemetry.Exporter.InMemory" Version="1.9.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.abstractions" Version="2.0.3" />
