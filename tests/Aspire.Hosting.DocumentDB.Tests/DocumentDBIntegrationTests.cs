@@ -50,6 +50,44 @@ public class DocumentDBIntegrationTests
         Assert.Equal(0, await collection.CountDocumentsAsync(filter, cancellationToken: cts.Token));
     }
 
+    [Fact]
+    public async Task ConfiguredEndToEndAppCanInsertAndDeleteDocument()
+    {
+        if (!RequiresDockerAttribute.IsSupported)
+        {
+            throw SkipException.ForSkip("Docker is required for DocumentDB end-to-end validation.");
+        }
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Aspire.Hosting.DocumentDB.ConfiguredEndToEndApp.Program>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("configureddb", cts.Token);
+        Assert.False(string.IsNullOrWhiteSpace(connectionString));
+
+        const string databaseName = "configureddb";
+        var database = await ConnectAsync(connectionString!, databaseName, cts.Token);
+        var collection = database.GetCollection<BsonDocument>("items");
+
+        var id = ObjectId.GenerateNewId();
+        var filter = Builders<BsonDocument>.Filter.Eq("_id", id);
+        var document = new BsonDocument
+        {
+            ["_id"] = id,
+            ["name"] = "configured-item"
+        };
+
+        await collection.InsertOneAsync(document, cancellationToken: cts.Token);
+        Assert.Equal(1, await collection.CountDocumentsAsync(filter, cancellationToken: cts.Token));
+
+        var deleteResult = await collection.DeleteOneAsync(filter, cancellationToken: cts.Token);
+        Assert.Equal(1, deleteResult.DeletedCount);
+        Assert.Equal(0, await collection.CountDocumentsAsync(filter, cancellationToken: cts.Token));
+    }
+
     private static async Task<IMongoDatabase> ConnectAsync(string connectionString, string databaseName, CancellationToken cancellationToken)
     {
         var settings = MongoClientSettings.FromConnectionString(connectionString);
