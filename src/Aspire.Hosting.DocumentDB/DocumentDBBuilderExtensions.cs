@@ -127,7 +127,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEndpoint("http", endpoint =>
+        return builder.WithEndpoint(DocumentDBServerResource.PrimaryEndpointName, endpoint =>
         {
             endpoint.Port = port;
         });
