@@ -6,7 +6,7 @@
 
 ### Prerequisites
 
-- [.NET 9 SDK](https://dotnet.microsoft.com/download) or later with the Aspire workload: `dotnet workload install aspire`
+- [.NET 10 SDK](https://dotnet.microsoft.com/download) or later with the Aspire workload: `dotnet workload install aspire`
 - [Docker](https://www.docker.com/products/docker-desktop/) (DocumentDB runs as a Linux container)
 
 ### Install the package

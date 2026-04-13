@@ -18,7 +18,7 @@
     <RepositoryType>git</RepositoryType>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageIcon>AzureCosmosDB_256x.png</PackageIcon>
-    <PackageReadmeFile>src/Aspire.Hosting.DocumentDB/README.md</PackageReadmeFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <MinVerTagPrefix>v</MinVerTagPrefix>
   </PropertyGroup>
 
@@ -32,7 +32,7 @@
 
   <ItemGroup>
     <None Include="$(SharedDir)AzureCosmosDB_256x.png" Pack="true" PackagePath="\" />
-    <None Include="README.md" Pack="true" PackagePath="src/Aspire.Hosting.DocumentDB/" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
     <None Include="../../CHANGELOG.md" Pack="true" PackagePath="\" />
     <None Include="../../LICENSE" Pack="true" PackagePath="\" />
     <None Include="../../docs/**/*.md" Pack="true" PackagePath="docs/%(RecursiveDir)%(Filename)%(Extension)" />

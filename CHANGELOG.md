@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `UseTls()` and `AllowInsecureTls()` extension methods for explicit TLS control
 
 ### Changed
-- Upgraded to .NET Aspire 13.1.2
+- Upgraded to .NET Aspire 13.2.2
 - Default container image updated to `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.109.0`
 - TLS is now enabled by default (`tls=true&tlsInsecure=true`) for the local container's self-signed certificate
 - Uses `tlsInsecure=true` instead of `tlsAllowInvalidCertificates=true` for better .NET MongoDB driver compatibility

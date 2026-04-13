@@ -6,7 +6,7 @@ This guide walks you through adding [DocumentDB](https://github.com/documentdb/d
 
 | Requirement | Details |
 |---|---|
-| .NET 9 SDK or later | [Download](https://dotnet.microsoft.com/download) |
+| .NET 10 SDK or later | [Download](https://dotnet.microsoft.com/download) |
 | .NET Aspire workload | `dotnet workload install aspire` |
 | Docker | DocumentDB runs as a Linux container. [Docker Desktop](https://www.docker.com/products/docker-desktop/) or any Docker-compatible runtime works. |
 | IDE (optional) | Visual Studio 2022 17.9+, VS Code with C# Dev Kit, or JetBrains Rider |

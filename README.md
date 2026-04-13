@@ -11,7 +11,7 @@ This package lets you add a DocumentDB container to your Aspire AppHost with a s
 
 ### Prerequisites
 
-- [.NET 9 SDK](https://dotnet.microsoft.com/download) or later
+- [.NET 10 SDK](https://dotnet.microsoft.com/download) or later
 - [.NET Aspire workload](https://learn.microsoft.com/en-us/dotnet/aspire/fundamentals/setup-tooling): `dotnet workload install aspire`
 - [Docker](https://www.docker.com/products/docker-desktop/) (DocumentDB runs as a Linux container)
 
