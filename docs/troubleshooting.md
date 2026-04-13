@@ -164,7 +164,7 @@ mongosh "mongodb://admin:<password>@localhost:<port>/?authSource=admin&authMecha
 Replace `<password>` and `<port>` with the values from the Aspire dashboard (click on the resource to see its connection string).
 For `mongosh`, `tlsAllowInvalidCertificates=true` matches the upstream DocumentDB documentation. For .NET applications, use the Aspire-generated connection string, which uses `tlsInsecure=true`.
 
-Useful mongosh commands:
+### Useful `mongosh` commands
 
 ```javascript
 // List databases
@@ -199,6 +199,6 @@ DocumentDB container logs can help diagnose startup and runtime issues:
 
 ## Known limitations
 
-- **Health checks are not enabled by default.** The health check integration is present in the code but commented out. Use `.WaitFor()` to sequence resource startup.
+- **Health checks are not enabled by default.** This integration does not currently register health checks. Use `.WaitFor()` to sequence resource startup.
 - **No built-in backup/restore.** For development data, use `WithDataVolume()` for persistence. For important data, use `mongodump` / `mongorestore` manually.
 - **Single server only.** The extension does not support replica sets or sharded clusters. It runs a single DocumentDB container intended for local development.

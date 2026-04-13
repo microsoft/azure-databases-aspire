@@ -1,10 +1,10 @@
 # Configuration reference
 
-This page documents every public API method in `Aspire.Hosting.DocumentDB` with usage examples and default values.
+This page covers the public API methods you can use in `Aspire.Hosting.DocumentDB`, along with usage examples and default values.
 
 ## AddDocumentDB
 
-The extension adds a DocumentDB server resource to the Aspire application model. A container is started for local development.
+The extension adds a DocumentDB server resource to the Aspire application model and starts a container for local development.
 
 ```csharp
 // Minimal -- random port, generated credentials
@@ -98,7 +98,7 @@ var server = builder.AddDocumentDB("documentdb")
 | `source` | `string` | (required) | Path on the host machine to mount. |
 | `isReadOnly` | `bool` | `false` | Mount as read-only. |
 
-By default, this helper mounts data at `/home/documentdb/postgresql/data` inside the container and sets `DATA_PATH` accordingly. Without `WithDataVolume()` or `WithDataBindMount()`, the underlying DocumentDB container keeps its own default data path of `/data`.
+By default, this helper mounts data at `/home/documentdb/postgresql/data` inside the container and sets `DATA_PATH` accordingly. If you do not call `WithDataVolume()` or `WithDataBindMount()`, the underlying DocumentDB container keeps its own default data path of `/data`.
 
 ## UseTls
 

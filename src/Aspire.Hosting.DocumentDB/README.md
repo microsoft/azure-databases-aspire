@@ -89,7 +89,7 @@ TLS and insecure TLS are enabled by default so the .NET MongoDB driver can conne
 
 ### Data persistence
 
-By default, data is stored inside the container and lost on restart. Use `WithDataVolume()` to persist:
+By default, DocumentDB stores data inside the container, and restarting the container removes it. Use `WithDataVolume()` to persist it:
 
 ```csharp
 builder.AddDocumentDB("documentdb")
@@ -99,10 +99,10 @@ builder.AddDocumentDB("documentdb")
 
 ## More information
 
-- [Getting started guide](../../docs/getting-started.md) — detailed step-by-step setup
-- [Configuration reference](../../docs/configuration.md) — all methods, parameters, defaults, and connection string details
-- [Troubleshooting](../../docs/troubleshooting.md) — TLS errors, Docker issues, connection failures, debugging
-- [Changelog](../../CHANGELOG.md) — release history
-- [License](../../LICENSE) — package license
+- [Getting started guide](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/getting-started.md) — detailed step-by-step setup
+- [Configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md) — all methods, parameters, defaults, and connection string details
+- [Troubleshooting](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/troubleshooting.md) — TLS errors, Docker issues, connection failures, debugging
+- [Changelog](https://github.com/microsoft/azure-databases-aspire/blob/main/CHANGELOG.md) — release history
+- [License](https://github.com/microsoft/azure-databases-aspire/blob/main/LICENSE) — package license
 - [DocumentDB project](https://github.com/documentdb/documentdb) — the database itself
 - [.NET Aspire documentation](https://learn.microsoft.com/en-us/dotnet/aspire/) — Aspire framework docs
