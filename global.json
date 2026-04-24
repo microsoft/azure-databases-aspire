@@ -5,6 +5,6 @@
     "allowPrerelease": false
   },
   "msbuild-sdks": {
-    "Aspire.AppHost.Sdk": "13.2.2"
+    "Aspire.AppHost.Sdk": "13.2.3"
   }
 }
