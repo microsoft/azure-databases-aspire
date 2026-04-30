@@ -135,6 +135,72 @@ var server = builder.AddDocumentDB("documentdb")
 > [!NOTE]
 > The extension uses `tlsInsecure=true` rather than `tlsAllowInvalidCertificates=true` because the .NET MongoDB driver does not fully honor `tlsAllowInvalidCertificates` for self-signed certificates and raises `UntrustedRoot` errors. `tlsInsecure=true` disables both certificate validation and hostname verification, which is the correct setting for local development containers.
 
+## WithDocumentDBVersion
+
+Pins the DocumentDB version to a specific release known to this build of the package. The selected version is combined with the currently selected `DocumentDBPostgresVersion` (default `Pg17`) to produce the container image tag `pgN-X.Y.Z`.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `version` | `DocumentDBVersion` | (required) | One of the supported versions enumerated by `DocumentDBVersion`. |
+
+## WithPostgresVersion
+
+Selects the PostgreSQL backend variant of the `documentdb-local` container image.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithPostgresVersion(DocumentDBPostgresVersion.Pg16)
+                    .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
+// -> image tag "pg16-0.110.0"
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`. |
+
+## Supported versions
+
+The `DocumentDBVersion` enum is the **curated, append-only** list of versions known to this build of the package. New entries are added by the `check-documentdb-version` GitHub Actions workflow only when the version is published as a non-prerelease GitHub Release on [`documentdb/documentdb`](https://github.com/documentdb/documentdb/releases) AND the `pg15-X.Y.Z`, `pg16-X.Y.Z`, and `pg17-X.Y.Z` container tags all exist on GHCR. Existing entries are never renamed, removed, or renumbered.
+
+You can enumerate the full list at runtime via `DocumentDBVersions.All`, and read the newest version known to the current package build via `DocumentDBVersions.Latest` (a property, not a `const`, so it is re-resolved after a package upgrade rather than inlined).
+
+| Symbol | Notes |
+|---|---|
+| `enum DocumentDBVersion` | Curated members like `V0_109_0`, `V0_110_0`. Stable forever once shipped. |
+| `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`. Default `Pg17`. |
+| `DocumentDBVersions.All` | All known version strings, ascending semver. |
+| `DocumentDBVersions.Latest` | The newest version known to *this build* of the package. |
+
+### Using a version not (yet) in the enum
+
+Aspire's framework `WithImageTag` is the free-form escape hatch. Use it to pin to a brand-new upstream release this package has not been updated to know about, or to a custom build:
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithImageTag("pg17-0.999.0");
+```
+
+### Precedence (last-call-wins)
+
+`WithDocumentDBVersion`, `WithPostgresVersion`, `WithImage`, and `WithImageTag` all converge on the same single `ContainerImageAnnotation`. The most recent call wins, regardless of which API was used:
+
+```csharp
+// Final tag is "pg17-0.110.0" -- the typed call wins because it came last.
+builder.AddDocumentDB("documentdb")
+       .WithImageTag("pg15-0.999.0")
+       .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
+
+// Final tag is "pg17-0.999.0" -- the free-form call wins because it came last.
+builder.AddDocumentDB("documentdb")
+       .WithDocumentDBVersion(DocumentDBVersion.V0_110_0)
+       .WithImageTag("pg17-0.999.0");
+```
+
 ## Connection string format
 
 The extension generates a MongoDB connection string with the following format:
@@ -162,7 +228,9 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-0.109.0` |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.110.0`) |
+| DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
+| PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
 | Host port | Random (unless set with `WithHostPort` or `port` parameter) |
 | Username | `admin` |
@@ -211,6 +279,8 @@ All configuration methods return the builder, so they can be chained:
 var db = builder.AddDocumentDB("documentdb")
                 .WithHostPort(10260)
                 .WithDataVolume()
+                .WithDocumentDBVersion(DocumentDBVersion.V0_110_0)
+                .WithPostgresVersion(DocumentDBPostgresVersion.Pg17)
                 .UseTls(true)
                 .AllowInsecureTls(true)
                 .AddDatabase("mydb");

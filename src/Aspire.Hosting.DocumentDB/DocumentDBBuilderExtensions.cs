@@ -292,4 +292,105 @@ public static class DocumentDBBuilderExtensions
         builder.Resource.SetAllowInsecureTls(allowInsecureTls);
         return builder;
     }
+
+    /// <summary>
+    /// Pins the DocumentDB version to a specific release known to this build of the package.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The selected version is combined with the currently selected
+    /// <see cref="DocumentDBPostgresVersion"/> (default <see cref="DocumentDBPostgresVersion.Pg17"/>)
+    /// to produce the container image tag <c>pgN-X.Y.Z</c>.
+    /// </para>
+    /// <para>
+    /// <b>Precedence:</b> for the image tag, the most recent of <see cref="WithDocumentDBVersion"/>,
+    /// <see cref="WithPostgresVersion"/>,
+    /// <see cref="ContainerResourceBuilderExtensions.WithImage{T}(IResourceBuilder{T}, string, string?)"/>,
+    /// and <see cref="ContainerResourceBuilderExtensions.WithImageTag{T}(IResourceBuilder{T}, string)"/>
+    /// wins. They all converge on the same single <see cref="ContainerImageAnnotation"/>.
+    /// </para>
+    /// <para>
+    /// This method updates only the image tag. A custom image name or registry configured with
+    /// <see cref="ContainerResourceBuilderExtensions.WithImage{T}(IResourceBuilder{T}, string, string?)"/>
+    /// or <see cref="ContainerResourceBuilderExtensions.WithImageRegistry{T}(IResourceBuilder{T}, string)"/>
+    /// is preserved.
+    /// </para>
+    /// <para>
+    /// To pin to a version not in <see cref="DocumentDBVersion"/> (for example, a brand-new
+    /// upstream release this package has not yet been updated to know about), use
+    /// <see cref="ContainerResourceBuilderExtensions.WithImageTag{T}(IResourceBuilder{T}, string)"/>
+    /// directly with a tag like <c>"pg17-0.999.0"</c>.
+    /// </para>
+    /// </remarks>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="version">The DocumentDB version to use.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
+    /// </code>
+    /// </example>
+    public static IResourceBuilder<DocumentDBServerResource> WithDocumentDBVersion(
+        this IResourceBuilder<DocumentDBServerResource> builder,
+        DocumentDBVersion version)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        builder.Resource.SetVersion(version);
+        return builder.WithImageTag(builder.Resource.ComputeImageTag());
+    }
+
+    /// <summary>
+    /// Selects the PostgreSQL backend variant of the <c>documentdb-local</c> container image.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The selected variant is combined with the currently selected
+    /// <see cref="DocumentDBVersion"/> (or <see cref="DocumentDBVersions.Latest"/> by default)
+    /// to produce the container image tag <c>pgN-X.Y.Z</c>.
+    /// </para>
+    /// <para>
+    /// <b>Precedence:</b> see <see cref="WithDocumentDBVersion"/> — last call wins.
+    /// </para>
+    /// </remarks>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="pgVersion">The PostgreSQL backend variant to use.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="builder"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="pgVersion"/> is not a defined member of
+    /// <see cref="DocumentDBPostgresVersion"/>. Use a free-form
+    /// <see cref="ContainerResourceBuilderExtensions.WithImageTag{T}(IResourceBuilder{T}, string)"/>
+    /// call to target an unsupported PG variant.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .WithPostgresVersion(DocumentDBPostgresVersion.Pg16)
+    ///                     .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
+    /// // -&gt; image tag "pg16-0.110.0"
+    /// </code>
+    /// </example>
+    public static IResourceBuilder<DocumentDBServerResource> WithPostgresVersion(
+        this IResourceBuilder<DocumentDBServerResource> builder,
+        DocumentDBPostgresVersion pgVersion)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        if (!Enum.IsDefined(pgVersion))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(pgVersion),
+                pgVersion,
+                $"Unsupported PostgreSQL backend variant '{pgVersion}'. " +
+                $"Use one of {nameof(DocumentDBPostgresVersion.Pg15)}, " +
+                $"{nameof(DocumentDBPostgresVersion.Pg16)}, or " +
+                $"{nameof(DocumentDBPostgresVersion.Pg17)}, or fall back to a free-form " +
+                $"WithImageTag(...) for unsupported variants.");
+        }
+
+        builder.Resource.SetPgVersion(pgVersion);
+        return builder.WithImageTag(builder.Resource.ComputeImageTag());
+    }
 }

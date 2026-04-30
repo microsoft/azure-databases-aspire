@@ -63,6 +63,8 @@ Then inject `IMongoClient` wherever you need it. The connection string is resolv
 | `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allowInsecureTls?)` | Allow self-signed certificates (default: enabled) |
+| `.WithDocumentDBVersion(version)` | Pin a curated DocumentDB version (default: latest known to this build) |
+| `.WithPostgresVersion(pgVersion)` | Choose PG15/16/17 backend variant (default: Pg17) |
 
 See the [Configuration Reference](docs/configuration.md) for details, code examples, and default values.
 

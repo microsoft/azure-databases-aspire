@@ -53,6 +53,21 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// </summary>
     internal bool AllowInsecureTls { get; set; } = true;
 
+    /// <summary>
+    /// Selected DocumentDB version, or <see langword="null"/> when the default
+    /// (<see cref="DocumentDBVersions.Latest"/>) should be used. Internal-only because consumers
+    /// must not rely on this as the source of truth: a free-form
+    /// <c>WithImageTag(...)</c>/<c>WithImage(...)</c> call can override the actual container tag
+    /// without touching this field.
+    /// </summary>
+    internal DocumentDBVersion? Version { get; private set; }
+
+    /// <summary>
+    /// Selected PostgreSQL backend variant. Defaults to <see cref="DocumentDBPostgresVersion.Pg17"/>.
+    /// Internal-only for the same reason as <see cref="Version"/>.
+    /// </summary>
+    internal DocumentDBPostgresVersion PgVersion { get; private set; } = DocumentDBPostgresVersion.Pg17;
+
     internal ReferenceExpression UserNameReference =>
         UserNameParameter is not null ?
             ReferenceExpression.Create($"{UserNameParameter}") :
@@ -129,5 +144,28 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     internal void SetAllowInsecureTls(bool allowInsecureTls)
     {
         AllowInsecureTls = allowInsecureTls;
+    }
+
+    internal void SetVersion(DocumentDBVersion version)
+    {
+        Version = version;
+    }
+
+    internal void SetPgVersion(DocumentDBPostgresVersion pgVersion)
+    {
+        PgVersion = pgVersion;
+    }
+
+    /// <summary>
+    /// Computes the container image tag (<c>pgN-X.Y.Z</c>) from the current
+    /// <see cref="Version"/> and <see cref="PgVersion"/> selections, falling back to
+    /// <see cref="DocumentDBVersions.Latest"/> when no DocumentDB version has been explicitly set.
+    /// </summary>
+    internal string ComputeImageTag()
+    {
+        var versionString = Version is { } v
+            ? DocumentDBVersions.ToVersionString(v)
+            : DocumentDBVersions.Latest;
+        return $"pg{(int)PgVersion}-{versionString}";
     }
 }
