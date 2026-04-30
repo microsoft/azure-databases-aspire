@@ -215,22 +215,57 @@ public class DocumentDBVersionSelectionTests
     }
 
     [Fact]
-    public void EveryDocumentDBVersionEnumMemberMapsToAVersionString()
+    public void DocumentDBVersionsAllCannotBeMutatedByDowncast()
     {
-        // Drives auto-generation consistency: if the update script ever forgets to update one
-        // of the auto-generated regions in DocumentDBVersion.cs, this test fails.
-        var allMembers = Enum.GetValues<DocumentDBVersion>();
-        Assert.NotEmpty(allMembers);
-        Assert.Equal(allMembers.Length, DocumentDBVersions.All.Count);
+        // Regression: previously the backing field was a `string[]`, so callers could
+        // cast the IReadOnlyList<string> back to string[] and mutate it process-wide,
+        // which would silently change `Latest` (and therefore the default container tag)
+        // for subsequent AddDocumentDB(...) calls.
+        var snapshotBefore = DocumentDBVersions.All.ToArray();
+        var latestBefore = DocumentDBVersions.Latest;
 
-        foreach (var member in allMembers)
+        Assert.False(
+            DocumentDBVersions.All is string[],
+            "DocumentDBVersions.All must not be a string[] — it must be a read-only wrapper " +
+            "to prevent callers from downcasting and mutating it process-wide.");
+
+        var asReadOnlyList = DocumentDBVersions.All;
+        Assert.IsAssignableFrom<System.Collections.ObjectModel.ReadOnlyCollection<string>>(asReadOnlyList);
+
+        // Sanity: even an attempt to round-trip through ICollection<string>.Add must fail.
+        if (asReadOnlyList is ICollection<string> mutableView)
         {
-            // Reflectively reach the internal ToVersionString to keep this test self-contained.
-            var method = typeof(DocumentDBVersions).GetMethod(
-                "ToVersionString",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
-            var versionString = (string)method.Invoke(null, new object[] { member })!;
-            Assert.Contains(versionString, DocumentDBVersions.All);
+            Assert.Throws<NotSupportedException>(() => mutableView.Add("0.999.0"));
         }
+
+        Assert.Equal(snapshotBefore, DocumentDBVersions.All);
+        Assert.Equal(latestBefore, DocumentDBVersions.Latest);
+    }
+
+    [Fact]
+    public void WithPostgresVersionRejectsUndefinedEnumValues()
+    {
+        // Regression: previously WithPostgresVersion forwarded any int-cast value to
+        // `(int)PgVersion`, producing tags like "pg999-..." that bypass the curated PG
+        // variant contract.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var resourceBuilder = appBuilder.AddDocumentDB("documentdb");
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(
+            () => resourceBuilder.WithPostgresVersion((DocumentDBPostgresVersion)999));
+
+        Assert.Equal("pgVersion", ex.ParamName);
+    }
+
+    [Fact]
+    public void WithPostgresVersionRejectsZero()
+    {
+        // The default(DocumentDBPostgresVersion) value is 0, which is not a defined member
+        // (Pg15, Pg16, Pg17 use explicit numeric values 15/16/17).
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var resourceBuilder = appBuilder.AddDocumentDB("documentdb");
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => resourceBuilder.WithPostgresVersion(default));
     }
 }

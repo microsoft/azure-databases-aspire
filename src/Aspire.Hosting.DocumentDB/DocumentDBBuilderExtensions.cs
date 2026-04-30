@@ -357,6 +357,13 @@ public static class DocumentDBBuilderExtensions
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="pgVersion">The PostgreSQL backend variant to use.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="builder"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="pgVersion"/> is not a defined member of
+    /// <see cref="DocumentDBPostgresVersion"/>. Use a free-form
+    /// <see cref="ContainerResourceBuilderExtensions.WithImageTag{T}(IResourceBuilder{T}, string)"/>
+    /// call to target an unsupported PG variant.
+    /// </exception>
     /// <example>
     /// <code>
     /// var server = builder.AddDocumentDB("documentdb")
@@ -370,6 +377,18 @@ public static class DocumentDBBuilderExtensions
         DocumentDBPostgresVersion pgVersion)
     {
         ArgumentNullException.ThrowIfNull(builder);
+
+        if (!Enum.IsDefined(pgVersion))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(pgVersion),
+                pgVersion,
+                $"Unsupported PostgreSQL backend variant '{pgVersion}'. " +
+                $"Use one of {nameof(DocumentDBPostgresVersion.Pg15)}, " +
+                $"{nameof(DocumentDBPostgresVersion.Pg16)}, or " +
+                $"{nameof(DocumentDBPostgresVersion.Pg17)}, or fall back to a free-form " +
+                $"WithImageTag(...) for unsupported variants.");
+        }
 
         builder.Resource.SetPgVersion(pgVersion);
         return builder.WithImageTag(builder.Resource.ComputeImageTag());

@@ -4,7 +4,6 @@ All notable changes to the `Aspire.Hosting.DocumentDB` package will be documente
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project uses [MinVer](https://github.com/adamralph/minver) for versioning based on Git tags.
 
-<!-- auto-generated:documentdb-versions-start -->
 ## [Unreleased]
 
 ### Added
@@ -22,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `DocumentDBContainerImageTags.Tag` is now a computed property
   (`pg17-{DocumentDBVersions.Latest}`) instead of a `const`, so the default tag follows the
   curated `Latest` version without manual edits to two files.
+
+<!-- auto-generated:documentdb-versions-start -->
+<!-- This block is rewritten by eng/scripts/check-documentdb-versions.py.
+     It contains ONLY auto-detected upstream version notes. Manual changelog
+     entries belong above this block, inside the [Unreleased] section. -->
 <!-- auto-generated:documentdb-versions-end -->
 
 ## [0.109.2] - 2026-04-13

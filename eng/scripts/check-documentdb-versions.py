@@ -345,22 +345,29 @@ def write_versions_file(versions_file: Path, assignments: dict[SemVer, int]) -> 
 def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
     """Replace-in-place the auto-generated DocumentDB versions block in CHANGELOG.md.
 
-    If the marker block does not yet exist, insert it right after the top-level title
-    so reruns become idempotent.
+    The block contains ONLY auto-detected upstream version notes. The surrounding
+    ``## [Unreleased]`` header and any manually-authored changelog entries live
+    OUTSIDE the marker block and are never touched by this script.
+
+    If the marker block does not exist yet (bootstrap), insert an empty block at
+    the end of the existing ``## [Unreleased]`` section, or — if no such section
+    exists — right after the top-level title.
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     body_lines = [
-        "## [Unreleased]",
+        "### Added (auto-detected upstream DocumentDB versions)",
         "",
-        "### Added",
-        f"- Detected new DocumentDB upstream version(s) on {today}:",
     ]
     for v in new_versions:
-        body_lines.append(f"  - {v} (container tags `pg15-{v}`, `pg16-{v}`, `pg17-{v}`)")
+        body_lines.append(
+            f"- DocumentDB `{v}` upstream release detected on {today} "
+            f"(container tags `pg15-{v}`, `pg16-{v}`, `pg17-{v}`)."
+        )
+    body_lines.append("")
     body_lines.append(
-        "- These were appended to `DocumentDBVersion` / `DocumentDBVersions`. "
-        "The maintainer must also append the new enum members to "
-        "`src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` before merging."
+        "_Maintainer: append the matching `DocumentDBVersion.V0_X_Y` enum members and "
+        "`public const string V0_X_Y = \"X.Y.Z\";` lines to "
+        "`src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` before merging._"
     )
     body = "\n".join(body_lines)
 
@@ -375,14 +382,26 @@ def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
         block = (
             "<!-- auto-generated:documentdb-versions-start -->\n"
             f"{body}\n"
-            "<!-- auto-generated:documentdb-versions-end -->\n\n"
+            "<!-- auto-generated:documentdb-versions-end -->\n"
         )
-        # Insert after the top-level "# Changelog" title and its blank line.
-        first_break = text.find("\n\n")
-        if first_break == -1:
-            text = block + text
+        # Prefer to bootstrap inside the existing [Unreleased] section so future runs
+        # never touch the manually-authored entries. Insert immediately before the
+        # next "## [" heading (i.e. at the end of [Unreleased]). Fall back to "right
+        # after the top-level title" when no [Unreleased] section exists.
+        unreleased_idx = text.find("## [Unreleased]")
+        if unreleased_idx != -1:
+            next_section_idx = text.find("\n## [", unreleased_idx + 1)
+            if next_section_idx != -1:
+                insertion_point = next_section_idx + 1  # keep the leading newline
+                text = text[:insertion_point] + block + "\n" + text[insertion_point:]
+            else:
+                text = text.rstrip() + "\n\n" + block
         else:
-            text = text[: first_break + 2] + block + text[first_break + 2 :]
+            first_break = text.find("\n\n")
+            if first_break == -1:
+                text = block + text
+            else:
+                text = text[: first_break + 2] + block + text[first_break + 2 :]
 
     changelog_file.write_text(text, encoding="utf-8")
 
