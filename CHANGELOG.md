@@ -4,6 +4,26 @@ All notable changes to the `Aspire.Hosting.DocumentDB` package will be documente
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project uses [MinVer](https://github.com/adamralph/minver) for versioning based on Git tags.
 
+<!-- auto-generated:documentdb-versions-start -->
+## [Unreleased]
+
+### Added
+- `DocumentDBVersion` enum (curated, append-only) and `DocumentDBPostgresVersion` enum exposing
+  the PostgreSQL backend choice.
+- `DocumentDBVersions` static class with `All`, `Latest`, and per-version string constants.
+- `WithDocumentDBVersion(...)` extension method to pin the DocumentDB version from code.
+- `WithPostgresVersion(...)` extension method to pick a PG15/PG16/PG17 backend variant.
+- `.github/workflows/check-documentdb-version.yml` scheduled workflow + companion
+  `eng/scripts/check-documentdb-versions.py` that detects new upstream releases (when both a
+  GitHub release and `pg15/16/17-X.Y.Z` GHCR tags exist) and opens a PR appending them to the
+  curated supported-versions list.
+
+### Changed
+- `DocumentDBContainerImageTags.Tag` is now a computed property
+  (`pg17-{DocumentDBVersions.Latest}`) instead of a `const`, so the default tag follows the
+  curated `Latest` version without manual edits to two files.
+<!-- auto-generated:documentdb-versions-end -->
+
 ## [0.109.2] - 2026-04-13
 
 ### Added
