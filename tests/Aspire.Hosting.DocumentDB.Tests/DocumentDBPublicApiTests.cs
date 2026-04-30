@@ -321,4 +321,29 @@ public class DocumentDBPublicApiTests
             : Assert.Throws<ArgumentException>(action);
         Assert.Equal(nameof(owner), exception.ParamName);
     }
+
+    [Fact]
+    public void WithHostPortShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithHostPort(10260);
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData("/some/dir/", "/valid/key.pem", "certPath")]
+    [InlineData("/valid/cert.pem", "/some/dir/", "keyPath")]
+    public void WithTlsCertificateShouldThrowWhenPathIsDirectoryOnly(string certPath, string keyPath, string expectedParamName)
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+
+        var action = () => builder.WithTlsCertificate(certPath, keyPath);
+
+        var exception = Assert.Throws<ArgumentException>(action);
+        Assert.Equal(expectedParamName, exception.ParamName);
+    }
 }

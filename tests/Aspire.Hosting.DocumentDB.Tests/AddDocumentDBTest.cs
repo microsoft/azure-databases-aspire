@@ -727,6 +727,37 @@ public class AddDocumentDBTests
         Assert.Equal(expectedKeyTarget, env["KEY_FILE"]);
     }
 
+    [Fact]
+    public async Task WithLogLevelThrowsForUndefinedEnumValue()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel((DocumentDBLogLevel)99);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => BuildEnvironmentVariablesAsync(containerResource));
+    }
+
+    [Fact]
+    public async Task WithTelemetryDefaultsToEnabled()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTelemetry();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["ENABLE_TELEMETRY"]);
+    }
+
     private static Dictionary<string, string> AssertConnectionString(
         string connectionString,
         string? expectedDatabaseName,
