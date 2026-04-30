@@ -137,9 +137,7 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     }
 
     internal void SetUseTls(bool useTls)
-    {
-        TLS = useTls;
-    }
+        => TLS = useTls;
 
     internal void SetAllowInsecureTls(bool allowInsecureTls)
     {
