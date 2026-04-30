@@ -303,11 +303,17 @@ public static class DocumentDBBuilderExtensions
     /// to produce the container image tag <c>pgN-X.Y.Z</c>.
     /// </para>
     /// <para>
-    /// <b>Precedence:</b> the most recent of <see cref="WithDocumentDBVersion"/>,
+    /// <b>Precedence:</b> for the image tag, the most recent of <see cref="WithDocumentDBVersion"/>,
     /// <see cref="WithPostgresVersion"/>,
     /// <see cref="ContainerResourceBuilderExtensions.WithImage{T}(IResourceBuilder{T}, string, string?)"/>,
     /// and <see cref="ContainerResourceBuilderExtensions.WithImageTag{T}(IResourceBuilder{T}, string)"/>
     /// wins. They all converge on the same single <see cref="ContainerImageAnnotation"/>.
+    /// </para>
+    /// <para>
+    /// This method updates only the image tag. A custom image name or registry configured with
+    /// <see cref="ContainerResourceBuilderExtensions.WithImage{T}(IResourceBuilder{T}, string, string?)"/>
+    /// or <see cref="ContainerResourceBuilderExtensions.WithImageRegistry{T}(IResourceBuilder{T}, string)"/>
+    /// is preserved.
     /// </para>
     /// <para>
     /// To pin to a version not in <see cref="DocumentDBVersion"/> (for example, a brand-new
@@ -332,7 +338,7 @@ public static class DocumentDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
 
         builder.Resource.SetVersion(version);
-        return builder.WithImage(DocumentDBContainerImageTags.Image, builder.Resource.ComputeImageTag());
+        return builder.WithImageTag(builder.Resource.ComputeImageTag());
     }
 
     /// <summary>
@@ -366,6 +372,6 @@ public static class DocumentDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
 
         builder.Resource.SetPgVersion(pgVersion);
-        return builder.WithImage(DocumentDBContainerImageTags.Image, builder.Resource.ComputeImageTag());
+        return builder.WithImageTag(builder.Resource.ComputeImageTag());
     }
 }

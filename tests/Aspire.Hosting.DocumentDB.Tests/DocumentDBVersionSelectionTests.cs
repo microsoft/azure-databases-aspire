@@ -135,6 +135,27 @@ public class DocumentDBVersionSelectionTests
     }
 
     [Fact]
+    public void TypedVersionMethodsPreserveCustomImageAndRegistry()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+
+        appBuilder.AddDocumentDB("documentdb")
+            .WithImage("custom/documentdb-local", "pg17-0.999.0")
+            .WithImageRegistry("registry.example.com")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_110_0)
+            .WithPostgresVersion(DocumentDBPostgresVersion.Pg15);
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var image = Assert.Single(server.Annotations.OfType<ContainerImageAnnotation>());
+
+        Assert.Equal("custom/documentdb-local", image.Image);
+        Assert.Equal("registry.example.com", image.Registry);
+        Assert.Equal("pg15-0.110.0", image.Tag);
+    }
+
+    [Fact]
     public void RepeatedCallsKeepASingleContainerImageAnnotation()
     {
         // Aspire's WithImage / WithImageTag mutate the existing ContainerImageAnnotation in

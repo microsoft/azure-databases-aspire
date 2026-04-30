@@ -33,7 +33,7 @@ time of this check", not "image bytes are immutable". Pinning by digest is a fut
 enhancement.
 
 Exit status: 0 always when invoked normally (success / no-op / new-versions-detected). Non-zero
-only on unrecoverable errors (network failures with no retries left, malformed source files).
+only on unrecoverable errors (network failures, malformed source files).
 """
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -93,35 +94,71 @@ class SemVer:
 # Network
 # ---------------------------------------------------------------------------
 
-def _http_get_json(url: str, headers: dict[str, str] | None = None) -> object:
+def _http_get_json_and_link(url: str, headers: dict[str, str] | None = None) -> tuple[object, str | None]:
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return json.loads(resp.read().decode("utf-8")), resp.headers.get("Link")
+
+
+def _http_get_json(url: str, headers: dict[str, str] | None = None) -> object:
+    return _http_get_json_and_link(url, headers=headers)[0]
+
+
+def _get_next_url_from_link_header(current_url: str, link_header: str | None) -> str | None:
+    if not link_header:
+        return None
+
+    for link in link_header.split(","):
+        link = link.strip()
+        if not link.startswith("<"):
+            continue
+
+        url_end = link.find(">")
+        if url_end == -1:
+            continue
+
+        target = link[1:url_end]
+        for parameter in link[url_end + 1:].split(";"):
+            name, separator, value = parameter.strip().partition("=")
+            if separator and name.lower() == "rel" and value.strip("\"'").lower() == "next":
+                return urllib.parse.urljoin(current_url, target)
+
+    return None
 
 
 def fetch_github_releases(owner: str, repo: str) -> list[SemVer]:
     """Return non-draft, non-prerelease releases whose tags map to a SemVer."""
-    url = f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=100"
     headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    data = _http_get_json(url, headers=headers)
-    if not isinstance(data, list):
-        raise RuntimeError(f"Unexpected releases payload shape: {type(data).__name__}")
-
     versions: list[SemVer] = []
-    for release in data:
-        if release.get("draft") or release.get("prerelease"):
-            continue
-        tag = release.get("tag_name") or ""
-        match = GH_TAG_RE.match(tag)
-        if not match:
-            print(f"  [skip] release tag does not match expected vMAJOR.MINOR-PATCH: {tag!r}",
-                  file=sys.stderr)
-            continue
-        versions.append(SemVer(int(match[1]), int(match[2]), int(match[3])))
+    page = 1
+    per_page = 100
+    while True:
+        url = f"https://api.github.com/repos/{owner}/{repo}/releases?per_page={per_page}&page={page}"
+        data = _http_get_json(url, headers=headers)
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected releases payload shape: {type(data).__name__}")
+        if not data:
+            break
+
+        for release in data:
+            if release.get("draft") or release.get("prerelease"):
+                continue
+            tag = release.get("tag_name") or ""
+            match = GH_TAG_RE.match(tag)
+            if not match:
+                print(f"  [skip] release tag does not match expected vMAJOR.MINOR-PATCH: {tag!r}",
+                      file=sys.stderr)
+                continue
+            versions.append(SemVer(int(match[1]), int(match[2]), int(match[3])))
+
+        if len(data) < per_page:
+            break
+        page += 1
+
     return versions
 
 
@@ -138,13 +175,19 @@ def fetch_ghcr_pg_tags(image_path: str) -> dict[SemVer, set[int]]:
     if not token:
         raise RuntimeError("GHCR token endpoint returned no token")
 
-    list_url = f"https://ghcr.io/v2/{image_path}/tags/list?n=500"
-    payload = _http_get_json(list_url, headers={"Authorization": f"Bearer {token}"})
-    if not isinstance(payload, dict):
-        raise RuntimeError("Unexpected GHCR tags payload")
-    tags = payload.get("tags") or []
-    if not isinstance(tags, list):
-        raise RuntimeError("GHCR tags field is not a list")
+    tags: list[object] = []
+    list_url: str | None = f"https://ghcr.io/v2/{image_path}/tags/list?n=500"
+    headers = {"Authorization": f"Bearer {token}"}
+    while list_url:
+        payload, link_header = _http_get_json_and_link(list_url, headers=headers)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected GHCR tags payload")
+        page_tags = payload.get("tags") or []
+        if not isinstance(page_tags, list):
+            raise RuntimeError("GHCR tags field is not a list")
+
+        tags.extend(page_tags)
+        list_url = _get_next_url_from_link_header(list_url, link_header)
 
     by_version: dict[SemVer, set[int]] = {}
     seen_pg: set[int] = set()
