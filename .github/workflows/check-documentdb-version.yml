@@ -29,8 +29,8 @@ name: Check DocumentDB Versions
 
 on:
   schedule:
-    # Daily at 06:00 UTC.
-    - cron: '0 6 * * *'
+    # Weekly at 06:00 UTC on Mondays.
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 permissions:
