@@ -100,6 +100,89 @@ var server = builder.AddDocumentDB("documentdb")
 
 By default, this helper mounts data at `/home/documentdb/postgresql/data` inside the container and sets `DATA_PATH` accordingly. If you do not call `WithDataVolume()` or `WithDataBindMount()`, the underlying DocumentDB container keeps its own default data path of `/data`.
 
+## WithLogLevel
+
+Sets the container `LOG_LEVEL` environment variable to control DocumentDB Local log verbosity.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithLogLevel(DocumentDBLogLevel.Debug);
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `logLevel` | `DocumentDBLogLevel` | (required) | One of `Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`. Mapped to the lowercase string passed to the container. |
+
+## WithInitData
+
+Bind-mounts a host directory containing custom initialization scripts (for example, MongoDB shell scripts) into the container at `/init_doc_db.d`. Built-in sample data is implicitly disabled so the mounted scripts are the only initialization source.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithInitData("./seed");
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `source` | `string` | (required) | Host directory containing initialization scripts. Mounted read-only at `/init_doc_db.d` and exposed via `INIT_DATA_PATH`. |
+
+This helper also sets `SKIP_INIT_DATA=true` so the container does not also import its built-in sample collections.
+
+## WithoutSampleData
+
+Disables the built-in sample data initialization without mounting custom scripts. Use this when you want a clean DocumentDB instance.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithoutSampleData();
+```
+
+This sets `SKIP_INIT_DATA=true` on the container.
+
+## WithTlsCertificate
+
+Mounts a custom TLS certificate and key into the container so DocumentDB Local serves connections with your certificate instead of its default self-signed one.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithTlsCertificate("./certs/documentdb.pem", "./certs/documentdb.key");
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `certPath` | `string` | (required) | Path on the host to the certificate file. |
+| `keyPath` | `string` | (required) | Path on the host to the private key file. |
+
+The certificate and key are bind-mounted at distinct container paths (`/documentdb-cert-<filename>` and `/documentdb-key-<filename>`), so they can be supplied even when the host file names are identical. The corresponding `CERT_PATH` and `KEY_FILE` environment variables are set automatically.
+
+## WithTelemetry
+
+Enables or disables container telemetry by setting the `ENABLE_TELEMETRY` environment variable.
+
+```csharp
+// Disable telemetry
+var server = builder.AddDocumentDB("documentdb")
+                    .WithTelemetry(enabled: false);
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | Whether telemetry should be enabled. |
+
+
+## WithOwner
+
+Sets the container `OWNER` environment variable, which DocumentDB Local uses to label resources.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithOwner("documentdb");
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `owner` | `string` | (required) | The owner value. |
+
 ## UseTls
 
 Controls whether TLS is included in the generated connection string. TLS is **enabled by default** because the DocumentDB Local container requires TLS connections.
@@ -251,6 +334,13 @@ The extension passes these environment variables to the DocumentDB container:
 | `USERNAME` | The configured username | Container creates this user on startup |
 | `PASSWORD` | The configured password | Password for the created user |
 | `DATA_PATH` | Path inside the container for the mounted data directory | Only set when using `WithDataVolume` or `WithDataBindMount`; otherwise the container uses its default `/data` |
+| `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Set by `WithLogLevel(...)` |
+| `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
+| `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |
+| `CERT_PATH` | Container path of the mounted certificate file | Set by `WithTlsCertificate(...)` |
+| `KEY_FILE` | Container path of the mounted key file | Set by `WithTlsCertificate(...)` |
+| `ENABLE_TELEMETRY` | `true` or `false` | Set by `WithTelemetry(...)` |
+| `OWNER` | The configured owner string | Set by `WithOwner(...)` |
 
 ## Resource model
 
@@ -281,6 +371,8 @@ var db = builder.AddDocumentDB("documentdb")
                 .WithDataVolume()
                 .WithDocumentDBVersion(DocumentDBVersion.V0_110_0)
                 .WithPostgresVersion(DocumentDBPostgresVersion.Pg17)
+                .WithLogLevel(DocumentDBLogLevel.Debug)
+                .WithoutSampleData()
                 .UseTls(true)
                 .AllowInsecureTls(true)
                 .AddDatabase("mydb");

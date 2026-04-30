@@ -1,5 +1,15 @@
 namespace Aspire.Hosting
 {
+    public enum DocumentDBLogLevel
+    {
+        Quiet = 0,
+        Error = 1,
+        Warn = 2,
+        Info = 3,
+        Debug = 4,
+        Trace = 5,
+    }
+
     public static partial class DocumentDBBuilderExtensions
     {
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBDatabaseResource> AddDatabase(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string name, string? databaseName = null) { throw null; }
@@ -13,6 +23,18 @@ namespace Aspire.Hosting
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithDataVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string? name = null, bool isReadOnly = false, string? targetPath = null) { throw null; }
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithHostPort(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, int? port) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithLogLevel(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, DocumentDBLogLevel logLevel) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithInitData(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string source) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithoutSampleData(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithTlsCertificate(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string certPath, string keyPath) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithTelemetry(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool enabled = true) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithOwner(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string owner) { throw null; }
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> UseTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool useTls = true) { throw null; }
 

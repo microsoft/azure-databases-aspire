@@ -536,6 +536,228 @@ public class AddDocumentDBTests
         Assert.Contains(db2.Resource, server.Resource.Databases);
     }
 
+    [Theory]
+    [InlineData(DocumentDBLogLevel.Quiet, "quiet")]
+    [InlineData(DocumentDBLogLevel.Error, "error")]
+    [InlineData(DocumentDBLogLevel.Warn, "warn")]
+    [InlineData(DocumentDBLogLevel.Info, "info")]
+    [InlineData(DocumentDBLogLevel.Debug, "debug")]
+    [InlineData(DocumentDBLogLevel.Trace, "trace")]
+    public async Task WithLogLevelAddsEnvironmentVariable(DocumentDBLogLevel logLevel, string expectedValue)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel(logLevel);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal(expectedValue, env["LOG_LEVEL"]);
+    }
+
+    [Fact]
+    public async Task WithInitDataAddsReadOnlyBindMountAndDisablesSampleData()
+    {
+        var source = Path.GetFullPath(Path.Combine("TestData", "init"));
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithInitData(source);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        Assert.True(containerResource.TryGetContainerMounts(out var mounts));
+        var mount = Assert.Single(mounts);
+        Assert.Equal(source, mount.Source);
+        Assert.Equal("/init_doc_db.d", mount.Target);
+        Assert.Equal(ContainerMountType.BindMount, mount.Type);
+        Assert.True(mount.IsReadOnly);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("/init_doc_db.d", env["INIT_DATA_PATH"]);
+        Assert.Equal("true", env["SKIP_INIT_DATA"]);
+    }
+
+    [Fact]
+    public async Task WithoutSampleDataAddsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithoutSampleData();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["SKIP_INIT_DATA"]);
+    }
+
+    [Fact]
+    public async Task WithTlsCertificateAddsReadOnlyBindMountsAndEnvironmentVariables()
+    {
+        var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.pem"));
+        var keyPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.key"));
+        var expectedCertTarget = $"/documentdb-cert-{Path.GetFileName(certPath)}";
+        var expectedKeyTarget = $"/documentdb-key-{Path.GetFileName(keyPath)}";
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTlsCertificate(certPath, keyPath);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        Assert.True(containerResource.TryGetContainerMounts(out var mounts));
+        var certMount = Assert.Single(mounts, mount => mount.Source == certPath);
+        Assert.Equal(expectedCertTarget, certMount.Target);
+        Assert.Equal(ContainerMountType.BindMount, certMount.Type);
+        Assert.True(certMount.IsReadOnly);
+
+        var keyMount = Assert.Single(mounts, mount => mount.Source == keyPath);
+        Assert.Equal(expectedKeyTarget, keyMount.Target);
+        Assert.Equal(ContainerMountType.BindMount, keyMount.Type);
+        Assert.True(keyMount.IsReadOnly);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expectedCertTarget, env["CERT_PATH"]);
+        Assert.Equal(expectedKeyTarget, env["KEY_FILE"]);
+    }
+
+    [Theory]
+    [InlineData(true, "true")]
+    [InlineData(false, "false")]
+    public async Task WithTelemetryAddsEnvironmentVariable(bool enabled, string expectedValue)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTelemetry(enabled);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expectedValue, env["ENABLE_TELEMETRY"]);
+    }
+
+
+    [Fact]
+    public async Task WithOwnerAddsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOwner("contoso");
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("contoso", env["OWNER"]);
+    }
+
+    [Fact]
+    public async Task VerifyManifestIncludesAdditionalConfigurationOptions()
+    {
+        var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.pem"));
+        var keyPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.key"));
+        var initDataPath = Path.GetFullPath(Path.Combine("TestData", "init"));
+        var expectedCertTarget = $"/documentdb-cert-{Path.GetFileName(certPath)}";
+        var expectedKeyTarget = $"/documentdb-key-{Path.GetFileName(keyPath)}";
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithInitData(initDataPath)
+            .WithTlsCertificate(certPath, keyPath)
+            .WithTelemetry(enabled: false)
+            .WithOwner("contoso");
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("debug", manifest["env"]?["LOG_LEVEL"]?.GetValue<string>());
+        Assert.Equal("/init_doc_db.d", manifest["env"]?["INIT_DATA_PATH"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
+        Assert.Equal(expectedCertTarget, manifest["env"]?["CERT_PATH"]?.GetValue<string>());
+        Assert.Equal(expectedKeyTarget, manifest["env"]?["KEY_FILE"]?.GetValue<string>());
+        Assert.Equal("false", manifest["env"]?["ENABLE_TELEMETRY"]?.GetValue<string>());
+        Assert.Equal("contoso", manifest["env"]?["OWNER"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task WithTlsCertificateUsesDistinctTargetsWhenFileNamesMatch()
+    {
+        var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "shared.pem"));
+        var keyPath = Path.GetFullPath(Path.Combine("TestData", "keys", "shared.pem"));
+        var expectedCertTarget = "/documentdb-cert-shared.pem";
+        var expectedKeyTarget = "/documentdb-key-shared.pem";
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTlsCertificate(certPath, keyPath);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        Assert.True(containerResource.TryGetContainerMounts(out var mounts));
+        var certMount = Assert.Single(mounts, mount => mount.Source == certPath);
+        var keyMount = Assert.Single(mounts, mount => mount.Source == keyPath);
+
+        Assert.Equal(expectedCertTarget, certMount.Target);
+        Assert.Equal(expectedKeyTarget, keyMount.Target);
+        Assert.NotEqual(certMount.Target, keyMount.Target);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expectedCertTarget, env["CERT_PATH"]);
+        Assert.Equal(expectedKeyTarget, env["KEY_FILE"]);
+    }
+
+    [Fact]
+    public async Task WithLogLevelThrowsForUndefinedEnumValue()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel((DocumentDBLogLevel)99);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => BuildEnvironmentVariablesAsync(containerResource));
+    }
+
+    [Fact]
+    public async Task WithTelemetryDefaultsToEnabled()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTelemetry();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["ENABLE_TELEMETRY"]);
+    }
+
     private static Dictionary<string, string> AssertConnectionString(
         string connectionString,
         string? expectedDatabaseName,

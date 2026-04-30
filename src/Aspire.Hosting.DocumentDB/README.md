@@ -74,10 +74,41 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithHostPort(port)` | Bind to a fixed host port (default: random) |
 | `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume |
 | `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
+| `.WithLogLevel(level)` | Set the container `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
+| `.WithInitData(source)` | Bind-mount initialization scripts to `/init_doc_db.d` and disable built-in sample data |
+| `.WithoutSampleData()` | Disable the built-in sample data initialization |
+| `.WithTlsCertificate(certPath, keyPath)` | Mount a custom TLS certificate and key into the container |
+| `.WithTelemetry(enabled?)` | Enable or disable container telemetry |
+| `.WithOwner(owner)` | Set the container `OWNER` value |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |
 | `.WithDocumentDBVersion(version)` | Pin a curated DocumentDB version (default: latest known to this build) |
 | `.WithPostgresVersion(pgVersion)` | Choose PG15/16/17 backend variant (default: Pg17) |
+
+### Additional container configuration
+
+For closer-to-production local setups, debugging, or custom data seeding, the
+hosting integration exposes additional DocumentDB Local container options:
+
+```csharp
+var documentdb = builder.AddDocumentDB("documentdb")
+    .WithLogLevel(DocumentDBLogLevel.Debug)
+    .WithInitData("../seed")
+    .WithTlsCertificate("../certs/documentdb.pem", "../certs/documentdb.key")
+    .WithTelemetry(enabled: false)
+    .WithOwner("documentdb");
+
+var db = documentdb.AddDatabase("mydb");
+```
+
+`WithInitData(...)` mounts a host directory into `/init_doc_db.d` and also
+disables the built-in sample data so your custom scripts are the only
+initialization source. Use `WithoutSampleData()` when you want to disable the
+built-in sample collections without mounting custom initialization scripts.
+
+`WithTlsCertificate(...)` mounts the certificate and key files at distinct
+container paths, so they can be supplied even when their host file names are
+identical.
 
 ### Connection strings
 
