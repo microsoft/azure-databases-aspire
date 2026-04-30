@@ -21,7 +21,6 @@ public class Program
             .WithTlsCertificate(assets.CertificatePath, assets.KeyPath)
             .WithTelemetry(enabled: false)
             .WithoutSampleData()
-            .WithoutExtendedRum()
             .WithOwner("documentdb")
             .AddDatabase("appdb");
 

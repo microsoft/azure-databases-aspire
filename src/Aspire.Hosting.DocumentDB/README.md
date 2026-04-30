@@ -79,7 +79,6 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithoutSampleData()` | Disable the built-in sample data initialization |
 | `.WithTlsCertificate(certPath, keyPath)` | Mount a custom TLS certificate and key into the container |
 | `.WithTelemetry(enabled?)` | Enable or disable container telemetry |
-| `.WithoutExtendedRum()` | Disable extended RUM index support |
 | `.WithOwner(owner)` | Set the container `OWNER` value |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |
@@ -97,7 +96,6 @@ var documentdb = builder.AddDocumentDB("documentdb")
     .WithInitData("../seed")
     .WithTlsCertificate("../certs/documentdb.pem", "../certs/documentdb.key")
     .WithTelemetry(enabled: false)
-    .WithoutExtendedRum()
     .WithOwner("documentdb");
 
 var db = documentdb.AddDatabase("mydb");

@@ -169,14 +169,6 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `enabled` | `bool` | `true` | Whether telemetry should be enabled. |
 
-## WithoutExtendedRum
-
-Disables DocumentDB Local extended RUM (Random Universal Mongo) index support by setting `DISABLE_EXTENDED_RUM=true`.
-
-```csharp
-var server = builder.AddDocumentDB("documentdb")
-                    .WithoutExtendedRum();
-```
 
 ## WithOwner
 
@@ -348,7 +340,6 @@ The extension passes these environment variables to the DocumentDB container:
 | `CERT_PATH` | Container path of the mounted certificate file | Set by `WithTlsCertificate(...)` |
 | `KEY_FILE` | Container path of the mounted key file | Set by `WithTlsCertificate(...)` |
 | `ENABLE_TELEMETRY` | `true` or `false` | Set by `WithTelemetry(...)` |
-| `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()` |
 | `OWNER` | The configured owner string | Set by `WithOwner(...)` |
 
 ## Resource model

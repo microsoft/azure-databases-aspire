@@ -34,8 +34,6 @@ namespace Aspire.Hosting
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithTelemetry(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool enabled = true) { throw null; }
 
-        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithoutExtendedRum(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder) { throw null; }
-
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithOwner(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string owner) { throw null; }
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> UseTls(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool useTls = true) { throw null; }

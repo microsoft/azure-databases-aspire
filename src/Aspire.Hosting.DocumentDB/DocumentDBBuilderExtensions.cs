@@ -24,7 +24,6 @@ public static class DocumentDBBuilderExtensions
     private const string CertPathEnvVarName = "CERT_PATH";
     private const string KeyFileEnvVarName = "KEY_FILE";
     private const string EnableTelemetryEnvVarName = "ENABLE_TELEMETRY";
-    private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
     private const string OwnerEnvVarName = "OWNER";
     private const string DataPathEnvVarName = "DATA_PATH";
 
@@ -351,20 +350,6 @@ public static class DocumentDBBuilderExtensions
         });
     }
 
-    /// <summary>
-    /// Disables the DocumentDB Local extended RUM index support.
-    /// </summary>
-    /// <param name="builder">The resource builder for DocumentDB.</param>
-    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
-    public static IResourceBuilder<DocumentDBServerResource> WithoutExtendedRum(this IResourceBuilder<DocumentDBServerResource> builder)
-    {
-        ArgumentNullException.ThrowIfNull(builder);
-
-        return builder.WithEnvironment(context =>
-        {
-            context.EnvironmentVariables[DisableExtendedRumEnvVarName] = "true";
-        });
-    }
 
     /// <summary>
     /// Configures the owner used by the DocumentDB Local container.
