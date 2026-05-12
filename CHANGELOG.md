@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Fixed
+- Default data volume path changed from `/home/documentdb/postgresql/data` to `/data` to match the DocumentDB Local container default ([documentdb/documentdb#556](https://github.com/documentdb/documentdb/issues/556))
+
 <!-- auto-generated:documentdb-versions-start -->
 <!-- This block is rewritten by eng/scripts/check-documentdb-versions.py.
      It contains ONLY auto-detected upstream version notes. Manual changelog
