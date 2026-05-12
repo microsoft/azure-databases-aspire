@@ -3,8 +3,8 @@
 
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.DocumentDB;
-// using Microsoft.Extensions.DependencyInjection;
-// using MongoDB.Driver;
+using Microsoft.Extensions.DependencyInjection;
+using MongoDB.Driver;
 
 namespace Aspire.Hosting;
 
@@ -15,6 +15,7 @@ public static class DocumentDBBuilderExtensions
 {
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
+    private const string DefaultHealthCheckDatabaseName = "admin";
 
     private const string UserEnvVarName = "USERNAME";
     private const string PasswordEnvVarName = "PASSWORD";
@@ -34,6 +35,9 @@ public static class DocumentDBBuilderExtensions
     /// Adds a DocumentDB resource to the application model. A container is used for local development.
     /// </summary>
     /// <remarks>
+    /// This resource includes a built-in health check. When this resource is referenced as a dependency
+    /// using the <see cref="ResourceBuilderExtensions.WaitFor{T}(IResourceBuilder{T}, IResourceBuilder{IResource})"/>
+    /// extension method then the dependent resource will wait until the DocumentDB server responds to ping.
     /// This version of the package defaults to the <inheritdoc cref="DocumentDBContainerImageTags.Tag"/> tag of the <inheritdoc cref="DocumentDBContainerImageTags.Image"/> container image.
     /// </remarks>
     /// <param name="builder">The <see cref="IDistributedApplicationBuilder"/>.</param>
@@ -90,6 +94,16 @@ public static class DocumentDBBuilderExtensions
                 ?? throw new DistributedApplicationException($"ConnectionStringAvailableEvent was published for the '{DocumentDBContainer.Name}' resource but the connection string was null.");
         });
 
+        var healthCheckKey = $"{name}_check";
+        // Use a database-scoped check so the MongoDB health check package executes a ping command.
+        IMongoDatabase? database = null;
+        builder.Services.AddHealthChecks()
+            .AddMongoDb(
+                _ => database ??=
+                    new MongoClient(connectionString ?? throw new InvalidOperationException("Connection string is unavailable"))
+                        .GetDatabase(DefaultHealthCheckDatabaseName),
+                name: healthCheckKey);
+
         return builder
             .AddResource(DocumentDBContainer)
             .WithEndpoint(port: port, targetPort: DefaultContainerPort, name: DocumentDBServerResource.PrimaryEndpointName)
@@ -99,8 +113,8 @@ public static class DocumentDBBuilderExtensions
             {
                 context.EnvironmentVariables[UserEnvVarName] = DocumentDBContainer.UserNameReference;
                 context.EnvironmentVariables[PasswordEnvVarName] = DocumentDBContainer.PasswordParameter!;
-            });
-        //.WithHealthCheck(healthCheckKey);
+            })
+            .WithHealthCheck(healthCheckKey);
     }
 
     /// <summary>
@@ -109,6 +123,9 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// The database resource inherits the parent server's connection string and appends the database name.
     /// Services should reference the database resource (not the server) via <c>.WithReference(db)</c>.
+    /// This resource includes a built-in health check. When this resource is referenced as a dependency
+    /// using the <see cref="ResourceBuilderExtensions.WaitFor{T}(IResourceBuilder{T}, IResourceBuilder{IResource})"/>
+    /// extension method then the dependent resource will wait until the DocumentDB database responds to ping.
     /// </remarks>
     /// <param name="builder">The DocumentDB server resource builder.</param>
     /// <param name="name">The name of the resource. This name will be used as the connection string name when referenced in a dependency.</param>
@@ -129,8 +146,8 @@ public static class DocumentDBBuilderExtensions
         // Use the resource name as the database name if it's not provided
         databaseName ??= name;
 
-    var DocumentDBDatabase = new DocumentDBDatabaseResource(name, databaseName, builder.Resource);
-    builder.Resource.AddDatabase(DocumentDBDatabase);
+        var DocumentDBDatabase = new DocumentDBDatabaseResource(name, databaseName, builder.Resource);
+        builder.Resource.AddDatabase(DocumentDBDatabase);
 
         string? connectionString = null;
 
@@ -140,18 +157,19 @@ public static class DocumentDBBuilderExtensions
                 ?? throw new DistributedApplicationException($"ConnectionStringAvailableEvent was published for the '{DocumentDBDatabase.Name}' resource but the connection string was null.");
         });
 
-        // var healthCheckKey = $"{name}_check";
-        // // cache the database client so it is reused on subsequent calls to the health check
-        // IMongoDatabase? database = null;
-        // builder.ApplicationBuilder.Services.AddHealthChecks()
-        //     .AddDocumentDB(
-        //         sp => database ??=
-        //             new MongoClient(connectionString ?? throw new InvalidOperationException("Connection string is unavailable"))
-        //                 .GetDatabase(databaseName),
-        //         name: healthCheckKey);
+        var healthCheckKey = $"{name}_check";
+        // cache the database instance so it is reused on subsequent calls to the health check
+        IMongoDatabase? database = null;
+        builder.ApplicationBuilder.Services.AddHealthChecks()
+            .AddMongoDb(
+                _ => database ??=
+                    new MongoClient(connectionString ?? throw new InvalidOperationException("Connection string is unavailable"))
+                        .GetDatabase(databaseName),
+                name: healthCheckKey);
 
         return builder.ApplicationBuilder
-            .AddResource(DocumentDBDatabase);
+            .AddResource(DocumentDBDatabase)
+            .WithHealthCheck(healthCheckKey);
     }
 
     /// <summary>

@@ -9,6 +9,7 @@ using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Testing;
 using Aspire.TestUtilities;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using Xunit;
@@ -36,6 +37,10 @@ public class DocumentDBIntegrationTests
         await using var app = await appHost.BuildAsync(cts.Token);
 
         await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+        await WaitForHealthCheckAsync(healthCheckService, "appdb_check", cts.Token);
 
         var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
         Assert.False(string.IsNullOrWhiteSpace(connectionString));
@@ -133,6 +138,10 @@ public class DocumentDBIntegrationTests
 
         await app.StartAsync(cts.Token);
 
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+        await WaitForHealthCheckAsync(healthCheckService, "appdb_check", cts.Token);
+
         var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
         Assert.False(string.IsNullOrWhiteSpace(connectionString));
 
@@ -198,6 +207,33 @@ public class DocumentDBIntegrationTests
         }
 
         throw new InvalidOperationException("DocumentDB did not become reachable in time.", lastException);
+    }
+
+    private static async Task WaitForHealthCheckAsync(HealthCheckService healthCheckService, string healthCheckKey, CancellationToken cancellationToken)
+    {
+        HealthReport? lastReport = null;
+
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            lastReport = await healthCheckService.CheckHealthAsync(
+                registration => registration.Name == healthCheckKey,
+                cancellationToken);
+
+            if (lastReport.Entries.TryGetValue(healthCheckKey, out var entry) && entry.Status == HealthStatus.Healthy)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        var lastMessage = "The health check registration was not found.";
+        if (lastReport is not null && lastReport.Entries.TryGetValue(healthCheckKey, out var lastEntry))
+        {
+            lastMessage = $"{lastEntry.Status}: {lastEntry.Description}";
+        }
+
+        throw new InvalidOperationException($"Health check '{healthCheckKey}' did not become healthy in time. Last result: {lastMessage}");
     }
 
     private static int GetAvailableTcpPort()
