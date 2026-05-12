@@ -7,9 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 <!-- auto-generated:documentdb-versions-start -->
-<!-- This block is rewritten by eng/scripts/check-documentdb-versions.py.
-     It contains ONLY auto-detected upstream version notes. Manual changelog
-     entries belong above this block, inside the [Unreleased] section. -->
+### Added (auto-detected upstream DocumentDB versions)
+
+- DocumentDB `0.111.0` upstream release detected on 2026-05-12 (container tags `pg15-0.111.0`, `pg16-0.111.0`, `pg17-0.111.0`).
+
+_Maintainer: append the matching `DocumentDBVersion.V0_X_Y` enum members and `public const string V0_X_Y = "X.Y.Z";` lines to `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` before merging._
 <!-- auto-generated:documentdb-versions-end -->
 
 ## [0.110.0] - 2026-05-12
