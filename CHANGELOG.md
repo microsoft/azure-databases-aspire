@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+<!-- auto-generated:documentdb-versions-start -->
+<!-- This block is rewritten by eng/scripts/check-documentdb-versions.py.
+     It contains ONLY auto-detected upstream version notes. Manual changelog
+     entries belong above this block, inside the [Unreleased] section. -->
+<!-- auto-generated:documentdb-versions-end -->
+
+## [0.110.0] - 2026-05-12
+
 ### Added
 - `DocumentDBVersion` enum (curated, append-only) and `DocumentDBPostgresVersion` enum exposing
   the PostgreSQL backend choice.
@@ -16,17 +24,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `eng/scripts/check-documentdb-versions.py` that detects new upstream releases (when both a
   GitHub release and `pg15/16/17-X.Y.Z` GHCR tags exist) and opens a PR appending them to the
   curated supported-versions list.
+- Configuration APIs: `WithLogLevel(...)`, `WithInitData(...)`, `WithoutSampleData()`,
+  `WithTlsCertificate(...)`, `WithTelemetry(...)`, and `WithOwner(...)` extension methods
+  for fine-grained container configuration.
 
 ### Changed
+- Default container image updated to `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.110.0`
 - `DocumentDBContainerImageTags.Tag` is now a computed property
   (`pg17-{DocumentDBVersions.Latest}`) instead of a `const`, so the default tag follows the
   curated `Latest` version without manual edits to two files.
+- Upgraded .NET Aspire to 13.3.0
+- Updated Microsoft.NET.Test.Sdk to 18.5.1
 
-<!-- auto-generated:documentdb-versions-start -->
-<!-- This block is rewritten by eng/scripts/check-documentdb-versions.py.
-     It contains ONLY auto-detected upstream version notes. Manual changelog
-     entries belong above this block, inside the [Unreleased] section. -->
-<!-- auto-generated:documentdb-versions-end -->
+### Fixed
+- Pinned SharpCompress and Snappier transitive dependencies to resolve NuGet vulnerability
+  audit errors.
+- Fixed TLS certificate/key bind-mount collision when both files mapped to the same
+  container path.
 
 ## [0.109.2] - 2026-04-13
 
@@ -78,6 +92,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - SCRAM-SHA-256 authentication support
 - Container image: `ghcr.io/documentdb/documentdb/documentdb-local`
 
+[0.110.0]: https://github.com/microsoft/azure-databases-aspire/releases/tag/v0.110.0
 [0.109.2]: https://github.com/microsoft/azure-databases-aspire/releases/tag/v0.109.2
 [0.109.0]: https://github.com/microsoft/azure-databases-aspire/releases/tag/v0.109.0
 [0.1.0]: https://github.com/microsoft/azure-databases-aspire/compare/32cee17...4aa9aac
