@@ -224,7 +224,7 @@ Pins the DocumentDB version to a specific release known to this build of the pac
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
-                    .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
+                    .WithDocumentDBVersion(DocumentDBVersion.V0_111_0);
 ```
 
 | Parameter | Type | Default | Description |
@@ -238,8 +238,8 @@ Selects the PostgreSQL backend variant of the `documentdb-local` container image
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
                     .WithPostgresVersion(DocumentDBPostgresVersion.Pg16)
-                    .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
-// -> image tag "pg16-0.110.0"
+                    .WithDocumentDBVersion(DocumentDBVersion.V0_111_0);
+// -> image tag "pg16-0.111.0"
 ```
 
 | Parameter | Type | Default | Description |
@@ -254,7 +254,7 @@ You can enumerate the full list at runtime via `DocumentDBVersions.All`, and rea
 
 | Symbol | Notes |
 |---|---|
-| `enum DocumentDBVersion` | Curated members like `V0_109_0`, `V0_110_0`. Stable forever once shipped. |
+| `enum DocumentDBVersion` | Curated members like `V0_109_0`, `V0_110_0`, `V0_111_0`. Stable forever once shipped. |
 | `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`. Default `Pg17`. |
 | `DocumentDBVersions.All` | All known version strings, ascending semver. |
 | `DocumentDBVersions.Latest` | The newest version known to *this build* of the package. |
@@ -273,14 +273,14 @@ var server = builder.AddDocumentDB("documentdb")
 `WithDocumentDBVersion`, `WithPostgresVersion`, `WithImage`, and `WithImageTag` all converge on the same single `ContainerImageAnnotation`. The most recent call wins, regardless of which API was used:
 
 ```csharp
-// Final tag is "pg17-0.110.0" -- the typed call wins because it came last.
+// Final tag is "pg17-0.111.0" -- the typed call wins because it came last.
 builder.AddDocumentDB("documentdb")
        .WithImageTag("pg15-0.999.0")
-       .WithDocumentDBVersion(DocumentDBVersion.V0_110_0);
+       .WithDocumentDBVersion(DocumentDBVersion.V0_111_0);
 
 // Final tag is "pg17-0.999.0" -- the free-form call wins because it came last.
 builder.AddDocumentDB("documentdb")
-       .WithDocumentDBVersion(DocumentDBVersion.V0_110_0)
+       .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
        .WithImageTag("pg17-0.999.0");
 ```
 
@@ -311,7 +311,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.110.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.111.0`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
@@ -369,7 +369,7 @@ All configuration methods return the builder, so they can be chained:
 var db = builder.AddDocumentDB("documentdb")
                 .WithHostPort(10260)
                 .WithDataVolume()
-                .WithDocumentDBVersion(DocumentDBVersion.V0_110_0)
+                .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
                 .WithPostgresVersion(DocumentDBPostgresVersion.Pg17)
                 .WithLogLevel(DocumentDBLogLevel.Debug)
                 .WithoutSampleData()
