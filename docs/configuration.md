@@ -80,9 +80,9 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `name` | `string?` | Auto-generated | Docker volume name. When `null`, a name is generated from the application and resource names. |
 | `isReadOnly` | `bool` | `false` | Mount the volume as read-only. |
-| `targetPath` | `string?` | `/home/documentdb/postgresql/data` | Path inside the container where the volume is mounted when this helper is used. |
+| `targetPath` | `string?` | `/data` | Path inside the container where the volume is mounted when this helper is used. |
 
-The bare DocumentDB container defaults `DATA_PATH` to `/data`. This method mounts the volume at `targetPath` and sets the `DATA_PATH` environment variable to match, overriding the container default so DocumentDB writes to the mounted directory.
+This method mounts the volume at `targetPath` (which defaults to `/data`, matching the container default) and sets the `DATA_PATH` environment variable to match so DocumentDB writes to the mounted directory.
 
 ## WithDataBindMount
 
@@ -98,7 +98,7 @@ var server = builder.AddDocumentDB("documentdb")
 | `source` | `string` | (required) | Path on the host machine to mount. |
 | `isReadOnly` | `bool` | `false` | Mount as read-only. |
 
-By default, this helper mounts data at `/home/documentdb/postgresql/data` inside the container and sets `DATA_PATH` accordingly. If you do not call `WithDataVolume()` or `WithDataBindMount()`, the underlying DocumentDB container keeps its own default data path of `/data`.
+By default, this helper mounts data at `/data` inside the container (matching the container default) and sets `DATA_PATH` accordingly.
 
 ## WithLogLevel
 
@@ -321,7 +321,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | TLS | Enabled |
 | Insecure TLS | Enabled (allows self-signed certificates) |
 | Container default data path | `/data` |
-| Persistence helper default path | `/home/documentdb/postgresql/data` |
+| Persistence helper default path | `/data` |
 | Auth mechanism | `SCRAM-SHA-256` |
 | Auth database | `admin` |
 

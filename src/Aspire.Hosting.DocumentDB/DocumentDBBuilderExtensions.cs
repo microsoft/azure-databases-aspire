@@ -28,7 +28,7 @@ public static class DocumentDBBuilderExtensions
     private const string OwnerEnvVarName = "OWNER";
     private const string DataPathEnvVarName = "DATA_PATH";
 
-    private const string DefaultMountedDataPath = "/home/documentdb/postgresql/data";
+    private const string DefaultMountedDataPath = "/data";
     private const string InitDataMountPath = "/init_doc_db.d";
 
     /// <summary>
@@ -206,7 +206,7 @@ public static class DocumentDBBuilderExtensions
     /// <param name="builder">The resource builder.</param>
     /// <param name="name">The name of the volume. Defaults to an auto-generated name based on the application and resource names.</param>
     /// <param name="isReadOnly">A flag that indicates if this is a read-only volume.</param>
-    /// <param name="targetPath">The target path inside the container. Defaults to /home/documentdb/postgresql/data when this helper is used.</param>
+    /// <param name="targetPath">The target path inside the container. Defaults to /data to match the container default when this helper is used.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
     /// <example>
     /// <code>
@@ -239,7 +239,7 @@ public static class DocumentDBBuilderExtensions
     /// Prefer <see cref="WithDataVolume"/> for most cases. Bind mounts are useful when you need
     /// direct access to the data files on the host filesystem.
     /// The bare DocumentDB container defaults <c>DATA_PATH</c> to <c>/data</c>.
-    /// This helper mounts the directory at <c>/home/documentdb/postgresql/data</c> and sets
+    /// This helper mounts the directory at <c>/data</c> (the container default) and sets
     /// <c>DATA_PATH</c> to the same value so DocumentDB writes to the mounted directory.
     /// </remarks>
     /// <param name="builder">The resource builder.</param>

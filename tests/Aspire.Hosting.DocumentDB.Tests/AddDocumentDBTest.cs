@@ -413,12 +413,12 @@ public class AddDocumentDBTests
 
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
         var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.Volume));
-        Assert.Equal("/home/documentdb/postgresql/data", volumeAnnotation.Target);
+        Assert.Equal("/data", volumeAnnotation.Target);
         Assert.False(volumeAnnotation.IsReadOnly);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/home/documentdb/postgresql/data", dataPath.Value);
+        Assert.Equal("/data", dataPath.Value);
     }
 
     [Fact]
@@ -454,12 +454,12 @@ public class AddDocumentDBTests
 
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
         var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.Volume));
-        Assert.Equal("/home/documentdb/postgresql/data", volumeAnnotation.Target);
+        Assert.Equal("/data", volumeAnnotation.Target);
         Assert.True(volumeAnnotation.IsReadOnly);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/home/documentdb/postgresql/data", dataPath.Value);
+        Assert.Equal("/data", dataPath.Value);
     }
 
     [Fact]
@@ -476,12 +476,12 @@ public class AddDocumentDBTests
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
         var bindMountAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.BindMount));
         Assert.Equal("/host/data", bindMountAnnotation.Source);
-        Assert.Equal("/home/documentdb/postgresql/data", bindMountAnnotation.Target);
+        Assert.Equal("/data", bindMountAnnotation.Target);
         Assert.False(bindMountAnnotation.IsReadOnly);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/home/documentdb/postgresql/data", dataPath.Value);
+        Assert.Equal("/data", dataPath.Value);
     }
 
     [Fact]
@@ -498,12 +498,12 @@ public class AddDocumentDBTests
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
         var bindMountAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.BindMount));
         Assert.Equal("/host/data", bindMountAnnotation.Source);
-        Assert.Equal("/home/documentdb/postgresql/data", bindMountAnnotation.Target);
+        Assert.Equal("/data", bindMountAnnotation.Target);
         Assert.True(bindMountAnnotation.IsReadOnly);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/home/documentdb/postgresql/data", dataPath.Value);
+        Assert.Equal("/data", dataPath.Value);
     }
 
     [Fact]
