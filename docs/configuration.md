@@ -150,6 +150,31 @@ var server = builder.AddDocumentDB("documentdb")
 
 This sets `DISABLE_EXTENDED_RUM=true` on the container. On container images older than v0.111-0 the environment variable is ignored.
 
+## WithoutUserCreation
+
+Disables the automatic user creation performed by the DocumentDB Local container on startup. Use only after a previous run has already created the user in persisted storage (`WithDataVolume` or `WithDataBindMount`). To avoid spurious init-data runs on subsequent starts, also call `WithoutSampleData()`.
+
+> [!WARNING]
+> Setting `CREATE_USER=false` on a fresh container (without a persisted user) will cause the container entrypoint to exit non-zero. The container's init-data scripts (both built-in sample data and custom scripts mounted via `WithInitData`) authenticate using the configured credentials, and will fail if the user does not exist. Always pair this method with `WithoutSampleData()` and ensure the user already exists in the persisted data.
+
+```csharp
+// Use stable credentials so the persisted user matches across container restarts
+var user = builder.AddParameter("db-user");
+var pass = builder.AddParameter("db-pass", secret: true);
+var server = builder.AddDocumentDB("documentdb", userName: user, password: pass)
+                    .WithDataVolume()
+                    .WithoutUserCreation()
+                    .WithoutSampleData();
+```
+
+This sets `CREATE_USER=false` on the container.
+
+> [!NOTE]
+> When using `WithoutUserCreation()` with `WithDataVolume`, you must supply stable credentials
+> via the `userName` and `password` parameters. The default auto-generated password changes on
+> each run, which would cause authentication failures against the user created during the
+> initial run.
+
 ## WithTlsCertificate
 
 Mounts a custom TLS certificate and key into the container so DocumentDB Local serves connections with your certificate instead of its default self-signed one.
@@ -353,6 +378,7 @@ The extension passes these environment variables to the DocumentDB container:
 | `ENABLE_TELEMETRY` | `true` or `false` | Set by `WithTelemetry(...)` |
 | `OWNER` | The configured owner string | Set by `WithOwner(...)` |
 | `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()` |
+| `CREATE_USER` | `false` | Set by `WithoutUserCreation()` |
 
 ## Resource model
 
@@ -386,6 +412,7 @@ var db = builder.AddDocumentDB("documentdb")
                 .WithLogLevel(DocumentDBLogLevel.Debug)
                 .WithoutSampleData()
                 .WithoutExtendedRum()
+                .WithoutUserCreation()
                 .UseTls(true)
                 .AllowInsecureTls(true)
                 .AddDatabase("mydb");

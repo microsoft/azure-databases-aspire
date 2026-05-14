@@ -28,6 +28,7 @@ public static class DocumentDBBuilderExtensions
     private const string OwnerEnvVarName = "OWNER";
     private const string DataPathEnvVarName = "DATA_PATH";
     private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
+    private const string CreateUserEnvVarName = "CREATE_USER";
 
     private const string DefaultMountedDataPath = "/data";
     private const string InitDataMountPath = "/init_doc_db.d";
@@ -340,6 +341,42 @@ public static class DocumentDBBuilderExtensions
         return builder.WithEnvironment(context =>
         {
             context.EnvironmentVariables[DisableExtendedRumEnvVarName] = "true";
+        });
+    }
+
+    /// <summary>
+    /// Disables the DocumentDB Local container's automatic user creation by setting the
+    /// upstream <c>CREATE_USER=false</c> environment variable.
+    /// </summary>
+    /// <remarks>
+    /// Use only after a previous run has already created the user in persisted storage
+    /// (<see cref="WithDataVolume"/> / <see cref="WithDataBindMount"/>). Setting
+    /// <c>CREATE_USER=false</c> on a fresh container will cause init-data steps to fail
+    /// authentication and the container entrypoint to exit non-zero. To avoid spurious
+    /// init-data runs on subsequent starts, also call <see cref="WithoutSampleData"/>.
+    /// <para>
+    /// <strong>Important:</strong> The container's init-data scripts (both built-in sample data
+    /// and custom scripts mounted via <see cref="WithInitData"/>) authenticate using the
+    /// configured credentials. If the user does not exist because creation was skipped,
+    /// these scripts will fail and the container will exit. Always pair this method with
+    /// <see cref="WithoutSampleData"/> and ensure the user already exists in the persisted data.
+    /// </para>
+    /// <para>
+    /// When combining this method with <see cref="WithDataVolume"/> or <see cref="WithDataBindMount"/>,
+    /// supply stable credentials via the <c>userName</c> and <c>password</c> parameters on
+    /// <c>AddDocumentDB</c>. The default auto-generated password changes on each run,
+    /// which would cause authentication failures against the user created during the initial run.
+    /// </para>
+    /// </remarks>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithoutUserCreation(this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[CreateUserEnvVarName] = "false";
         });
     }
 
