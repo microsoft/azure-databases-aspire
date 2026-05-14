@@ -641,6 +641,22 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public async Task WithoutExtendedRumAddsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithoutExtendedRum();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["DISABLE_EXTENDED_RUM"]);
+    }
+
+    [Fact]
     public async Task WithTlsCertificateAddsReadOnlyBindMountsAndEnvironmentVariables()
     {
         var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "documentdb.pem"));
@@ -723,7 +739,8 @@ public class AddDocumentDBTests
             .WithInitData(initDataPath)
             .WithTlsCertificate(certPath, keyPath)
             .WithTelemetry(enabled: false)
-            .WithOwner("contoso");
+            .WithOwner("contoso")
+            .WithoutExtendedRum();
 
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
@@ -734,6 +751,7 @@ public class AddDocumentDBTests
         Assert.Equal(expectedKeyTarget, manifest["env"]?["KEY_FILE"]?.GetValue<string>());
         Assert.Equal("false", manifest["env"]?["ENABLE_TELEMETRY"]?.GetValue<string>());
         Assert.Equal("contoso", manifest["env"]?["OWNER"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["DISABLE_EXTENDED_RUM"]?.GetValue<string>());
     }
 
     [Fact]

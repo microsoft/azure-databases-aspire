@@ -323,6 +323,17 @@ public class DocumentDBPublicApiTests
     }
 
     [Fact]
+    public void WithoutExtendedRumShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithoutExtendedRum();
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Fact]
     public void WithHostPortShouldThrowWhenBuilderIsNull()
     {
         IResourceBuilder<DocumentDBServerResource> builder = null!;

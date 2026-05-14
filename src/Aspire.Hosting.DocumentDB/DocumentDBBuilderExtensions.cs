@@ -27,6 +27,7 @@ public static class DocumentDBBuilderExtensions
     private const string EnableTelemetryEnvVarName = "ENABLE_TELEMETRY";
     private const string OwnerEnvVarName = "OWNER";
     private const string DataPathEnvVarName = "DATA_PATH";
+    private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
 
     private const string DefaultMountedDataPath = "/data";
     private const string InitDataMountPath = "/init_doc_db.d";
@@ -319,6 +320,26 @@ public static class DocumentDBBuilderExtensions
         return builder.WithEnvironment(context =>
         {
             context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
+        });
+    }
+
+    /// <summary>
+    /// Disables the <c>extended_rum</c> index access method in the DocumentDB Local container
+    /// by setting <c>DISABLE_EXTENDED_RUM=true</c>.
+    /// </summary>
+    /// <remarks>
+    /// Available in DocumentDB <c>v0.111-0</c> and later. On older container images the
+    /// environment variable is ignored.
+    /// </remarks>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithoutExtendedRum(this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[DisableExtendedRumEnvVarName] = "true";
         });
     }
 
