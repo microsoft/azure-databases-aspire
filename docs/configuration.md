@@ -150,6 +150,23 @@ var server = builder.AddDocumentDB("documentdb")
 
 This sets `DISABLE_EXTENDED_RUM=true` on the container. On container images older than v0.111-0 the environment variable is ignored.
 
+## WithoutUserCreation
+
+Disables the automatic user creation performed by the DocumentDB Local container on startup. Use only after a previous run has already created the user in persisted storage (`WithDataVolume` or `WithDataBindMount`). To avoid spurious init-data runs on subsequent starts, also call `WithoutSampleData()`.
+
+> [!WARNING]
+> Setting `CREATE_USER=false` on a fresh container (without a persisted user) will cause the container entrypoint to exit non-zero. The container's init-data scripts (both built-in sample data and custom scripts mounted via `WithInitData`) authenticate using the configured credentials, and will fail if the user does not exist. Always pair this method with `WithoutSampleData()` and ensure the user already exists in the persisted data.
+
+```csharp
+// Typical pattern: persist data and skip user creation + sample data on subsequent runs
+var server = builder.AddDocumentDB("documentdb")
+                    .WithDataVolume()
+                    .WithoutUserCreation()
+                    .WithoutSampleData();
+```
+
+This sets `CREATE_USER=false` on the container.
+
 ## WithTlsCertificate
 
 Mounts a custom TLS certificate and key into the container so DocumentDB Local serves connections with your certificate instead of its default self-signed one.
@@ -353,6 +370,7 @@ The extension passes these environment variables to the DocumentDB container:
 | `ENABLE_TELEMETRY` | `true` or `false` | Set by `WithTelemetry(...)` |
 | `OWNER` | The configured owner string | Set by `WithOwner(...)` |
 | `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()` |
+| `CREATE_USER` | `false` | Set by `WithoutUserCreation()` |
 
 ## Resource model
 
@@ -386,6 +404,7 @@ var db = builder.AddDocumentDB("documentdb")
                 .WithLogLevel(DocumentDBLogLevel.Debug)
                 .WithoutSampleData()
                 .WithoutExtendedRum()
+                .WithoutUserCreation()
                 .UseTls(true)
                 .AllowInsecureTls(true)
                 .AddDatabase("mydb");
