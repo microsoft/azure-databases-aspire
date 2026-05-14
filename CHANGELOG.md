@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- `WithoutExtendedRum()` extension method to disable the `extended_rum` index access method in the DocumentDB Local container ([documentdb/documentdb#470](https://github.com/documentdb/documentdb/pull/470))
+
 ### Fixed
 - Default data volume path changed from `/home/documentdb/postgresql/data` to `/data` to match the DocumentDB Local container default ([documentdb/documentdb#556](https://github.com/documentdb/documentdb/issues/556))
 

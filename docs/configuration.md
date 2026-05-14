@@ -139,6 +139,17 @@ var server = builder.AddDocumentDB("documentdb")
 
 This sets `SKIP_INIT_DATA=true` on the container.
 
+## WithoutExtendedRum
+
+Disables the `extended_rum` index access method in the DocumentDB Local container. Extended RUM is enabled by default starting with DocumentDB v0.111-0.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithoutExtendedRum();
+```
+
+This sets `DISABLE_EXTENDED_RUM=true` on the container. On container images older than v0.111-0 the environment variable is ignored.
+
 ## WithTlsCertificate
 
 Mounts a custom TLS certificate and key into the container so DocumentDB Local serves connections with your certificate instead of its default self-signed one.
@@ -341,6 +352,7 @@ The extension passes these environment variables to the DocumentDB container:
 | `KEY_FILE` | Container path of the mounted key file | Set by `WithTlsCertificate(...)` |
 | `ENABLE_TELEMETRY` | `true` or `false` | Set by `WithTelemetry(...)` |
 | `OWNER` | The configured owner string | Set by `WithOwner(...)` |
+| `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()` |
 
 ## Resource model
 
@@ -373,6 +385,7 @@ var db = builder.AddDocumentDB("documentdb")
                 .WithPostgresVersion(DocumentDBPostgresVersion.Pg17)
                 .WithLogLevel(DocumentDBLogLevel.Debug)
                 .WithoutSampleData()
+                .WithoutExtendedRum()
                 .UseTls(true)
                 .AllowInsecureTls(true)
                 .AddDatabase("mydb");

@@ -30,6 +30,8 @@ namespace Aspire.Hosting
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithoutSampleData(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder) { throw null; }
 
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithoutExtendedRum(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder) { throw null; }
+
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithTlsCertificate(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string certPath, string keyPath) { throw null; }
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithTelemetry(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool enabled = true) { throw null; }

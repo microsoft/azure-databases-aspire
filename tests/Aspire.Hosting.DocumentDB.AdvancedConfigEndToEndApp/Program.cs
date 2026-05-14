@@ -22,6 +22,7 @@ public class Program
             .WithTelemetry(enabled: false)
             .WithoutSampleData()
             .WithOwner("documentdb")
+            .WithoutExtendedRum()
             .AddDatabase("appdb");
 
         var app = builder.Build();
