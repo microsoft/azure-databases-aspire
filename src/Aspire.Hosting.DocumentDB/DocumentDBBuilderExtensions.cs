@@ -361,12 +361,6 @@ public static class DocumentDBBuilderExtensions
     /// these scripts will fail and the container will exit. Always pair this method with
     /// <see cref="WithoutSampleData"/> and ensure the user already exists in the persisted data.
     /// </para>
-    /// <para>
-    /// When combining this method with <see cref="WithDataVolume"/> or <see cref="WithDataBindMount"/>,
-    /// supply stable credentials via the <c>userName</c> and <c>password</c> parameters on
-    /// <c>AddDocumentDB</c>. The default auto-generated password changes on each run,
-    /// which would cause authentication failures against the user created during the initial run.
-    /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
