@@ -6,11 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.112.0] - 2026-06-02
+
+### Highlights
+- Default `documentdb-local` container tag bumped to `pg17-0.112.0`. `DocumentDBVersion.V0_112_0` added to the curated enum and is now `DocumentDBVersions.Latest`.
+- New typed extension methods round out v0.112-era container parity: `WithoutExtendedRum()`, `WithoutUserCreation()`, `WithPostgresEndpoint()`, and `WithOpenTelemetryMetrics(...)`.
+- `WithTelemetry(bool)` is now `[Obsolete]` (warning only) because the underlying `ENABLE_TELEMETRY` env var is no longer consumed by the v0.112-0 gateway; migrate to `WithOpenTelemetryMetrics(...)` for OTLP metrics.
+
 ### Added
 - `WithoutExtendedRum()` extension method to disable the `extended_rum` index access method in the DocumentDB Local container ([documentdb/documentdb#470](https://github.com/documentdb/documentdb/pull/470))
 - `WithoutUserCreation()` extension method to skip automatic user creation on container startup
 - `WithPostgresEndpoint()` extension method to opt in to exposing the PostgreSQL backend coordinator port (`9712`), plus `DocumentDBServerResource.PostgresEndpoint` and `DocumentDBServerResource.PostgresConnectionStringExpression` for accessing the `postgresql://` connection string ([#10](https://github.com/microsoft/azure-databases-aspire/issues/10)). Requires DocumentDB container image `>= 0.112.0`; see [configuration.md](docs/configuration.md#withpostgresendpoint) for the recovery recipe when an older tag is pinned.
 - `WithOpenTelemetryMetrics(endpoint?, enabled?, exportInterval?, timeout?, serviceName?, serviceVersion?)` extension method to wire the OTLP/gRPC metrics exporter introduced in DocumentDB Local container image `v0.112-0`. Sets `OTEL_METRICS_ENABLED`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`, `OTEL_SERVICE_NAME`, and `OTEL_SERVICE_VERSION` as appropriate ([#72](https://github.com/microsoft/azure-databases-aspire/issues/72))
+- `DocumentDBVersion.V0_112_0` curated enum member and `DocumentDBVersions.V0_112_0 = "0.112.0"` constant. `DocumentDBVersions.Latest` and the default container tag (`pg17-0.112.0`) now follow this entry ([#70](https://github.com/microsoft/azure-databases-aspire/issues/70))
+
+### Changed
+- Default container image updated to `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.112.0`. Upgraded .NET Aspire to 13.3.5, Microsoft.NET.Test.Sdk to 18.6.0, and bumped centrally managed `Microsoft.Extensions.*` to 10.0.7 to satisfy the Aspire transitive floor.
 
 ### Deprecated
 - `WithTelemetry(bool)` is marked `[Obsolete]` with diagnostic ID `ASPIREDOCDB0001`. The `ENABLE_TELEMETRY` environment variable it sets is not consumed by the DocumentDB gateway in container image `v0.112-0` or later, so calling it has no observable effect. The method is retained for binary compatibility and may be removed in a future release. Use `WithOpenTelemetryMetrics(...)` to configure OTLP metrics export instead ([#72](https://github.com/microsoft/azure-databases-aspire/issues/72))
