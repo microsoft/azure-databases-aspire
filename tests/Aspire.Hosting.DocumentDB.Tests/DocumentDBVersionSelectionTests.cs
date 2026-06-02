@@ -30,6 +30,7 @@ public class DocumentDBVersionSelectionTests
     [InlineData(DocumentDBVersion.V0_109_0, "pg17-0.109.0")]
     [InlineData(DocumentDBVersion.V0_110_0, "pg17-0.110.0")]
     [InlineData(DocumentDBVersion.V0_111_0, "pg17-0.111.0")]
+    [InlineData(DocumentDBVersion.V0_112_0, "pg17-0.112.0")]
     public void WithDocumentDBVersionAloneSetsExpectedTag(DocumentDBVersion version, string expectedTag)
     {
         var appBuilder = DistributedApplication.CreateBuilder();
@@ -186,6 +187,41 @@ public class DocumentDBVersionSelectionTests
         Assert.NotEmpty(DocumentDBVersions.All);
         Assert.Equal(DocumentDBVersions.All[DocumentDBVersions.All.Count - 1], DocumentDBVersions.Latest);
         Assert.Contains(DocumentDBVersions.Latest, DocumentDBVersions.All);
+    }
+
+    [Fact]
+    public void EveryDocumentDBVersionEnumMemberMapsToStringInAllList()
+    {
+        // Drift guard: the four auto-generated regions in DocumentDBVersion.cs (enum,
+        // const, list, switch) must stay in lockstep. If a future bot run, manual edit,
+        // or merge conflict resolution updates one region but not another, every other
+        // test in this file still passes because they all read through `Latest` or
+        // explicit InlineData. This test fails immediately on any mismatch.
+        //
+        // Goes through the public surface (WithDocumentDBVersion -> ContainerImageAnnotation.Tag)
+        // because ToVersionString is internal. WithDocumentDBVersion ultimately calls
+        // ToVersionString via ComputeImageTag, so a missing switch arm surfaces as
+        // ArgumentOutOfRangeException here. A missing All entry surfaces as the
+        // Count mismatch assertion.
+        var enumMembers = Enum.GetValues<DocumentDBVersion>();
+        Assert.Equal(enumMembers.Length, DocumentDBVersions.All.Count);
+
+        foreach (var v in enumMembers)
+        {
+            var appBuilder = DistributedApplication.CreateBuilder();
+            appBuilder.AddDocumentDB($"documentdb-{(int)v}").WithDocumentDBVersion(v);
+
+            using var app = appBuilder.Build();
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+            var image = Assert.Single(server.Annotations.OfType<ContainerImageAnnotation>());
+
+            // Tag is "pgN-X.Y.Z"; extract the version string and confirm it's in All.
+            var dash = image.Tag!.IndexOf('-');
+            Assert.True(dash > 0, $"Unexpected image tag format: {image.Tag}");
+            var versionString = image.Tag![(dash + 1)..];
+            Assert.Contains(versionString, DocumentDBVersions.All);
+        }
     }
 
     [Fact]
