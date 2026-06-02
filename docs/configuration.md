@@ -158,22 +158,14 @@ Disables the automatic user creation performed by the DocumentDB Local container
 > Setting `CREATE_USER=false` on a fresh container (without a persisted user) will cause the container entrypoint to exit non-zero. The container's init-data scripts (both built-in sample data and custom scripts mounted via `WithInitData`) authenticate using the configured credentials, and will fail if the user does not exist. Always pair this method with `WithoutSampleData()` and ensure the user already exists in the persisted data.
 
 ```csharp
-// Use stable credentials so the persisted user matches across container restarts
-var user = builder.AddParameter("db-user");
-var pass = builder.AddParameter("db-pass", secret: true);
-var server = builder.AddDocumentDB("documentdb", userName: user, password: pass)
+// Typical pattern: persist data and skip user creation + sample data on subsequent runs
+var server = builder.AddDocumentDB("documentdb")
                     .WithDataVolume()
                     .WithoutUserCreation()
                     .WithoutSampleData();
 ```
 
 This sets `CREATE_USER=false` on the container.
-
-> [!NOTE]
-> When using `WithoutUserCreation()` with `WithDataVolume`, you must supply stable credentials
-> via the `userName` and `password` parameters. The default auto-generated password changes on
-> each run, which would cause authentication failures against the user created during the
-> initial run.
 
 ## WithTlsCertificate
 
