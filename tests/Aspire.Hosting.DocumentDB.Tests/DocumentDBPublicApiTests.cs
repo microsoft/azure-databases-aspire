@@ -284,14 +284,92 @@ public class DocumentDBPublicApiTests
     [Fact]
     public void WithTelemetryShouldThrowWhenBuilderIsNull()
     {
+#pragma warning disable ASPIREDOCDB0001 // WithTelemetry is obsolete; null-builder guard retained for binary compatibility.
         IResourceBuilder<DocumentDBServerResource> builder = null!;
 
         var action = () => builder.WithTelemetry();
+#pragma warning restore ASPIREDOCDB0001
 
         var exception = Assert.Throws<ArgumentNullException>(action);
         Assert.Equal(nameof(builder), exception.ParamName);
     }
 
+    [Fact]
+    public void WithOpenTelemetryMetricsShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithOpenTelemetryMetrics();
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void WithOpenTelemetryMetricsShouldThrowWhenEndpointIsEmptyOrWhitespace(string endpoint)
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+
+        var action = () => builder.WithOpenTelemetryMetrics(endpoint: endpoint);
+
+        var exception = Assert.Throws<ArgumentException>(action);
+        Assert.Equal(nameof(endpoint), exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void WithOpenTelemetryMetricsShouldThrowWhenServiceNameIsEmptyOrWhitespace(string serviceName)
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+
+        var action = () => builder.WithOpenTelemetryMetrics(serviceName: serviceName);
+
+        var exception = Assert.Throws<ArgumentException>(action);
+        Assert.Equal(nameof(serviceName), exception.ParamName);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void WithOpenTelemetryMetricsShouldThrowWhenServiceVersionIsEmptyOrWhitespace(string serviceVersion)
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+
+        var action = () => builder.WithOpenTelemetryMetrics(serviceVersion: serviceVersion);
+
+        var exception = Assert.Throws<ArgumentException>(action);
+        Assert.Equal(nameof(serviceVersion), exception.ParamName);
+    }
+
+    [Fact]
+    public void WithOpenTelemetryMetricsShouldThrowWhenExportIntervalIsNegative()
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+
+        var action = () => builder.WithOpenTelemetryMetrics(exportInterval: TimeSpan.FromSeconds(-1));
+
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(action);
+        Assert.Equal("exportInterval", exception.ParamName);
+    }
+
+    [Fact]
+    public void WithOpenTelemetryMetricsShouldThrowWhenTimeoutIsNegative()
+    {
+        var builder = TestDistributedApplicationBuilder.Create()
+            .AddDocumentDB("DocumentDB");
+
+        var action = () => builder.WithOpenTelemetryMetrics(timeout: TimeSpan.FromMilliseconds(-1));
+
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(action);
+        Assert.Equal("timeout", exception.ParamName);
+    }
 
     [Fact]
     public void WithOwnerShouldThrowWhenBuilderIsNull()

@@ -80,7 +80,8 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithoutExtendedRum()` | Disable the `extended_rum` index access method (DocumentDB v0.111.0+) |
 | `.WithoutUserCreation()` | Skip automatic user creation on container startup |
 | `.WithTlsCertificate(certPath, keyPath)` | Mount a custom TLS certificate and key into the container |
-| `.WithTelemetry(enabled?)` | Enable or disable container telemetry |
+| `.WithTelemetry(enabled?)` | **Obsolete.** No-op against gateway v0.112-0+; use `.WithOpenTelemetryMetrics(...)` instead. Kept for binary compatibility (`ASPIREDOCDB0001`). |
+| `.WithOpenTelemetryMetrics(endpoint?, enabled?, exportInterval?, timeout?, serviceName?, serviceVersion?)` | Enable OpenTelemetry metrics export from the gateway via OTLP/gRPC (container v0.112-0+) |
 | `.WithOwner(owner)` | Set the container `OWNER` value |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |
@@ -97,7 +98,7 @@ var documentdb = builder.AddDocumentDB("documentdb")
     .WithLogLevel(DocumentDBLogLevel.Debug)
     .WithInitData("../seed")
     .WithTlsCertificate("../certs/documentdb.pem", "../certs/documentdb.key")
-    .WithTelemetry(enabled: false)
+    .WithOpenTelemetryMetrics(endpoint: "http://otel-collector:4317")
     .WithOwner("documentdb")
     .WithoutExtendedRum();
 

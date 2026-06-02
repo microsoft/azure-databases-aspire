@@ -15,6 +15,7 @@ public class Program
         var builder = DistributedApplication.CreateBuilder(args);
         var assets = TestAssets.Create();
 
+#pragma warning disable ASPIREDOCDB0001 // WithTelemetry is obsolete; covered by an integration test.
         builder.AddDocumentDB("documentdb")
             .WithLogLevel(DocumentDBLogLevel.Debug)
             .WithInitData(assets.InitDataPath)
@@ -24,6 +25,7 @@ public class Program
             .WithOwner("documentdb")
             .WithoutExtendedRum()
             .AddDatabase("appdb");
+#pragma warning restore ASPIREDOCDB0001
 
         var app = builder.Build();
 
