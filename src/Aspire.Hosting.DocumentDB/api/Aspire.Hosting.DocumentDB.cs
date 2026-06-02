@@ -36,7 +36,10 @@ namespace Aspire.Hosting
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithTlsCertificate(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string certPath, string keyPath) { throw null; }
 
+        [Obsolete("ENABLE_TELEMETRY is not consumed by the DocumentDB gateway in container image v0.112-0 or later, so this method has no observable effect on those images. Use WithOpenTelemetryMetrics(...) for OTLP metrics. This member is kept for binary compatibility and may be removed in a future release.", error: false, DiagnosticId = "ASPIREDOCDB0001", UrlFormat = "https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#withtelemetry-obsolete")]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithTelemetry(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, bool enabled = true) { throw null; }
+
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithOpenTelemetryMetrics(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string? endpoint = null, bool enabled = true, System.TimeSpan? exportInterval = null, System.TimeSpan? timeout = null, string? serviceName = null, string? serviceVersion = null) { throw null; }
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithOwner(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, string owner) { throw null; }
 

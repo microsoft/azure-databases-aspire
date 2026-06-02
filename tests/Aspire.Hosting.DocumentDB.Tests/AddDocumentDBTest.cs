@@ -710,9 +710,11 @@ public class AddDocumentDBTests
     [InlineData(false, "false")]
     public async Task WithTelemetryAddsEnvironmentVariable(bool enabled, string expectedValue)
     {
+#pragma warning disable ASPIREDOCDB0001 // WithTelemetry is obsolete; behavior retained for binary compatibility.
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithTelemetry(enabled);
+#pragma warning restore ASPIREDOCDB0001
 
         using var app = appBuilder.Build();
 
@@ -721,6 +723,250 @@ public class AddDocumentDBTests
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         Assert.Equal(expectedValue, env["ENABLE_TELEMETRY"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsSetsEnabledEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["OTEL_METRICS_ENABLED"]);
+        Assert.False(env.ContainsKey("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"));
+        Assert.False(env.ContainsKey("OTEL_METRIC_EXPORT_INTERVAL"));
+        Assert.False(env.ContainsKey("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_NAME"));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_VERSION"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRespectsExplicitFalse()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsSetsExporterEndpoint()
+    {
+        const string Endpoint = "http://otel-collector:4317";
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(endpoint: Endpoint);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(Endpoint, env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
+        Assert.Equal("true", env["OTEL_METRICS_ENABLED"]);
+        Assert.False(env.ContainsKey("OTEL_EXPORTER_OTLP_ENDPOINT"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsSetsExportInterval()
+    {
+        var interval = TimeSpan.FromSeconds(30);
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(exportInterval: interval);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("30000", env["OTEL_METRIC_EXPORT_INTERVAL"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsSetsTimeout()
+    {
+        var timeout = TimeSpan.FromSeconds(5);
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(timeout: timeout);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("5000", env["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsSetsServiceNameAndVersion()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(serviceName: "documentdb-local", serviceVersion: "0.112.0");
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("documentdb-local", env["OTEL_SERVICE_NAME"]);
+        Assert.Equal("0.112.0", env["OTEL_SERVICE_VERSION"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFormatsTimeSpanAsInvariantMilliseconds()
+    {
+        var originalCulture = System.Threading.Thread.CurrentThread.CurrentCulture;
+
+        try
+        {
+            System.Threading.Thread.CurrentThread.CurrentCulture =
+                System.Globalization.CultureInfo.GetCultureInfo("tr-TR");
+
+            var appBuilder = DistributedApplication.CreateBuilder();
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithOpenTelemetryMetrics(
+                    exportInterval: TimeSpan.FromMilliseconds(1234567),
+                    timeout: TimeSpan.FromMilliseconds(2500));
+
+            using var app = appBuilder.Build();
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+            var env = await BuildEnvironmentVariablesAsync(containerResource);
+            Assert.Equal("1234567", env["OTEL_METRIC_EXPORT_INTERVAL"]);
+            Assert.Equal("2500", env["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
+        }
+        finally
+        {
+            System.Threading.Thread.CurrentThread.CurrentCulture = originalCulture;
+        }
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsCoexistsWithObsoleteWithTelemetry()
+    {
+#pragma warning disable ASPIREDOCDB0001 // WithTelemetry is obsolete; coexistence test ensures no aliasing.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithTelemetry(enabled: false)
+            .WithOpenTelemetryMetrics(enabled: true, endpoint: "http://collector:4317");
+#pragma warning restore ASPIREDOCDB0001
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["ENABLE_TELEMETRY"]);
+        Assert.Equal("true", env["OTEL_METRICS_ENABLED"]);
+        Assert.Equal("http://collector:4317", env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsMergesAcrossMultipleCalls()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(endpoint: "http://first:4317", serviceName: "first")
+            .WithOpenTelemetryMetrics(enabled: false, serviceName: "second");
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+        Assert.Equal("http://first:4317", env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
+        Assert.Equal("second", env["OTEL_SERVICE_NAME"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRewritesEnabledOnEveryCall()
+    {
+        // Documented behavior: `enabled` is non-nullable with default `true`, so every call
+        // rewrites OTEL_METRICS_ENABLED. A later call that omits `enabled` re-enables metrics
+        // even when an earlier call disabled them. Callers must re-pass `enabled: false` to
+        // preserve a disabled state.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(enabled: false)
+            .WithOpenTelemetryMetrics(endpoint: "http://collector:4317");
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["OTEL_METRICS_ENABLED"]);
+        Assert.Equal("http://collector:4317", env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsZeroTimeSpan()
+    {
+        // Boundary of the non-negative TimeSpan guard: TimeSpan.Zero is accepted and emitted as "0".
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(exportInterval: TimeSpan.Zero, timeout: TimeSpan.Zero);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("0", env["OTEL_METRIC_EXPORT_INTERVAL"]);
+        Assert.Equal("0", env["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAddsAllEnvironmentVariablesInManifest()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(
+                endpoint: "http://otel-collector:4317",
+                enabled: true,
+                exportInterval: TimeSpan.FromSeconds(60),
+                timeout: TimeSpan.FromSeconds(10),
+                serviceName: "documentdb-local",
+                serviceVersion: "0.112.0");
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("true", manifest["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal("http://otel-collector:4317", manifest["env"]?["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]?.GetValue<string>());
+        Assert.Equal("60000", manifest["env"]?["OTEL_METRIC_EXPORT_INTERVAL"]?.GetValue<string>());
+        Assert.Equal("10000", manifest["env"]?["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]?.GetValue<string>());
+        Assert.Equal("documentdb-local", manifest["env"]?["OTEL_SERVICE_NAME"]?.GetValue<string>());
+        Assert.Equal("0.112.0", manifest["env"]?["OTEL_SERVICE_VERSION"]?.GetValue<string>());
     }
 
 
@@ -749,6 +995,7 @@ public class AddDocumentDBTests
         var expectedCertTarget = $"/documentdb-cert-{Path.GetFileName(certPath)}";
         var expectedKeyTarget = $"/documentdb-key-{Path.GetFileName(keyPath)}";
 
+#pragma warning disable ASPIREDOCDB0001 // WithTelemetry is obsolete; covered for back-compat in this manifest test.
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
             .WithLogLevel(DocumentDBLogLevel.Debug)
@@ -758,6 +1005,7 @@ public class AddDocumentDBTests
             .WithOwner("contoso")
             .WithoutExtendedRum()
             .WithoutUserCreation();
+#pragma warning restore ASPIREDOCDB0001
 
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
@@ -996,9 +1244,11 @@ public class AddDocumentDBTests
     [Fact]
     public async Task WithTelemetryDefaultsToEnabled()
     {
+#pragma warning disable ASPIREDOCDB0001 // WithTelemetry is obsolete; default-value behavior retained for binary compatibility.
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithTelemetry();
+#pragma warning restore ASPIREDOCDB0001
 
         using var app = appBuilder.Build();
 

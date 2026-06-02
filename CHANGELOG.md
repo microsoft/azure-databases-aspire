@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `WithoutExtendedRum()` extension method to disable the `extended_rum` index access method in the DocumentDB Local container ([documentdb/documentdb#470](https://github.com/documentdb/documentdb/pull/470))
 - `WithoutUserCreation()` extension method to skip automatic user creation on container startup
 - `WithPostgresEndpoint()` extension method to opt in to exposing the PostgreSQL backend coordinator port (`9712`), plus `DocumentDBServerResource.PostgresEndpoint` and `DocumentDBServerResource.PostgresConnectionStringExpression` for accessing the `postgresql://` connection string ([#10](https://github.com/microsoft/azure-databases-aspire/issues/10))
+- `WithOpenTelemetryMetrics(endpoint?, enabled?, exportInterval?, timeout?, serviceName?, serviceVersion?)` extension method to wire the OTLP/gRPC metrics exporter introduced in DocumentDB Local container image `v0.112-0`. Sets `OTEL_METRICS_ENABLED`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`, `OTEL_SERVICE_NAME`, and `OTEL_SERVICE_VERSION` as appropriate ([#72](https://github.com/microsoft/azure-databases-aspire/issues/72))
+
+### Deprecated
+- `WithTelemetry(bool)` is marked `[Obsolete]` with diagnostic ID `ASPIREDOCDB0001`. The `ENABLE_TELEMETRY` environment variable it sets is not consumed by the DocumentDB gateway in container image `v0.112-0` or later, so calling it has no observable effect. The method is retained for binary compatibility and may be removed in a future release. Use `WithOpenTelemetryMetrics(...)` to configure OTLP metrics export instead ([#72](https://github.com/microsoft/azure-databases-aspire/issues/72))
 
 ### Fixed
 - Default data volume path changed from `/home/documentdb/postgresql/data` to `/data` to match the DocumentDB Local container default ([documentdb/documentdb#556](https://github.com/documentdb/documentdb/issues/556))
