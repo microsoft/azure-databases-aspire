@@ -9,9 +9,11 @@
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.EndToEndApp\Aspire.Hosting.DocumentDB.EndToEndApp.csproj" />
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.ConfiguredEndToEndApp\Aspire.Hosting.DocumentDB.ConfiguredEndToEndApp.csproj" />
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.AdvancedConfigEndToEndApp\Aspire.Hosting.DocumentDB.AdvancedConfigEndToEndApp.csproj" />
+    <ProjectReference Include="..\Aspire.Hosting.DocumentDB.PostgresEndToEndApp\Aspire.Hosting.DocumentDB.PostgresEndToEndApp.csproj" />
     <PackageReference Include="Aspire.MongoDB.Driver" />
     <PackageReference Include="Aspire.Hosting.Testing" />
     <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
+    <PackageReference Include="Npgsql" />
     <PackageReference Include="xunit.abstractions" />
     <PackageReference Include="xunit" />
   </ItemGroup>

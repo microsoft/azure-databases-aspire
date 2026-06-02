@@ -4,6 +4,7 @@
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.DocumentDB;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
 
 namespace Aspire.Hosting;
@@ -261,7 +262,126 @@ public static class DocumentDBBuilderExtensions
                 // server even on upstream container builds where the entrypoint's default
                 // ALLOW_EXTERNAL_CONNECTIONS handling is corrected.
                 context.EnvironmentVariables[AllowExternalConnectionsEnvVarName] = "true";
+            })
+            .SubscribeMinimumPostgresImageGuard();
+    }
+
+    /// <summary>
+    /// Subscribes a <see cref="BeforeResourceStartedEvent"/> handler that throws
+    /// <see cref="InvalidOperationException"/> if the resource's effective container image
+    /// tag is older than <see cref="DocumentDBContainerImageTags.MinimumPostgresEndpointVersion"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The handler is registered AFTER endpoint and environment configuration have run,
+    /// but executes at run-time via the orchestrator, which honours the documented
+    /// "last call wins" precedence: a <c>WithImageTag(...)</c> chained after
+    /// <see cref="WithPostgresEndpoint"/> still affects the tag the guard sees.
+    /// </para>
+    /// <para>
+    /// The guard is run-mode only. <see cref="BeforeResourceStartedEvent"/> is not published
+    /// during manifest generation, so <c>azd publish</c> / <c>--publisher manifest</c> flows
+    /// are unaffected — that is intentional, because no container is started in those modes.
+    /// </para>
+    /// <para>
+    /// Custom images (anything whose <see cref="ContainerImageAnnotation.Image"/> is not
+    /// the curated <see cref="DocumentDBContainerImageTags.Image"/>) are exempt with a
+    /// single warning. Tags that do not match the strict <c>pg{NN}-X.Y.Z</c> pattern
+    /// (e.g., <c>nightly</c>, <c>pg17-0.112.0-rc.1</c>) are also exempt with a single
+    /// warning, so callers pinning custom builds or pre-releases are not surprised by an
+    /// unactionable hard failure.
+    /// </para>
+    /// </remarks>
+    private static IResourceBuilder<DocumentDBServerResource> SubscribeMinimumPostgresImageGuard(
+        this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        // Captured per-resource one-shot flag so unknown-tag / custom-image warnings
+        // don't spam on every restart attempt. Hard-failure exceptions are deterministic
+        // and intentionally re-thrown on each start attempt. Interlocked guard makes
+        // the at-most-once property memory-safe even if a future Aspire orchestrator
+        // dispatches BeforeResourceStartedEvent concurrently for the same resource.
+        var warningLogged = 0;
+
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(
+            builder.Resource,
+            (evt, ct) =>
+            {
+                var imageAnnotation = evt.Resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
+                if (imageAnnotation is null)
+                {
+                    // Defensive: AddDocumentDB sets ContainerImageAnnotation eagerly via WithImage.
+                    return Task.CompletedTask;
+                }
+
+                var logger = TryGetResourceLogger(evt);
+
+                // Custom-image carve-out: only enforce the floor on the curated
+                // documentdb-local image. A fork using a different image name
+                // (regardless of registry) is assumed to know what it is doing.
+                if (!string.Equals(imageAnnotation.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
+                {
+                    if (Interlocked.CompareExchange(ref warningLogged, 1, 0) == 0)
+                    {
+                        logger?.LogWarning(
+                            "DocumentDB resource '{ResourceName}' uses custom image '{Image}:{Tag}'. " +
+                            "The v{MinVersion} minimum required by WithPostgresEndpoint() for credential parity " +
+                            "is NOT enforced on custom images.",
+                            evt.Resource.Name,
+                            imageAnnotation.Image,
+                            imageAnnotation.Tag,
+                            DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
+                    }
+                    return Task.CompletedTask;
+                }
+
+                if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(imageAnnotation.Tag, out _, out var docVersion))
+                {
+                    if (Interlocked.CompareExchange(ref warningLogged, 1, 0) == 0)
+                    {
+                        logger?.LogWarning(
+                            "DocumentDB resource '{ResourceName}' uses image tag '{Tag}', which does not match " +
+                            "the curated 'pg{{NN}}-X.Y.Z' pattern. The v{MinVersion} minimum required by " +
+                            "WithPostgresEndpoint() for credential parity is NOT enforced on unrecognised tags.",
+                            evt.Resource.Name,
+                            imageAnnotation.Tag,
+                            DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
+                    }
+                    return Task.CompletedTask;
+                }
+
+                if (docVersion < DocumentDBContainerImageTags.MinimumPostgresEndpointVersion)
+                {
+                    throw new InvalidOperationException(
+                        $"DocumentDB resource '{evt.Resource.Name}' is configured with image tag " +
+                        $"'{imageAnnotation.Tag}', but WithPostgresEndpoint() requires DocumentDB " +
+                        $"v{DocumentDBContainerImageTags.MinimumPostgresEndpointVersion} or later. " +
+                        $"Earlier images hard-code the PostgreSQL admin credentials to " +
+                        $"'docdb_admin'/'Admin100', so the Aspire-generated postgresql:// connection " +
+                        $"string would silently fail to authenticate. Recovery: chain " +
+                        $"'.WithImageTag(\"pg{{NN}}-{DocumentDBContainerImageTags.MinimumPostgresEndpointVersion}\")' " +
+                        $"(or newer) after AddDocumentDB(...). See " +
+                        $"https://github.com/microsoft/azure-databases-aspire/issues/71.");
+                }
+
+                return Task.CompletedTask;
             });
+
+        return builder;
+    }
+
+    private static ILogger? TryGetResourceLogger(BeforeResourceStartedEvent evt)
+    {
+        // Prefer per-resource logger so the message shows in the Aspire dashboard's
+        // resource log pane. Fall back to a general host logger if the service is
+        // not registered (shouldn't happen in 13.3.5, but defensive).
+        var resourceLoggerService = evt.Services.GetService<ResourceLoggerService>();
+        if (resourceLoggerService is not null)
+        {
+            return resourceLoggerService.GetLogger(evt.Resource);
+        }
+
+        var loggerFactory = evt.Services.GetService<ILoggerFactory>();
+        return loggerFactory?.CreateLogger("Aspire.Hosting.DocumentDB.WithPostgresEndpoint");
     }
 
     /// <summary>

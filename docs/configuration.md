@@ -293,6 +293,55 @@ builder.AddProject<Projects.Worker>("worker")
 |---|---|---|---|
 | `port` | `int?` | `null` | Host port to bind to. When `null`, Aspire assigns a random host port. |
 
+> [!IMPORTANT]
+> **`WithPostgresEndpoint()` requires DocumentDB container image `>= 0.112.0`.**
+>
+> The `documentdb-local` entrypoint hard-codes the PostgreSQL admin role to
+> `docdb_admin`/`Admin100` on image tags below `0.112.0`, so the
+> `postgresql://admin:<password>@host:port/postgres` connection string Aspire
+> generates would silently fail authentication. To prevent the silent failure,
+> the integration validates the resource's effective `ContainerImageAnnotation`
+> tag at startup and throws an `InvalidOperationException` if it is older than
+> `pg{NN}-0.112.0`. The exception message looks like:
+>
+> ```
+> DocumentDB resource 'documentdb' is configured with image tag 'pg17-0.111.0',
+> but WithPostgresEndpoint() requires DocumentDB v0.112.0 or later. Earlier
+> images hard-code the PostgreSQL admin credentials to 'docdb_admin'/'Admin100',
+> so the Aspire-generated postgresql:// connection string would silently fail to
+> authenticate. Recovery: chain '.WithImageTag("pg{NN}-0.112.0")' (or newer)
+> after AddDocumentDB(...). See https://github.com/microsoft/azure-databases-aspire/issues/71.
+> ```
+>
+> **Recovery recipe:**
+>
+> ```csharp
+> var db = builder.AddDocumentDB("documentdb")
+>                 .WithImageTag("pg17-0.112.0")   // or any newer tag
+>                 .WithPostgresEndpoint();
+> ```
+>
+> Once `DocumentDBVersion.V0_112_0` is added to the curated enum
+> (tracked by issue [#70](https://github.com/microsoft/azure-databases-aspire/issues/70)),
+> the typed form `.WithDocumentDBVersion(DocumentDBVersion.V0_112_0)` becomes
+> available as an equivalent recovery. Until then, prefer the free-form
+> `.WithImageTag(...)` shown above.
+>
+> **Scope of the guard:**
+> - **Run mode only.** Manifest generation (`azd publish`, `--publisher
+>   manifest`) does not start the container, so the guard does not fire and
+>   the manifest is produced regardless of tag.
+> - **Curated image only.** A custom image (any
+>   `ContainerImageAnnotation.Image` other than
+>   `documentdb/documentdb-local`, e.g. a fork via `.WithImage("myorg/build", "pg17-0.110.0")`)
+>   is exempt with a one-time warning. The container registry does not factor
+>   into the carve-out — a private mirror of the curated image is still
+>   guarded.
+> - **Unknown tag patterns** (`:latest`, `:nightly`, `pg17-0.112.0-rc.1`,
+>   custom non-`pg{NN}-X.Y.Z` strings) bypass the version check with a
+>   one-time warning, so pinning a custom build or pre-release does not break
+>   startup.
+
 ### Generated PostgreSQL connection string
 
 ```
