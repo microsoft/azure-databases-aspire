@@ -375,7 +375,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.111.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.112.0`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
