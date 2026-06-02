@@ -355,6 +355,17 @@ public class DocumentDBPublicApiTests
         Assert.Equal(nameof(builder), exception.ParamName);
     }
 
+    [Fact]
+    public void WithPostgresEndpointShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithPostgresEndpoint();
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
     [Theory]
     [InlineData("/some/dir/", "/valid/key.pem", "certPath")]
     [InlineData("/valid/cert.pem", "/some/dir/", "keyPath")]

@@ -274,6 +274,42 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`. |
 
+## WithPostgresEndpoint
+
+Exposes the PostgreSQL backend coordinator port of the DocumentDB Local container (default container port `9712`) as a second endpoint on the resource, and enables `DocumentDBServerResource.PostgresConnectionStringExpression`.
+
+The `documentdb-local` container bundles a MongoDB-compatible gateway and a PostgreSQL coordinator on separate ports. By default, only the gateway port (`10260`) is published and only a `mongodb://` connection string is generated. Call `WithPostgresEndpoint()` when you also want to talk to the PostgreSQL backend directly (psql / Npgsql / etc.).
+
+```csharp
+var documentDB = builder.AddDocumentDB("documentdb")
+                        .WithPostgresEndpoint();
+
+builder.AddProject<Projects.Worker>("worker")
+       .WithReference(documentDB) // injects the mongodb:// connection string
+       .WithEnvironment("ConnectionStrings__pg", documentDB.Resource.PostgresConnectionStringExpression);
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `port` | `int?` | `null` | Host port to bind to. When `null`, Aspire assigns a random host port. |
+
+### Generated PostgreSQL connection string
+
+```
+postgresql://<username>:<password>@<host>:<port>/postgres
+```
+
+- The same `userName` / `password` parameters as the MongoDB gateway are used, because the upstream container provisions a single admin user shared by both surfaces.
+- The default database is `postgres`, matching the upstream entrypoint's `-d postgres` convention.
+- No `sslmode` query parameter is added, because the bundled PostgreSQL server is started with `ssl = off`; the `UseTls` / `AllowInsecureTls` flags only affect the MongoDB connection string. If you have configured TLS on the PostgreSQL side, append `?sslmode=...` yourself.
+
+> [!NOTE]
+> Accessing `PostgresConnectionStringExpression` before calling `WithPostgresEndpoint()` throws `InvalidOperationException`. Calling `WithPostgresEndpoint()` more than once on the same resource also throws.
+
+Calling this method also sets `ALLOW_EXTERNAL_CONNECTIONS=true` on the container so the upstream entrypoint configures PostgreSQL to listen on all interfaces with a permissive `pg_hba.conf`. Publishing the host port alone is not enough to guarantee external reachability across upstream container revisions.
+
+The supplied `userName`/`password` (default `admin` + auto-generated) are usable as PostgreSQL credentials because the upstream entrypoint creates a real PostgreSQL role via `documentdb_api.create_user(...)` with a SCRAM-SHA-256-hashed password. The same caveat as the gateway side applies: combining this with `WithoutUserCreation()` only works against a persisted data volume that already contains the role.
+
 ## Supported versions
 
 The `DocumentDBVersion` enum is the **curated, append-only** list of versions known to this build of the package. New entries are added by the `check-documentdb-version` GitHub Actions workflow only when the version is published as a non-prerelease GitHub Release on [`documentdb/documentdb`](https://github.com/documentdb/documentdb/releases) AND the `pg15-X.Y.Z`, `pg16-X.Y.Z`, and `pg17-X.Y.Z` container tags all exist on GHCR. Existing entries are never renamed, removed, or renumbered.
