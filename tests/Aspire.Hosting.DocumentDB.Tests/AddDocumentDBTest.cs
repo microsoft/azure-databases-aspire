@@ -773,6 +773,182 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public void WithPostgresEndpointAddsSecondEndpointAnnotation()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var endpoints = containerResource.Annotations.OfType<EndpointAnnotation>().ToList();
+        Assert.Equal(2, endpoints.Count);
+
+        var pgEndpoint = Assert.Single(endpoints, e => e.Name == "postgres");
+        Assert.Equal(9712, pgEndpoint.TargetPort);
+        Assert.Null(pgEndpoint.Port);
+        Assert.Equal(ProtocolType.Tcp, pgEndpoint.Protocol);
+        Assert.Equal("postgresql", pgEndpoint.UriScheme);
+    }
+
+    [Fact]
+    public void WithPostgresEndpointBindsCustomHostPort()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint(15432);
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var pgEndpoint = Assert.Single(
+            containerResource.Annotations.OfType<EndpointAnnotation>(),
+            e => e.Name == "postgres");
+        Assert.Equal(9712, pgEndpoint.TargetPort);
+        Assert.Equal(15432, pgEndpoint.Port);
+    }
+
+    [Fact]
+    public void AddDocumentDBDoesNotAddPostgresEndpointByDefault()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB");
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var endpoints = containerResource.Annotations.OfType<EndpointAnnotation>().ToList();
+        Assert.Single(endpoints);
+        Assert.DoesNotContain(endpoints, e => e.Name == "postgres");
+    }
+
+    [Fact]
+    public void PostgresConnectionStringExpressionThrowsWhenEndpointNotAdded()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => _ = documentDB.Resource.PostgresConnectionStringExpression);
+
+        Assert.Contains("WithPostgresEndpoint", exception.Message);
+    }
+
+    [Fact]
+    public void PostgresConnectionStringExpressionIncludesCredentialsAndDefaultDatabase()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint();
+
+        var expression = documentDB.Resource.PostgresConnectionStringExpression.ValueExpression;
+
+        Assert.Equal(
+            "postgresql://admin:{DocumentDB-password.value}@" +
+            "{DocumentDB.bindings.postgres.host}:{DocumentDB.bindings.postgres.port}/postgres",
+            expression);
+    }
+
+    [Fact]
+    public async Task PostgresConnectionStringResolvesToReachableUri()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint()
+            .WithEndpoint("postgres", e => e.AllocatedEndpoint = new AllocatedEndpoint(e, "localhost", 25432));
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var passwordParameter = Assert.IsType<ParameterResource>(containerResource.PasswordParameter);
+        var password = await passwordParameter.GetValueAsync(default);
+        Assert.NotNull(password);
+
+        var connectionString = await containerResource.PostgresConnectionStringExpression.GetValueAsync(default);
+        Assert.NotNull(connectionString);
+
+        var uri = new Uri(connectionString!);
+        Assert.Equal("postgresql", uri.Scheme);
+        Assert.Equal("localhost", uri.Host);
+        Assert.Equal(25432, uri.Port);
+        Assert.Equal("/postgres", uri.AbsolutePath);
+        var userInfo = uri.UserInfo.Split(':', 2);
+        Assert.Equal("admin", userInfo[0]);
+        Assert.Equal(password!, userInfo[1]);
+        Assert.Equal(string.Empty, uri.Query);
+    }
+
+    [Fact]
+    public async Task VerifyManifestIncludesPostgresEndpointWhenOptedIn()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint();
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        var bindings = manifest["bindings"];
+        Assert.NotNull(bindings);
+
+        var tcpBinding = bindings!["tcp"];
+        Assert.NotNull(tcpBinding);
+        Assert.Equal(10260, tcpBinding!["targetPort"]?.GetValue<int>());
+
+        var pgBinding = bindings["postgres"];
+        Assert.NotNull(pgBinding);
+        Assert.Equal(9712, pgBinding!["targetPort"]?.GetValue<int>());
+        Assert.Equal("postgresql", pgBinding["scheme"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public void WithPostgresEndpointCalledTwiceThrowsInvalidOperation()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint();
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => documentDB.WithPostgresEndpoint());
+
+        Assert.Contains("already been added", exception.Message);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointSetsAllowExternalConnectionsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["ALLOW_EXTERNAL_CONNECTIONS"]);
+    }
+
+    [Fact]
+    public async Task AddDocumentDBDoesNotSetAllowExternalConnectionsByDefault()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB");
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.False(env.ContainsKey("ALLOW_EXTERNAL_CONNECTIONS"));
+    }
+
+    [Fact]
     public async Task WithTlsCertificateUsesDistinctTargetsWhenFileNamesMatch()
     {
         var certPath = Path.GetFullPath(Path.Combine("TestData", "certs", "shared.pem"));

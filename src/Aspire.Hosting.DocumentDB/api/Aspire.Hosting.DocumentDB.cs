@@ -48,6 +48,8 @@ namespace Aspire.Hosting
 
         public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithPostgresVersion(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, ApplicationModel.DocumentDBPostgresVersion pgVersion) { throw null; }
 
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> WithPostgresEndpoint(this ApplicationModel.IResourceBuilder<ApplicationModel.DocumentDBServerResource> builder, int? port = null) { throw null; }
+
     }
 }
 
@@ -70,11 +72,15 @@ namespace Aspire.Hosting.ApplicationModel
 
         public ReferenceExpression ConnectionStringExpression { get { throw null; } }
 
+        public ReferenceExpression PostgresConnectionStringExpression { get { throw null; } }
+
     public System.Collections.Generic.IReadOnlyList<ApplicationModel.DocumentDBDatabaseResource> Databases { get { throw null; } }
 
         public ParameterResource? PasswordParameter { get { throw null; } }
 
         public EndpointReference PrimaryEndpoint { get { throw null; } }
+
+        public EndpointReference PostgresEndpoint { get { throw null; } }
 
         public ParameterResource? UserNameParameter { get { throw null; } }
     }

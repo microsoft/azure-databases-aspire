@@ -65,6 +65,7 @@ Then inject `IMongoClient` wherever you need it. The connection string is resolv
 | `.AllowInsecureTls(allowInsecureTls?)` | Allow self-signed certificates (default: enabled) |
 | `.WithDocumentDBVersion(version)` | Pin a curated DocumentDB version (default: latest known to this build) |
 | `.WithPostgresVersion(pgVersion)` | Choose PG15/16/17 backend variant (default: Pg17) |
+| `.WithPostgresEndpoint(port?)` | Also expose the PostgreSQL backend port (9712) and enable `PostgresConnectionStringExpression` |
 
 See the [Configuration Reference](docs/configuration.md) for details, code examples, and default values.
 

@@ -15,6 +15,8 @@ public static class DocumentDBBuilderExtensions
 {
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
+    // default PostgreSQL coordinator port inside the documentdb-local container.
+    private const int DefaultPostgresContainerPort = 9712;
     private const string DefaultHealthCheckDatabaseName = "admin";
 
     private const string UserEnvVarName = "USERNAME";
@@ -29,6 +31,7 @@ public static class DocumentDBBuilderExtensions
     private const string DataPathEnvVarName = "DATA_PATH";
     private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
     private const string CreateUserEnvVarName = "CREATE_USER";
+    private const string AllowExternalConnectionsEnvVarName = "ALLOW_EXTERNAL_CONNECTIONS";
 
     private const string DefaultMountedDataPath = "/data";
     private const string InitDataMountPath = "/init_doc_db.d";
@@ -194,6 +197,71 @@ public static class DocumentDBBuilderExtensions
         {
             endpoint.Port = port;
         });
+    }
+
+    /// <summary>
+    /// Exposes the PostgreSQL backend coordinator port of the DocumentDB Local container
+    /// (default container port <c>9712</c>) as a second endpoint on the resource.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The <c>documentdb-local</c> container bundles a MongoDB-compatible gateway and a
+    /// PostgreSQL coordinator listening on separate ports. By default this integration only
+    /// publishes the gateway port (<c>10260</c>) and surfaces a <c>mongodb://</c> connection
+    /// string. Calling <see cref="WithPostgresEndpoint"/> additionally publishes the
+    /// PostgreSQL port so consumers can use psql/Npgsql/etc. directly, and enables
+    /// <see cref="DocumentDBServerResource.PostgresConnectionStringExpression"/>.
+    /// </para>
+    /// <para>
+    /// The endpoint uses the same <c>userName</c>/<c>password</c> parameters as the gateway
+    /// because the container provisions a single admin user shared by both surfaces.
+    /// The default database in the resulting URI is <c>postgres</c>, matching the upstream
+    /// entrypoint, which connects with <c>-d postgres</c>.
+    /// </para>
+    /// </remarks>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="port">
+    /// The host port to bind to. If <see langword="null"/> a random port is assigned.
+    /// </param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <example>
+    /// <code>
+    /// var documentDB = builder.AddDocumentDB("documentdb")
+    ///                         .WithPostgresEndpoint();
+    ///
+    /// builder.AddProject&lt;Projects.Worker&gt;("worker")
+    ///        .WithEnvironment("ConnectionStrings__pg", documentDB.Resource.PostgresConnectionStringExpression);
+    /// </code>
+    /// </example>
+    public static IResourceBuilder<DocumentDBServerResource> WithPostgresEndpoint(
+        this IResourceBuilder<DocumentDBServerResource> builder,
+        int? port = null)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        if (builder.Resource.Annotations.OfType<EndpointAnnotation>()
+                .Any(e => e.Name == DocumentDBServerResource.PostgresEndpointName))
+        {
+            throw new InvalidOperationException(
+                $"A PostgreSQL endpoint has already been added to resource '{builder.Resource.Name}'. " +
+                $"Call '{nameof(WithPostgresEndpoint)}()' at most once per DocumentDB resource.");
+        }
+
+        return builder
+            .WithEndpoint(
+                port: port,
+                targetPort: DefaultPostgresContainerPort,
+                scheme: "postgresql",
+                name: DocumentDBServerResource.PostgresEndpointName)
+            .WithEnvironment(context =>
+            {
+                // Explicitly opt the upstream entrypoint into accepting external PostgreSQL
+                // connections (sets PGOPTIONS=-e -> listen_addresses='*' + permissive pg_hba.conf).
+                // Setting this is required so publishing the host port produces a reachable
+                // server even on upstream container builds where the entrypoint's default
+                // ALLOW_EXTERNAL_CONNECTIONS handling is corrected.
+                context.EnvironmentVariables[AllowExternalConnectionsEnvVarName] = "true";
+            });
     }
 
     /// <summary>

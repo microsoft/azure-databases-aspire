@@ -1,6 +1,8 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Linq;
+
 namespace Aspire.Hosting.ApplicationModel;
 
 /// <summary>
@@ -10,11 +12,14 @@ namespace Aspire.Hosting.ApplicationModel;
 public class DocumentDBServerResource(string name) : ContainerResource(name), IResourceWithConnectionString
 {
     internal const string PrimaryEndpointName = "tcp";
+    internal const string PostgresEndpointName = "postgres";
     private const string DefaultUserName = "admin";
     private const string DefaultAuthenticationDatabase = "admin";
     private const string DefaultAuthenticationMechanism = "SCRAM-SHA-256";
+    private const string DefaultPostgresDatabase = "postgres";
 
     private EndpointReference? _primaryEndpoint;
+    private EndpointReference? _postgresEndpoint;
 
     /// <summary>
     /// Initialize a resource that represents a DocumentDB container.
@@ -32,6 +37,18 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// Gets the primary endpoint for the DocumentDB server.
     /// </summary>
     public EndpointReference PrimaryEndpoint => _primaryEndpoint ??= new(this, PrimaryEndpointName);
+
+    /// <summary>
+    /// Gets the PostgreSQL backend endpoint for the DocumentDB server.
+    /// </summary>
+    /// <remarks>
+    /// This endpoint is only allocated when
+    /// <see cref="Aspire.Hosting.DocumentDBBuilderExtensions.WithPostgresEndpoint"/>
+    /// has been called on the resource builder. Accessing
+    /// <see cref="PostgresConnectionStringExpression"/> without first opting in
+    /// throws an <see cref="System.InvalidOperationException"/>.
+    /// </remarks>
+    public EndpointReference PostgresEndpoint => _postgresEndpoint ??= new(this, PostgresEndpointName);
 
     /// <summary>
     /// Gets the parameter that contains the DocumentDB server password.
@@ -78,6 +95,34 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// </summary>
     public ReferenceExpression ConnectionStringExpression => BuildConnectionString();
 
+    /// <summary>
+    /// Gets the PostgreSQL connection string for the DocumentDB server in the standard
+    /// <c>postgresql://user:password@host:port/postgres</c> URI form.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The PostgreSQL backend port (<c>9712</c>) must be exposed via
+    /// <see cref="Aspire.Hosting.DocumentDBBuilderExtensions.WithPostgresEndpoint"/>
+    /// before this property is accessed; otherwise an
+    /// <see cref="System.InvalidOperationException"/> is thrown.
+    /// </para>
+    /// <para>
+    /// The default database in the URI is <c>postgres</c>, matching the upstream
+    /// <c>documentdb-local</c> entrypoint, which connects with <c>-d postgres</c>.
+    /// Credentials come from the same <see cref="UserNameParameter"/> /
+    /// <see cref="PasswordParameter"/> used by the MongoDB gateway because the
+    /// container creates a single admin user shared by both surfaces.
+    /// </para>
+    /// <para>
+    /// No <c>sslmode</c> query parameter is added, because the bundled
+    /// PostgreSQL server is started with <c>ssl = off</c>; the
+    /// <see cref="TLS"/> field of this resource only controls the MongoDB
+    /// gateway. Consumers needing TLS on the PostgreSQL side should append
+    /// <c>?sslmode=...</c> themselves.
+    /// </para>
+    /// </remarks>
+    public ReferenceExpression PostgresConnectionStringExpression => BuildPostgresConnectionString();
+
     internal ReferenceExpression BuildConnectionString(string? databaseName = null)
     {
         var builder = new ReferenceExpressionBuilder();
@@ -119,6 +164,30 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
                 builder.Append($"&tlsInsecure=true");
             }
         }
+
+        return builder.Build();
+    }
+
+    internal ReferenceExpression BuildPostgresConnectionString()
+    {
+        if (!Annotations.OfType<EndpointAnnotation>().Any(e => e.Name == PostgresEndpointName))
+        {
+            throw new InvalidOperationException(
+                $"The PostgreSQL endpoint on resource '{Name}' has not been added. " +
+                $"Call '{nameof(Aspire.Hosting.DocumentDBBuilderExtensions.WithPostgresEndpoint)}()' on " +
+                $"the DocumentDB resource builder before accessing '{nameof(PostgresConnectionStringExpression)}'.");
+        }
+
+        var builder = new ReferenceExpressionBuilder();
+        builder.AppendLiteral("postgresql://");
+
+        if (PasswordParameter is not null)
+        {
+            builder.Append($"{UserNameReference}:{PasswordParameter}@");
+        }
+
+        builder.Append($"{PostgresEndpoint.Property(EndpointProperty.HostAndPort)}");
+        builder.AppendLiteral($"/{DefaultPostgresDatabase}");
 
         return builder.Build();
     }
