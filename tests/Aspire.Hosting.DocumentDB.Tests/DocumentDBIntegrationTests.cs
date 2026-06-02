@@ -12,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using Npgsql;
 using Xunit;
 using Xunit.Sdk;
 
@@ -173,6 +174,122 @@ public class DocumentDBIntegrationTests
 
         await collection.InsertOneAsync(document, cancellationToken: cts.Token);
         Assert.Equal(1, await collection.CountDocumentsAsync(filter, cancellationToken: cts.Token));
+    }
+
+    [Fact]
+    public async Task PostgresConnectionStringResolvesAndAuthenticatesAgainstContainer()
+    {
+        // Regression for issue #71: prior to v0.112-0, the documentdb-local entrypoint
+        // hard-coded the PostgreSQL admin role to docdb_admin/Admin100, so the
+        // postgresql:// connection string Aspire produces (which uses the gateway's
+        // USERNAME/PASSWORD) silently failed authentication. v0.112-0 makes the
+        // entrypoint honour USERNAME/PASSWORD on the PG admin role. This test pins
+        // the fix end-to-end: opening an Npgsql connection with the Aspire-resolved
+        // credentials must succeed, and current_user must report 'admin' (NOT the
+        // legacy docdb_admin).
+        //
+        // The AppHost (Aspire.Hosting.DocumentDB.PostgresEndToEndApp) pins the
+        // image to pg17-0.112.0 explicitly so the test does not depend on
+        // DocumentDBVersions.Latest being bumped to >= 0.112.0 (tracked by #70).
+        if (!RequiresDockerAttribute.IsSupported)
+        {
+            throw SkipException.ForSkip("Docker is required for DocumentDB end-to-end validation.");
+        }
+
+        using var cts = CreateEndToEndTimeoutSource();
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Aspire.Hosting.DocumentDB.PostgresEndToEndApp.Program>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+        await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var documentDB = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var connectionString = await documentDB.PostgresConnectionStringExpression.GetValueAsync(cts.Token);
+        Assert.False(string.IsNullOrWhiteSpace(connectionString));
+
+        // PostgreSQL backend may take a moment to come up after the MongoDB gateway
+        // is healthy; retry mirroring the Mongo ConnectAsync pattern above.
+        var (selectOneResult, currentUser) = await OpenPostgresAndRunSmokeTestsAsync(connectionString!, cts.Token);
+
+        Assert.Equal(1, selectOneResult);
+        Assert.Equal("admin", currentUser);
+    }
+
+    private static async Task<(int SelectOneResult, string CurrentUser)> OpenPostgresAndRunSmokeTestsAsync(
+        string postgresqlUri,
+        CancellationToken cancellationToken)
+    {
+        // Npgsql (verified against 9.0.5) does NOT parse postgresql:// URIs: both
+        // NpgsqlConnectionStringBuilder(uri) and new NpgsqlConnection(uri) throw
+        // ArgumentException at construct time. Convert the URI to key-value form.
+        var keyValueConnectionString = ConvertPostgresUriToKeyValue(postgresqlUri);
+
+        Exception? lastException = null;
+
+        for (var attempt = 0; attempt < 15; attempt++)
+        {
+            try
+            {
+                await using var conn = new NpgsqlConnection(keyValueConnectionString);
+                await conn.OpenAsync(cancellationToken);
+
+                await using var selectOne = new NpgsqlCommand("SELECT 1", conn);
+                var selectOneResult = Convert.ToInt32(await selectOne.ExecuteScalarAsync(cancellationToken));
+
+                await using var currentUser = new NpgsqlCommand("SELECT current_user", conn);
+                var currentUserResult = (string)(await currentUser.ExecuteScalarAsync(cancellationToken))!;
+
+                return (selectOneResult, currentUserResult);
+            }
+            catch (NpgsqlException ex)
+            {
+                lastException = ex;
+            }
+            catch (SocketException ex)
+            {
+                lastException = ex;
+            }
+            catch (TimeoutException ex)
+            {
+                lastException = ex;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        throw new InvalidOperationException(
+            "PostgreSQL did not become reachable / did not authenticate the Aspire-resolved credentials in time. " +
+            "If this fails with '28P01: password authentication failed', the documentdb-local image is older " +
+            "than v0.112-0, in which case WithPostgresEndpoint() should have blocked startup.",
+            lastException);
+    }
+
+    /// <summary>
+    /// Converts a <c>postgresql://user:password@host:port/database</c> URI (the form
+    /// emitted by <see cref="DocumentDBServerResource.PostgresConnectionStringExpression"/>)
+    /// into the key=value form that Npgsql 9.x requires.
+    /// </summary>
+    private static string ConvertPostgresUriToKeyValue(string postgresqlUri)
+    {
+        var uri = new Uri(postgresqlUri);
+        var userInfo = uri.UserInfo.Split(':', 2);
+        var user = Uri.UnescapeDataString(userInfo[0]);
+        var password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : string.Empty;
+        var database = uri.AbsolutePath.TrimStart('/');
+
+        return new NpgsqlConnectionStringBuilder
+        {
+            Host = uri.Host,
+            Port = uri.Port,
+            Username = user,
+            Password = password,
+            Database = string.IsNullOrEmpty(database) ? "postgres" : database,
+            Timeout = 5,
+            CommandTimeout = 5,
+        }.ConnectionString;
     }
 
     private static async Task<IMongoDatabase> ConnectAsync(string connectionString, string databaseName, CancellationToken cancellationToken)

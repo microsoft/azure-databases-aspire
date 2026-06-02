@@ -3,9 +3,11 @@
 
 using System.Net.Sockets;
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Eventing;
 using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Xunit;
 
@@ -1194,6 +1196,304 @@ public class AddDocumentDBTests
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         Assert.False(env.ContainsKey("ALLOW_EXTERNAL_CONNECTIONS"));
+    }
+
+    // ---------------------------------------------------------------------
+    // WithPostgresEndpoint() v0.112.0 floor guard (issue #71)
+    //
+    // The guard is implemented via a BeforeResourceStartedEvent subscription
+    // so that callers chaining WithImageTag(...) AFTER WithPostgresEndpoint()
+    // still get validated against the final effective tag. These tests publish
+    // BeforeResourceStartedEvent synthetically so they stay pure unit tests
+    // (no Docker, no real app StartAsync).
+    // ---------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("pg17-0.112.0")]
+    [InlineData("pg17-0.113.0")]
+    [InlineData("pg17-1.0.0")]
+    [InlineData("pg15-0.112.0")]
+    [InlineData("pg16-0.200.0")]
+    public async Task WithPostgresEndpointAllowsV0_112_0AndAbove(string tag)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(tag)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointWithImageTagV0_111_0Throws()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.111.0")
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("DocumentDB", ex.Message);
+        Assert.Contains("pg17-0.111.0", ex.Message);
+        Assert.Contains("0.112.0", ex.Message);
+        Assert.Contains("WithPostgresEndpoint", ex.Message);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointWithDocumentDBVersionV0_111_0Throws()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("pg17-0.111.0", ex.Message);
+        Assert.Contains("0.112.0", ex.Message);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointWithUnknownTagPatternLogsWarningOnceAndAllows()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("nightly")
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        // Publish the event TWICE to prove the warning is one-shot.
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("nightly", warnings[0].Message);
+        Assert.Contains("pg{NN}-X.Y.Z", warnings[0].Message);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardHonoursLastCallWins()
+    {
+        // WithImageTag chained AFTER WithPostgresEndpoint must still be detected,
+        // because the guard reads the effective ContainerImageAnnotation at event time,
+        // not at WithPostgresEndpoint() call time.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint()
+            .WithImageTag("pg17-0.111.0");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("pg17-0.111.0", ex.Message);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardSkippedForCustomImage()
+    {
+        // A fork using a non-curated image name is exempt with a warning.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("forks/my-build", "pg17-0.110.0")
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        // Must NOT throw, even though the tag is < v0.112.0.
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("custom image", warnings[0].Message);
+        Assert.Contains("forks/my-build", warnings[0].Message);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardSkippedForCustomImageWithCustomRegistry()
+    {
+        // Confirm that ContainerImageAnnotation.Registry does NOT factor into the
+        // image-name carve-out: the curated image hosted on a private registry is
+        // still subject to the guard, while a custom image is exempt regardless of
+        // registry.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("forks/my-build", "pg17-0.110.0")
+            .WithImageRegistry("registry.example.com")
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        // Must NOT throw.
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardEnforcedWhenOnlyRegistryOverridden()
+    {
+        // Mirror image: a private mirror of the curated documentdb-local image MUST
+        // still be guarded - only the image NAME exempts, not the registry.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageRegistry("registry.example.com")
+            .WithImageTag("pg17-0.111.0")
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointDefaultTagThrowsUntilLatestReachesV0_112_0()
+    {
+        // Documents the intentional behavior described in issue #71's docs callout:
+        // when DocumentDBVersions.Latest is < 0.112.0, AddDocumentDB().WithPostgresEndpoint()
+        // (no explicit tag override) will throw at startup. This is the whole point of
+        // the issue - converting a silent auth failure into a loud one. Once issue #70
+        // bumps Latest to >= 0.112.0, this test's branch becomes the "no-throw" path.
+        var latestParsed = Version.Parse(DocumentDBVersions.Latest);
+        var floor = DocumentDBContainerImageTags.MinimumPostgresEndpointVersion;
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint(); // intentionally no WithImageTag
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        if (latestParsed < floor)
+        {
+            // Current branch: Latest is 0.111.0, guard throws.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => PublishBeforeResourceStartedAsync(app, resource));
+            Assert.Contains($"pg17-{DocumentDBVersions.Latest}", ex.Message);
+        }
+        else
+        {
+            // After #70 lands: Latest is >= 0.112.0, default flow succeeds.
+            await PublishBeforeResourceStartedAsync(app, resource);
+        }
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardDoesNotFireDuringManifestGeneration()
+    {
+        // Manifest generation goes through Aspire's publish pipeline, which does NOT
+        // publish BeforeResourceStartedEvent (no container is started). The guard must
+        // not interfere with `azd publish` / `--publisher manifest` flows, even when
+        // pinning a pre-v0.112 tag.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.111.0")
+            .WithPostgresEndpoint();
+
+        // Generating the manifest must not throw.
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.NotNull(manifest);
+        var bindings = manifest["bindings"];
+        Assert.NotNull(bindings);
+        Assert.NotNull(bindings!["postgres"]);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardReadsLastWithImageTagCall()
+    {
+        // Multiple WithImageTag calls: the LAST one wins (Aspire mutates the single
+        // ContainerImageAnnotation in place). The guard must observe the final value,
+        // not an intermediate one.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresEndpoint()
+            .WithImageTag("pg17-0.111.0")  // would throw...
+            .WithImageTag("pg17-0.112.0"); // ...but this overrides.
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        // Must NOT throw - the final tag is >= floor.
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)
+    {
+        var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
+        // useEmptyServices=true forces the guard's logger-resolution fallback path
+        // (ILoggerFactory) instead of ResourceLoggerService. This lets tests
+        // capture the warning text via a CapturingLoggerProvider registered on the
+        // app's service collection, without needing to inspect ResourceLoggerService's
+        // internal per-resource log buffer.
+        var services = useEmptyServices
+            ? new ServiceCollection().AddSingleton(app.Services.GetRequiredService<ILoggerFactory>()).BuildServiceProvider()
+            : app.Services;
+        var evt = new BeforeResourceStartedEvent(resource, services);
+        return eventing.PublishAsync(evt, EventDispatchBehavior.BlockingSequential, CancellationToken.None);
+    }
+
+    private sealed class CapturingLoggerSink
+    {
+        public List<(LogLevel Level, string Category, string Message)> LogEntries { get; } = new();
+    }
+
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        private readonly CapturingLoggerSink _sink;
+        public CapturingLoggerProvider(CapturingLoggerSink sink) => _sink = sink;
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(_sink, categoryName);
+        public void Dispose() { }
+
+        private sealed class CapturingLogger : ILogger
+        {
+            private readonly CapturingLoggerSink _sink;
+            private readonly string _category;
+            public CapturingLogger(CapturingLoggerSink sink, string category)
+            {
+                _sink = sink;
+                _category = category;
+            }
+
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                _sink.LogEntries.Add((logLevel, _category, formatter(state, exception)));
+            }
+        }
     }
 
     [Fact]
