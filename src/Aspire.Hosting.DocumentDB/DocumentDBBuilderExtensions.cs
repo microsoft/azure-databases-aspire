@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Globalization;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.DocumentDB;
 using Microsoft.Extensions.DependencyInjection;
@@ -28,6 +29,12 @@ public static class DocumentDBBuilderExtensions
     private const string CertPathEnvVarName = "CERT_PATH";
     private const string KeyFileEnvVarName = "KEY_FILE";
     private const string EnableTelemetryEnvVarName = "ENABLE_TELEMETRY";
+    private const string OtelMetricsEnabledEnvVarName = "OTEL_METRICS_ENABLED";
+    private const string OtelExporterOtlpMetricsEndpointEnvVarName = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT";
+    private const string OtelExporterOtlpMetricsTimeoutEnvVarName = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT";
+    private const string OtelMetricExportIntervalEnvVarName = "OTEL_METRIC_EXPORT_INTERVAL";
+    private const string OtelServiceNameEnvVarName = "OTEL_SERVICE_NAME";
+    private const string OtelServiceVersionEnvVarName = "OTEL_SERVICE_VERSION";
     private const string OwnerEnvVarName = "OWNER";
     private const string DataPathEnvVarName = "DATA_PATH";
     private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
@@ -593,11 +600,26 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
-    /// Enables or disables DocumentDB Local telemetry.
+    /// Enables or disables DocumentDB Local telemetry by setting the <c>ENABLE_TELEMETRY</c>
+    /// environment variable.
     /// </summary>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="enabled">Whether telemetry should be enabled.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <remarks>
+    /// The <c>ENABLE_TELEMETRY</c> environment variable is not consumed by the DocumentDB gateway
+    /// in container image v0.112-0 or later. On those images this method has no observable effect
+    /// on the running container. Use <see cref="WithOpenTelemetryMetrics(IResourceBuilder{DocumentDBServerResource}, string?, bool, TimeSpan?, TimeSpan?, string?, string?)"/>
+    /// to configure OTLP metrics export.
+    /// </remarks>
+    [Obsolete(
+        "ENABLE_TELEMETRY is not consumed by the DocumentDB gateway in container image v0.112-0 " +
+        "or later, so this method has no observable effect on those images. Use " +
+        "WithOpenTelemetryMetrics(...) for OTLP metrics. This member is kept for binary " +
+        "compatibility and may be removed in a future release.",
+        error: false,
+        DiagnosticId = "ASPIREDOCDB0001",
+        UrlFormat = "https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#withtelemetry-obsolete")]
     public static IResourceBuilder<DocumentDBServerResource> WithTelemetry(this IResourceBuilder<DocumentDBServerResource> builder, bool enabled = true)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -605,6 +627,158 @@ public static class DocumentDBBuilderExtensions
         return builder.WithEnvironment(context =>
         {
             context.EnvironmentVariables[EnableTelemetryEnvVarName] = enabled ? "true" : "false";
+        });
+    }
+
+    /// <summary>
+    /// Enables OpenTelemetry metrics export from the DocumentDB gateway via OTLP/gRPC.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Requires container image v0.112-0 or later. Only metrics are exported today;
+    /// traces and logs are not yet supported by the gateway.
+    /// </para>
+    /// <para>
+    /// The container default for <c>OTEL_METRICS_ENABLED</c> is <c>false</c>; calling this method
+    /// flips it to <c>true</c> unless <paramref name="enabled"/> is explicitly set to <c>false</c>.
+    /// </para>
+    /// <para>
+    /// Merge semantics across multiple calls on the same builder:
+    /// <list type="bullet">
+    ///   <item>
+    ///     <paramref name="enabled"/> is non-nullable and is therefore written on every call.
+    ///     The last call's value wins (defaulting to <c>true</c> when omitted), even if a
+    ///     previous call set it to <c>false</c>.
+    ///   </item>
+    ///   <item>
+    ///     All other parameters are nullable; later calls override only the environment variables
+    ///     they explicitly set, and values from earlier calls are preserved for parameters left
+    ///     at <see langword="null"/>.
+    ///   </item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// When <paramref name="endpoint"/> is omitted, the gateway falls back to the standard OTLP/gRPC
+    /// default (<c>http://localhost:4317</c>). In an Aspire container scenario, that fallback is
+    /// rarely reachable, so an explicit endpoint pointing to your collector is recommended.
+    /// </para>
+    /// <para>
+    /// <paramref name="exportInterval"/> and <paramref name="timeout"/> are written as integer
+    /// milliseconds via <see cref="CultureInfo.InvariantCulture"/>. Values smaller than one
+    /// millisecond (sub-ms ticks) truncate to <c>0</c>; callers should pass whole-millisecond or
+    /// larger granularities.
+    /// </para>
+    /// </remarks>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <param name="endpoint">
+    /// OTLP/gRPC endpoint of the collector that should receive metrics. When provided, sets
+    /// <c>OTEL_EXPORTER_OTLP_METRICS_ENDPOINT</c> (which takes precedence over the generic
+    /// <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> per the OpenTelemetry specification). Defaults to
+    /// <see langword="null"/> (leave the environment variable unset; gateway falls back to its
+    /// own default).
+    /// </param>
+    /// <param name="enabled">
+    /// Whether metrics export is enabled. Sets <c>OTEL_METRICS_ENABLED</c>. Defaults to
+    /// <see langword="true"/>: opting into this method clearly indicates the caller wants metrics on.
+    /// </param>
+    /// <param name="exportInterval">
+    /// How often the gateway flushes accumulated metrics to the collector. When provided, sets
+    /// <c>OTEL_METRIC_EXPORT_INTERVAL</c> (milliseconds, integer). Must be non-negative.
+    /// </param>
+    /// <param name="timeout">
+    /// Per-export request timeout. When provided, sets <c>OTEL_EXPORTER_OTLP_METRICS_TIMEOUT</c>
+    /// (milliseconds, integer). Must be non-negative.
+    /// </param>
+    /// <param name="serviceName">
+    /// Logical service name attached to the metrics. When provided, sets <c>OTEL_SERVICE_NAME</c>.
+    /// </param>
+    /// <param name="serviceVersion">
+    /// Logical service version attached to the metrics. When provided, sets
+    /// <c>OTEL_SERVICE_VERSION</c>.
+    /// </param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="builder"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="endpoint"/>, <paramref name="serviceName"/>, or <paramref name="serviceVersion"/>
+    /// is provided but is empty or whitespace.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="exportInterval"/> or <paramref name="timeout"/> is negative.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// var server = builder.AddDocumentDB("documentdb")
+    ///                     .WithOpenTelemetryMetrics(
+    ///                         endpoint: "http://otel-collector:4317",
+    ///                         exportInterval: TimeSpan.FromSeconds(30));
+    /// </code>
+    /// </example>
+    public static IResourceBuilder<DocumentDBServerResource> WithOpenTelemetryMetrics(
+        this IResourceBuilder<DocumentDBServerResource> builder,
+        string? endpoint = null,
+        bool enabled = true,
+        TimeSpan? exportInterval = null,
+        TimeSpan? timeout = null,
+        string? serviceName = null,
+        string? serviceVersion = null)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        if (endpoint is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(endpoint);
+        }
+
+        if (serviceName is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(serviceName);
+        }
+
+        if (serviceVersion is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(serviceVersion);
+        }
+
+        if (exportInterval is { } ei)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(ei, TimeSpan.Zero, nameof(exportInterval));
+        }
+
+        if (timeout is { } to)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(to, TimeSpan.Zero, nameof(timeout));
+        }
+
+        return builder.WithEnvironment(context =>
+        {
+            context.EnvironmentVariables[OtelMetricsEnabledEnvVarName] = enabled ? "true" : "false";
+
+            if (endpoint is not null)
+            {
+                context.EnvironmentVariables[OtelExporterOtlpMetricsEndpointEnvVarName] = endpoint;
+            }
+
+            if (exportInterval is { } interval)
+            {
+                context.EnvironmentVariables[OtelMetricExportIntervalEnvVarName] =
+                    ((long)interval.TotalMilliseconds).ToString(CultureInfo.InvariantCulture);
+            }
+
+            if (timeout is { } timeoutValue)
+            {
+                context.EnvironmentVariables[OtelExporterOtlpMetricsTimeoutEnvVarName] =
+                    ((long)timeoutValue.TotalMilliseconds).ToString(CultureInfo.InvariantCulture);
+            }
+
+            if (serviceName is not null)
+            {
+                context.EnvironmentVariables[OtelServiceNameEnvVarName] = serviceName;
+            }
+
+            if (serviceVersion is not null)
+            {
+                context.EnvironmentVariables[OtelServiceVersionEnvVarName] = serviceVersion;
+            }
         });
     }
 

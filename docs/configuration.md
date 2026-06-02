@@ -183,19 +183,76 @@ var server = builder.AddDocumentDB("documentdb")
 
 The certificate and key are bind-mounted at distinct container paths (`/documentdb-cert-<filename>` and `/documentdb-key-<filename>`), so they can be supplied even when the host file names are identical. The corresponding `CERT_PATH` and `KEY_FILE` environment variables are set automatically.
 
-## WithTelemetry
+## WithTelemetry (obsolete)
 
-Enables or disables container telemetry by setting the `ENABLE_TELEMETRY` environment variable.
+> **Deprecated since this release.** The `ENABLE_TELEMETRY` environment variable is no longer
+> consumed by the DocumentDB gateway in container image v0.112-0 or later. This method continues
+> to set the variable for binary compatibility but has no observable effect on the running
+> container on those images. Calling it produces compiler diagnostic `ASPIREDOCDB0001`. Use
+> [`WithOpenTelemetryMetrics`](#withopentelemetrymetrics) to configure OTLP metrics export
+> instead. The method may be removed in a future release.
+
+Sets the `ENABLE_TELEMETRY` environment variable. Retained for binary compatibility only.
 
 ```csharp
-// Disable telemetry
+// Disable telemetry (no-op against gateway v0.112-0+; retained for binary compatibility).
 var server = builder.AddDocumentDB("documentdb")
                     .WithTelemetry(enabled: false);
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | `bool` | `true` | Whether telemetry should be enabled. |
+| `enabled` | `bool` | `true` | Value written to `ENABLE_TELEMETRY`. Not consumed by the gateway in v0.112-0 or later. |
+
+
+## WithOpenTelemetryMetrics
+
+Enables OpenTelemetry metrics export from the DocumentDB gateway via OTLP/gRPC. Requires
+container image v0.112-0 or later. Only metrics are exported today; traces and logs are not yet
+supported by the gateway.
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithOpenTelemetryMetrics(
+                        endpoint: "http://otel-collector:4317",
+                        exportInterval: TimeSpan.FromSeconds(30),
+                        serviceName: "documentdb-local",
+                        serviceVersion: "0.112.0");
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `endpoint` | `string?` | `null` | OTLP/gRPC endpoint of the collector to receive metrics. When provided, sets `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, which takes precedence over the generic `OTEL_EXPORTER_OTLP_ENDPOINT` per the OpenTelemetry specification. Must be non-empty when provided. |
+| `enabled` | `bool` | `true` | Whether metrics export is enabled. Sets `OTEL_METRICS_ENABLED`. The container default is `false`; calling this method flips it on unless `enabled: false` is passed. |
+| `exportInterval` | `TimeSpan?` | `null` | How often the gateway flushes metrics. When provided, sets `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds, integer, invariant culture). Must be non-negative. |
+| `timeout` | `TimeSpan?` | `null` | Per-export request timeout. When provided, sets `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` (milliseconds, integer, invariant culture). Must be non-negative. |
+| `serviceName` | `string?` | `null` | Logical service name attached to the metrics. When provided, sets `OTEL_SERVICE_NAME`. Must be non-empty when provided. |
+| `serviceVersion` | `string?` | `null` | Logical service version attached to the metrics. When provided, sets `OTEL_SERVICE_VERSION`. Must be non-empty when provided. |
+
+When `endpoint` is omitted, the gateway falls back to the standard OTLP/gRPC default
+(`http://localhost:4317`). In typical Aspire container scenarios that fallback is unreachable,
+so an explicit endpoint pointing to your collector (for example, the Aspire dashboard or an
+OpenTelemetry Collector container) is recommended.
+
+Merge semantics across multiple calls on the same builder:
+
+- `enabled` is non-nullable and is therefore written on every call. The last call's value wins
+  (defaulting to `true` when omitted), even if a previous call set it to `false`. To preserve a
+  `false` setting through subsequent calls, pass `enabled: false` explicitly each time.
+- All other parameters are nullable; later calls override only the environment variables they
+  explicitly set, and values from earlier calls are preserved for parameters left at `null`.
+
+`WithOpenTelemetryMetrics` and the obsolete `WithTelemetry` set disjoint environment variables
+and do not interact.
+
+`exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
+Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
+larger granularities.
+
+The gateway also reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TIMEOUT` when the
+signal-specific variants above are unset, plus `OTEL_RESOURCE_ATTRIBUTES`. These are not exposed
+by the typed API — set them via `WithEnvironment(...)` if you need them. Note that
+`OTEL_RESOURCE_ATTRIBUTES` is parsed by the gateway but not yet wired into startup as of v0.112-0.
 
 
 ## WithOwner
@@ -424,7 +481,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.111.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.112.0`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
@@ -452,7 +509,15 @@ The extension passes these environment variables to the DocumentDB container:
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `CERT_PATH` | Container path of the mounted certificate file | Set by `WithTlsCertificate(...)` |
 | `KEY_FILE` | Container path of the mounted key file | Set by `WithTlsCertificate(...)` |
-| `ENABLE_TELEMETRY` | `true` or `false` | Set by `WithTelemetry(...)` |
+| `ENABLE_TELEMETRY` | `true` or `false` | Set by `WithTelemetry(...)` — **deprecated**, no longer consumed by the gateway in v0.112-0+ |
+| `OTEL_METRICS_ENABLED` | `true` or `false` | Set by `WithOpenTelemetryMetrics(...)` |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | OTLP/gRPC collector endpoint | Set by `WithOpenTelemetryMetrics(endpoint: ...)` |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Milliseconds (integer) | Set by `WithOpenTelemetryMetrics(exportInterval: ...)` |
+| `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Milliseconds (integer) | Set by `WithOpenTelemetryMetrics(timeout: ...)` |
+| `OTEL_SERVICE_NAME` | Service name string | Set by `WithOpenTelemetryMetrics(serviceName: ...)` |
+| `OTEL_SERVICE_VERSION` | Service version string | Set by `WithOpenTelemetryMetrics(serviceVersion: ...)` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC endpoint | Read by gateway as fallback when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is unset; not set by the typed API |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | Milliseconds (integer) | Read by gateway as fallback when `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` is unset; not set by the typed API |
 | `OWNER` | The configured owner string | Set by `WithOwner(...)` |
 | `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()` |
 | `CREATE_USER` | `false` | Set by `WithoutUserCreation()` |
