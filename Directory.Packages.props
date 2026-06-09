@@ -18,7 +18,23 @@
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
   </ItemGroup>
 
-  <!-- Pin transitive dependencies to resolve known vulnerabilities -->
+  <!--
+    Transitive dependencies pulled in through the MongoDB.Driver chain, pinned to
+    non-vulnerable, restore-compatible versions. Keep these until the advisories
+    below no longer apply to the resolved graph.
+
+    SharpCompress 1.0.0:
+      * Minimum floor mandated by Aspire.MongoDB.Driver 13.4.2 (its nuspec requires
+        SharpCompress >= 1.0.0), so a lower pin fails restore with NU1109. This is the
+        lowest version that satisfies both upstream and the advisory below; it is
+        intentionally not a 0.4x pin.
+      * Clears GHSA-6c8g-7p36-r338 (zip-slip directory traversal, medium; affects
+        <= 0.47.4). Without this pin, MongoDB.Driver 3.8.1 alone would floor
+        SharpCompress at 0.30.1 (vulnerable).
+    Snappier 1.3.1:
+      * Clears GHSA-pggp-6c3x-2xmx (decompression infinite-loop DoS, high; affects
+        <= 1.3.0).
+  -->
   <ItemGroup Label="Transitive pins">
     <PackageVersion Include="SharpCompress" Version="1.0.0" />
     <PackageVersion Include="Snappier" Version="1.3.1" />
