@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- `DocumentDBVersion.V0_113_0` curated enum member and `DocumentDBVersions.V0_113_0 = "0.113.0"` constant. `DocumentDBVersions.Latest` and the default container tag (`pg17-0.113.0`) now follow this entry.
+
+### Changed
+- Default `documentdb-local` container image updated to `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.113.0`. Upstream DocumentDB `0.113.0` is a performance and indexing release (sort-into-accumulator GUC for `$sortGroup`, collation for non-unique ordered indexes with `$in`/`$nin`, dead-index-entry pruning for ordered TTL indexes, and index-only scans for composite-covered `$group` accumulators); no new package APIs are required.
+
 ## [0.112.0] - 2026-06-02
 
 ### Highlights
@@ -33,7 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 <!-- auto-generated:documentdb-versions-start -->
 ### Added (auto-detected upstream DocumentDB versions)
 
-- DocumentDB `0.112.0` upstream release detected on 2026-06-02 (container tags `pg15-0.112.0`, `pg16-0.112.0`, `pg17-0.112.0`).
+- DocumentDB `0.113.0` upstream release detected on 2026-06-23 (container tags `pg15-0.113.0`, `pg16-0.113.0`, `pg17-0.113.0`).
 <!-- auto-generated:documentdb-versions-end -->
 
 ## [0.110.0] - 2026-05-12
