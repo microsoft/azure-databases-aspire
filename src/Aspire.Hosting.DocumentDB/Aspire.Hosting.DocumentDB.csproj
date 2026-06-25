@@ -9,7 +9,7 @@
 
   <!-- NuGet package metadata -->
   <PropertyGroup>
-    <Description>DocumentDB support for .NET Aspire. Provides extension methods and resource definitions for a .NET Aspire AppHost to configure a DocumentDB resource.</Description>
+    <Description>DocumentDB support for Aspire. Provides extension methods and resource definitions for an Aspire AppHost to configure a DocumentDB resource.</Description>
     <Authors>Microsoft</Authors>
     <Copyright>Copyright (c) Microsoft 2025</Copyright>
     <PackageTags>aspire integration hosting documentdb mongodb cosmosdb azure database</PackageTags>
