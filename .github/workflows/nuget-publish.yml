@@ -19,7 +19,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
 
@@ -36,7 +36,7 @@ jobs:
         run: dotnet pack src/Aspire.Hosting.DocumentDB/Aspire.Hosting.DocumentDB.csproj -c Release --no-build -o ./artifacts
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nuget-package
           path: ./artifacts/*.nupkg
