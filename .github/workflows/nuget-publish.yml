@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -44,3 +44,45 @@ jobs:
       - name: Push to NuGet
         if: startsWith(github.ref, 'refs/tags/v')
         run: dotnet nuget push ./artifacts/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_API_KEY }} --skip-duplicate
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag.removeprefix("v")
+          lines = Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+
+          start = None
+          heading = re.compile(rf"^## \[{re.escape(version)}\](?: - .*)?$")
+          next_heading = re.compile(r"^## \[")
+          for index, line in enumerate(lines):
+              if heading.match(line):
+                  start = index + 1
+                  break
+
+          notes = []
+          if start is not None:
+              for line in lines[start:]:
+                  if next_heading.match(line):
+                      break
+                  notes.append(line)
+
+          notes_text = "\n".join(notes).strip()
+          if not notes_text:
+              notes_text = f"Release {tag}."
+
+          Path("release-notes.md").write_text(notes_text + "\n", encoding="utf-8")
+          PY
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+          fi
