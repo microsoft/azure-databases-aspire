@@ -1,13 +1,13 @@
 # Getting started
 
-This guide walks you through adding [DocumentDB](https://github.com/documentdb/documentdb) to a .NET Aspire application. By the end, you will have a running Aspire app with a DocumentDB container that your services can connect to using the MongoDB driver.
+This guide walks you through adding [DocumentDB](https://github.com/documentdb/documentdb) to an Aspire application. By the end, you will have a running Aspire app with a DocumentDB container that your services can connect to using the MongoDB driver.
 
 ## Prerequisites
 
 | Requirement | Details |
 |---|---|
 | .NET 10 SDK or later | [Download](https://dotnet.microsoft.com/download) |
-| .NET Aspire workload | `dotnet workload install aspire` |
+| Aspire workload | `dotnet workload install aspire` |
 | Docker | DocumentDB runs as a Linux container. [Docker Desktop](https://www.docker.com/products/docker-desktop/) or any Docker-compatible runtime works. |
 | IDE (optional) | Visual Studio 2022 17.9+, VS Code with C# Dev Kit, or JetBrains Rider |
 

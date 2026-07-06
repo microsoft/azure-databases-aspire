@@ -1,6 +1,6 @@
 # Aspire.Hosting.DocumentDB
 
-[DocumentDB](https://github.com/documentdb/documentdb) is an open-source, MongoDB-compatible document database built on PostgreSQL. This package provides .NET Aspire hosting integration to configure and run a DocumentDB container as part of your distributed application.
+[DocumentDB](https://github.com/documentdb/documentdb) is an open-source, MongoDB-compatible document database built on PostgreSQL. This package provides Aspire hosting integration to configure and run a DocumentDB container as part of your distributed application.
 
 ## Getting started
 
@@ -142,4 +142,4 @@ builder.AddDocumentDB("documentdb")
 - [Changelog](https://github.com/microsoft/azure-databases-aspire/blob/main/CHANGELOG.md) — release history
 - [License](https://github.com/microsoft/azure-databases-aspire/blob/main/LICENSE) — package license
 - [DocumentDB project](https://github.com/documentdb/documentdb) — the database itself
-- [.NET Aspire documentation](https://learn.microsoft.com/en-us/dotnet/aspire/) — Aspire framework docs
+- [Aspire documentation](https://learn.microsoft.com/en-us/dotnet/aspire/) — Aspire framework docs
