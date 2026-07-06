@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.113.0] - 2026-07-06
+
 ### Added
 - `DocumentDBVersion.V0_113_0` curated enum member and `DocumentDBVersions.V0_113_0 = "0.113.0"` constant. `DocumentDBVersions.Latest` and the default container tag (`pg17-0.113.0`) now follow this entry.
 
@@ -122,6 +124,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - SCRAM-SHA-256 authentication support
 - Container image: `ghcr.io/documentdb/documentdb/documentdb-local`
 
+[Unreleased]: https://github.com/microsoft/azure-databases-aspire/compare/v0.113.0...HEAD
+[0.113.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.112.0...v0.113.0
+[0.112.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.111.0...v0.112.0
+[0.111.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.110.0...v0.111.0
 [0.110.0]: https://github.com/microsoft/azure-databases-aspire/releases/tag/v0.110.0
 [0.109.2]: https://github.com/microsoft/azure-databases-aspire/releases/tag/v0.109.2
 [0.109.0]: https://github.com/microsoft/azure-databases-aspire/releases/tag/v0.109.0
