@@ -3,7 +3,7 @@
 [![NuGet](https://img.shields.io/nuget/v/Aspire.Hosting.DocumentDB.svg)](https://www.nuget.org/packages/Aspire.Hosting.DocumentDB)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A [Aspire](https://learn.microsoft.com/en-us/dotnet/aspire/fundamentals/integrations-overview) hosting integration for [DocumentDB](https://github.com/documentdb/documentdb), the open-source MongoDB-compatible document database built on PostgreSQL.
+An [Aspire](https://learn.microsoft.com/en-us/dotnet/aspire/fundamentals/integrations-overview) hosting integration for [DocumentDB](https://github.com/documentdb/documentdb), the open-source MongoDB-compatible document database built on PostgreSQL.
 
 This package lets you add a DocumentDB container to your Aspire AppHost with a single line of code. Connection strings, credentials, TLS, and container lifecycle are managed automatically.
 
