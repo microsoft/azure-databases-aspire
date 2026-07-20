@@ -49,6 +49,7 @@ public class DocumentDBVersionSelectionTests
     [InlineData(DocumentDBPostgresVersion.Pg15, "pg15-")]
     [InlineData(DocumentDBPostgresVersion.Pg16, "pg16-")]
     [InlineData(DocumentDBPostgresVersion.Pg17, "pg17-")]
+    [InlineData(DocumentDBPostgresVersion.Pg18, "pg18-")]
     public void WithPostgresVersionAloneSetsExpectedPrefixWithLatest(DocumentDBPostgresVersion pg, string expectedPrefix)
     {
         var appBuilder = DistributedApplication.CreateBuilder();

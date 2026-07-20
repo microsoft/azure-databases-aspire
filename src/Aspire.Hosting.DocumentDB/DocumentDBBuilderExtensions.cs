@@ -944,8 +944,9 @@ public static class DocumentDBBuilderExtensions
                 pgVersion,
                 $"Unsupported PostgreSQL backend variant '{pgVersion}'. " +
                 $"Use one of {nameof(DocumentDBPostgresVersion.Pg15)}, " +
-                $"{nameof(DocumentDBPostgresVersion.Pg16)}, or " +
-                $"{nameof(DocumentDBPostgresVersion.Pg17)}, or fall back to a free-form " +
+                $"{nameof(DocumentDBPostgresVersion.Pg16)}, " +
+                $"{nameof(DocumentDBPostgresVersion.Pg17)}, or " +
+                $"{nameof(DocumentDBPostgresVersion.Pg18)}, or fall back to a free-form " +
                 $"WithImageTag(...) for unsupported variants.");
         }
 
