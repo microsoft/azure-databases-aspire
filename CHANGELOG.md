@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.114.0] - 2026-07-20
+
+### Added
+- `DocumentDBVersion.V0_114_0` curated enum member and `DocumentDBVersions.V0_114_0 = "0.114.0"` constant. `DocumentDBVersions.Latest` and the default container tag (`pg17-0.114.0`) now follow this entry.
+- `DocumentDBPostgresVersion.Pg18` enum member, enabling `WithPostgresVersion(DocumentDBPostgresVersion.Pg18)` to target the new `pg18-` container variant that upstream publishes starting with DocumentDB `0.114.0`.
+
+### Changed
+- Default `documentdb-local` container image updated to `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.114.0`. Upstream DocumentDB `0.114.0` enables schema validation by default and non-blocking unique index builds, and adds gateway operational features (environment-variable configuration overlay, a `documentdb-gateway check` subcommand, and PostgreSQL peer-auth hardening) that apply to standalone/systemd gateway installs rather than the combined `documentdb-local` entrypoint the Aspire integration uses. No new package APIs are required beyond the version and PG-variant additions above.
+
 ## [0.113.0] - 2026-07-06
 
 ### Added
@@ -41,7 +50,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 <!-- auto-generated:documentdb-versions-start -->
 ### Added (auto-detected upstream DocumentDB versions)
 
-- DocumentDB `0.113.0` upstream release detected on 2026-06-23 (container tags `pg15-0.113.0`, `pg16-0.113.0`, `pg17-0.113.0`).
+- DocumentDB `0.114.0` upstream release detected on 2026-07-20 (container tags `pg15-0.114.0`, `pg16-0.114.0`, `pg17-0.114.0`).
 <!-- auto-generated:documentdb-versions-end -->
 
 ## [0.110.0] - 2026-05-12
@@ -124,7 +133,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - SCRAM-SHA-256 authentication support
 - Container image: `ghcr.io/documentdb/documentdb/documentdb-local`
 
-[Unreleased]: https://github.com/microsoft/azure-databases-aspire/compare/v0.113.0...HEAD
+[Unreleased]: https://github.com/microsoft/azure-databases-aspire/compare/v0.114.0...HEAD
+[0.114.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.113.0...v0.114.0
 [0.113.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.112.0...v0.113.0
 [0.112.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.111.0...v0.112.0
 [0.111.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.110.0...v0.111.0
