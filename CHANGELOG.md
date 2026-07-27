@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+<!-- auto-generated:documentdb-versions-start -->
+### Added (auto-detected upstream DocumentDB versions)
+
+- DocumentDB `0.114.0` upstream release detected on 2026-07-20 (container tags `pg15-0.114.0`, `pg16-0.114.0`, `pg17-0.114.0`, `pg18-0.114.0`).
+<!-- auto-generated:documentdb-versions-end -->
+
 ## [0.114.0] - 2026-07-20
 
 ### Added
@@ -46,12 +52,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Fixed
 - Default data volume path changed from `/home/documentdb/postgresql/data` to `/data` to match the DocumentDB Local container default ([documentdb/documentdb#556](https://github.com/documentdb/documentdb/issues/556))
 - `WithPostgresEndpoint()` now validates the effective container image tag at startup (via `BeforeResourceStartedEvent`) and throws `InvalidOperationException` if the tag is older than `pg{NN}-0.112.0`, preventing the previously silent PostgreSQL authentication failure caused by the legacy `docdb_admin`/`Admin100` admin role in pre-v0.112-0 `documentdb-local` images. Custom images and unknown tag patterns are exempt with a warning. ([#71](https://github.com/microsoft/azure-databases-aspire/issues/71))
-
-<!-- auto-generated:documentdb-versions-start -->
-### Added (auto-detected upstream DocumentDB versions)
-
-- DocumentDB `0.114.0` upstream release detected on 2026-07-20 (container tags `pg15-0.114.0`, `pg16-0.114.0`, `pg17-0.114.0`, `pg18-0.114.0`).
-<!-- auto-generated:documentdb-versions-end -->
 
 ## [0.110.0] - 2026-05-12
 
