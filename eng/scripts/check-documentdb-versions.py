@@ -14,9 +14,12 @@ What this script does:
        DEFERRED_PG_SET (i.e. variants the package does not know about at all).
   3. Computes the intersection of (GH releases) and (GHCR tags), where each version is only
      considered "supported" if every PG variant in REQUIRED_PG_SET (currently {15, 16, 17, 18})
-     has a `pgN-X.Y.Z` tag on GHCR. Released versions newer than the newest shipped one that
-     cannot be adopted - missing a required variant, or with no container tags published at
-     all - are reported as `[warn] ... blocked: ...`, so stalled adoption is never silent.
+     has a `pgN-X.Y.Z` tag on GHCR. Every release at or above the oldest curated version that
+     is not adopted is reported, so stalled adoption is never silent: `[warn] ... blocked: ...`
+     for one missing a required variant or with no container tags at all, and `[warn] skipping
+     backfill candidate(s) ...` for one that a newer adoption has leapfrogged. An empty
+     intersection is reported too - it is what a GHCR/release feed that changed shape looks
+     like, and both fetches return empty rather than raising in that case.
   4. Parses the auto-generated regions in `src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs`
      to learn the current curated list. Any line it cannot parse is a hard error: re-rendering
      a partially parsed enum would delete shipped members. Single-line attributes attached to a
@@ -27,6 +30,9 @@ What this script does:
      CHANGELOG block. Candidates OLDER than the newest shipped version ("backfill") are skipped
      with a warning rather than adopted, because numeric enum values must never shift; newer
      candidates in the same run are still adopted.
+  6. Checks on EVERY run - adoption or not - that the CHANGELOG marker block still sits inside
+     the `## [Unreleased]` section, and refuses to adopt anything while it does not, rather than
+     filing the generated notes under an already-released version.
 
 What this script does NOT do (deliberately):
   - It does not edit `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs`. That
@@ -77,6 +83,16 @@ REQUIRED_PG_SET: frozenset[int] = frozenset({15, 16, 17, 18})
 # which is what catches "the enum gained a variant but the adoption gate never heard about it".
 DEFERRED_PG_SET: frozenset[int] = frozenset()
 
+# Upstream releases the maintainer has decided will never be adopted, as "X.Y.Z" strings.
+# A release that upstream published while one of its required PG variants was still building can
+# be leapfrogged: a newer version is adopted, and from then on the older one can only be taken by
+# a manual PR, because numeric enum values must never shift. `report_unadopted_versions` keeps
+# reporting it so the stall never goes silent - and would therefore report it every week forever,
+# which is the version-level twin of the recurring "unknown PG variant" noise DEFERRED_PG_SET
+# removes. Listing it here acknowledges the decision once and stops the warning. Releases older
+# than the oldest curated member are out of scope already and never need an entry.
+ACKNOWLEDGED_SKIPS: frozenset[str] = frozenset()
+
 GH_TAG_RE = re.compile(r"^v(\d+)\.(\d+)-(\d+)$")
 GHCR_TAG_RE = re.compile(r"^pg(\d+)-(\d+)\.(\d+)\.(\d+)$")
 ENUM_MEMBER_LINE_RE = re.compile(r"^V(\d+)_(\d+)_(\d+)\s*=\s*(\d+)\s*,?$")
@@ -112,6 +128,23 @@ class SemVer:
     @property
     def enum_member(self) -> str:
         return f"V{self.major}_{self.minor}_{self.patch}"
+
+
+def acknowledged_skips() -> set[SemVer]:
+    """Parse ACKNOWLEDGED_SKIPS, hard-failing on a malformed entry.
+
+    A typo would otherwise silently fail to match any version and quietly restore the recurring
+    warning the entry was added to silence.
+    """
+    parsed: set[SemVer] = set()
+    for text in ACKNOWLEDGED_SKIPS:
+        parts = text.split(".")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            raise RuntimeError(
+                f"ACKNOWLEDGED_SKIPS entry {text!r} is not a MAJOR.MINOR.PATCH version string."
+            )
+        parsed.add(SemVer(int(parts[0]), int(parts[1]), int(parts[2])))
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +420,31 @@ def parse_versions_text(
     return values, enum_attributes, const_attributes
 
 
+@dataclass(frozen=True)
+class VersionsSource:
+    """DocumentDBVersion.cs as it currently stands on disk, read and parsed exactly once.
+
+    Three consumers need overlapping pieces of this file: main() needs the numeric assignments to
+    work out what is new, `render_versions_file` needs the attribute lines so a hand-applied
+    `[Obsolete]` survives regeneration, and `write_versions_file` needs the raw text to locate the
+    auto-generated regions plus the assignments to check its own output is append-only. Loading
+    them together is one read and one parse instead of two, and removes the possibility of two
+    callers disagreeing about what the file contains.
+    """
+
+    path: Path
+    text: str
+    values: dict[SemVer, int]
+    enum_attributes: dict[SemVer, list[str]]
+    const_attributes: dict[SemVer, list[str]]
+
+    @classmethod
+    def load(cls, path: Path) -> "VersionsSource":
+        text = path.read_text(encoding="utf-8")
+        values, enum_attributes, const_attributes = parse_versions_text(text, path)
+        return cls(path, text, values, enum_attributes, const_attributes)
+
+
 def parse_known_versions(versions_file: Path) -> dict[SemVer, int]:
     """Return {SemVer: numeric_value} for every member currently in DocumentDBVersion.cs.
 
@@ -394,7 +452,7 @@ def parse_known_versions(versions_file: Path) -> dict[SemVer, int]:
     The numeric values must be preserved exactly; this dict is the source of truth used by
     `render_versions_file` to avoid renumbering existing members.
     """
-    return parse_versions_text(versions_file.read_text(encoding="utf-8"), versions_file)[0]
+    return VersionsSource.load(versions_file).values
 
 
 def assert_append_only(
@@ -515,7 +573,7 @@ def render_versions_file(
     return enum_block, const_block, list_block, switch_block
 
 
-def write_versions_file(versions_file: Path, assignments: dict[SemVer, int]) -> None:
+def write_versions_file(source: VersionsSource, assignments: dict[SemVer, int]) -> None:
     """Rewrite the four auto-generated regions, verifying the result before it hits disk.
 
     The rendered text is re-parsed and checked with `assert_append_only` against what the file
@@ -523,37 +581,48 @@ def write_versions_file(versions_file: Path, assignments: dict[SemVer, int]) -> 
     caller just built) is what makes the guard able to catch a rendering or region-replacement
     bug; and doing it before `write_text` means a failure leaves the file untouched.
     """
-    text = versions_file.read_text(encoding="utf-8")
-    existing, enum_attributes, const_attributes = parse_versions_text(text, versions_file)
-    enum_block, const_block, list_block, switch_block = render_versions_file(
-        assignments, enum_attributes, const_attributes
-    )
-    blocks = [enum_block, const_block, list_block, switch_block]
+    blocks = render_versions_file(assignments, source.enum_attributes, source.const_attributes)
+
+    # Count the regions BEFORE pairing them with the rendered blocks. Indexing `blocks` inside the
+    # loop instead would turn "the file grew a fifth region" into a bare IndexError traceback in
+    # the cron log, rather than the actionable message below.
+    regions = list(AUTO_GEN_RE.finditer(source.text))
+    if len(regions) != len(blocks):
+        raise RuntimeError(
+            f"Expected {len(blocks)} auto-generated regions in {source.path}, found {len(regions)}"
+        )
 
     # Replace each auto-generated region in order.
     new_parts: list[str] = []
     cursor = 0
-    block_index = 0
-    for match in AUTO_GEN_RE.finditer(text):
+    for block, match in zip(blocks, regions):
         start, end = match.span()
-        new_parts.append(text[cursor:start])
-        replacement = match.group(1) + blocks[block_index] + match.group(3)
-        new_parts.append(replacement)
+        new_parts.append(source.text[cursor:start])
+        new_parts.append(match.group(1) + block + match.group(3))
         cursor = end
-        block_index += 1
 
-    if block_index != 4:
-        raise RuntimeError(
-            f"Expected 4 auto-generated regions in {versions_file}, found {block_index}"
-        )
-
-    new_parts.append(text[cursor:])
+    new_parts.append(source.text[cursor:])
     new_text = "".join(new_parts)
 
-    written, _, _ = parse_versions_text(new_text, versions_file)
-    assert_append_only(existing, written)
+    written, _, _ = parse_versions_text(new_text, source.path)
+    assert_append_only(source.values, written)
 
-    versions_file.write_text(new_text, encoding="utf-8")
+    source.path.write_text(new_text, encoding="utf-8")
+
+
+def unreleased_section_bounds(text: str) -> tuple[int, int] | None:
+    """Return the ``[start, end)`` offsets of the ``## [Unreleased]`` section, or None if absent.
+
+    `end` is the offset of the next top-level release heading, or the end of the text. Both the
+    placement guard and the bootstrap insertion point derive from this, so "where the Unreleased
+    section stops" has exactly one definition and changing the heading convention is a one-line
+    edit rather than two edits that can disagree.
+    """
+    start = text.find(UNRELEASED_HEADING)
+    if start == -1:
+        return None
+    end = text.find("\n## [", start + 1)
+    return start, len(text) if end == -1 else end
 
 
 def warn_if_markers_outside_unreleased(
@@ -569,8 +638,8 @@ def warn_if_markers_outside_unreleased(
     exactly what a release cut produces when the heading is renamed to ``## [X.Y.Z] - <date>``
     and not re-added, and it means the markers are now inside an already-released section.
     """
-    unreleased_idx = text.find(UNRELEASED_HEADING)
-    if unreleased_idx == -1:
+    bounds = unreleased_section_bounds(text)
+    if bounds is None:
         message = (
             f"{changelog_file.name} has no '{UNRELEASED_HEADING}' section, so the auto-generated "
             "versions block cannot be inside one; the generated notes are being written into an "
@@ -581,11 +650,8 @@ def warn_if_markers_outside_unreleased(
         emit_github_annotation("warning", "CHANGELOG has no [Unreleased] section", message)
         return True
 
-    section_end = text.find("\n## [", unreleased_idx + 1)
-    if section_end == -1:
-        section_end = len(text)
-
-    if unreleased_idx < marker_start < section_end:
+    section_start, section_end = bounds
+    if section_start < marker_start < section_end:
         return False
 
     message = (
@@ -596,6 +662,25 @@ def warn_if_markers_outside_unreleased(
     print(f"  [warn] {message}", file=sys.stderr)
     emit_github_annotation("warning", "CHANGELOG auto-generated block is misplaced", message)
     return True
+
+
+def check_changelog_placement(changelog_file: Path) -> bool:
+    """Run the placement guard over `changelog_file`; True when the markers are misplaced.
+
+    main() calls this on EVERY run, not only when a version is adopted. A release cut that renames
+    ``## [Unreleased]`` and forgets to re-add it is followed by weeks of runs with nothing to
+    adopt, and a guard reachable only from the write path would sit unexecuted through all of
+    them - green, unannotated, and quietly writing to the wrong section on the run that finally
+    does find something.
+
+    A file with no markers at all is not a placement problem: `update_changelog` bootstraps the
+    block inside [Unreleased] the first time it runs.
+    """
+    text = changelog_file.read_text(encoding="utf-8")
+    match = CHANGELOG_AUTO_GEN_RE.search(text)
+    if match is None:
+        return False
+    return warn_if_markers_outside_unreleased(changelog_file, text, match.start())
 
 
 def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
@@ -631,7 +716,17 @@ def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
     text = changelog_file.read_text(encoding="utf-8")
     marker_match = CHANGELOG_AUTO_GEN_RE.search(text)
     if marker_match:
-        warn_if_markers_outside_unreleased(changelog_file, text, marker_match.start())
+        # Detecting a misplaced block and then rewriting it anyway would annotate the run and
+        # still commit the generated notes into an already-released section. main() checks the
+        # placement before it writes anything, so reaching this raise means the file changed
+        # underneath the run; either way, refusing is the only useful response.
+        if warn_if_markers_outside_unreleased(changelog_file, text, marker_match.start()):
+            raise RuntimeError(
+                f"Refusing to rewrite the auto-generated block in {changelog_file.name}: it is "
+                f"not inside the '{UNRELEASED_HEADING}' section, so the generated notes would be "
+                "filed under an already-released version. Move the markers (and their body) back "
+                "into [Unreleased] and re-run."
+            )
         text = CHANGELOG_AUTO_GEN_RE.sub(
             lambda m: m.group(1) + body + m.group(3),
             text,
@@ -644,23 +739,21 @@ def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
             "<!-- auto-generated:documentdb-versions-end -->\n"
         )
         # Prefer to bootstrap inside the existing [Unreleased] section so future runs
-        # never touch the manually-authored entries. Insert immediately before the
-        # next "## [" heading (i.e. at the end of [Unreleased]). Fall back to "right
-        # after the top-level title" when no [Unreleased] section exists.
-        unreleased_idx = text.find("## [Unreleased]")
-        if unreleased_idx != -1:
-            next_section_idx = text.find("\n## [", unreleased_idx + 1)
-            if next_section_idx != -1:
-                insertion_point = next_section_idx + 1  # keep the leading newline
-                text = text[:insertion_point] + block + "\n" + text[insertion_point:]
-            else:
-                text = text.rstrip() + "\n\n" + block
-        else:
+        # never touch the manually-authored entries. Insert at the end of that section
+        # (immediately before the next "## [" heading). Fall back to "right after the
+        # top-level title" when no [Unreleased] section exists.
+        bounds = unreleased_section_bounds(text)
+        if bounds is None:
             first_break = text.find("\n\n")
             if first_break == -1:
                 text = block + text
             else:
                 text = text[: first_break + 2] + block + text[first_break + 2 :]
+        elif bounds[1] == len(text):
+            text = text.rstrip() + "\n\n" + block
+        else:
+            insertion_point = bounds[1] + 1  # keep the leading newline
+            text = text[:insertion_point] + block + "\n" + text[insertion_point:]
 
     changelog_file.write_text(text, encoding="utf-8")
 
@@ -669,29 +762,53 @@ def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def report_blocked_versions(
+def report_unadopted_versions(
     gh_versions: list[SemVer],
     ghcr_map: dict[SemVer, set[int]],
-    minimum: SemVer | None,
-) -> list[SemVer]:
-    """Warn about released versions that cannot be adopted yet.
+    known: set[SemVer],
+) -> tuple[list[SemVer], list[SemVer]]:
+    """Warn about every upstream release that exists but is not in the curated list.
 
-    Covers both stall modes: a version whose container images are missing entirely (the GitHub
-    release usually lands before the image build finishes), and one that has some tags but is
-    missing a required PG variant. Without this, either case is indistinguishable from "nothing
-    new upstream": the run is silent and green while adoption is stuck. Only versions newer than
-    `minimum` (the newest version already shipped) are reported, because older ones are never
-    adoption candidates.
+    Returns (blocked, backfill). Three stall modes, all of which are otherwise indistinguishable
+    from "nothing new upstream" - a silent, green run while adoption is stuck:
 
-    The run still exits 0 (a blocked version is upstream's state, not an error here), so the
-    findings are also emitted as a GitHub Actions annotation - a green scheduled run whose log
+    * no container tags at all (the GitHub release usually lands before the image build finishes),
+    * some tags but a required PG variant missing,
+    * *leapfrogged*: a newer version was adopted while this one was incomplete, so it is now
+      older than the newest curated member and can only be taken by a manual PR, because numeric
+      enum values must never shift. Filtering on "newer than the newest shipped version" is what
+      used to make this third case vanish the moment it became permanent - exactly when reporting
+      it started to matter.
+
+    Scope is releases at or above the OLDEST curated member. Anything below that was never a
+    candidate (the curated list starts where it starts) and reporting it would bury the signal.
+    A release the maintainer has decided never to adopt goes in ACKNOWLEDGED_SKIPS, so the
+    warning does not recur every week forever.
+
+    The run still exits 0 (an unadopted version is upstream's state, not an error here), so the
+    findings are also emitted as GitHub Actions annotations - a green scheduled run whose log
     nobody opens is precisely the failure mode this reporting exists to prevent.
     """
+    oldest_known = min(known) if known else None
+    newest_known = max(known) if known else None
+    acknowledged = acknowledged_skips()
+
     blocked: list[SemVer] = []
-    reasons: list[str] = []
+    blocked_reasons: list[str] = []
+    backfill: list[SemVer] = []
+
     for version in sorted(gh_versions):
-        if minimum is not None and version <= minimum:
+        if version in known or version in acknowledged:
             continue
+        if oldest_known is not None and version < oldest_known:
+            continue
+
+        if newest_known is not None and version < newest_known:
+            # Leapfrogged. Its tags may since have completed, but adoption is manual either way,
+            # so the tag state is not worth reporting - the decision to make is the same.
+            backfill.append(version)
+            continue
+
         variants = ghcr_map.get(version) or set()
         missing = REQUIRED_PG_SET - variants
         if not missing:
@@ -710,15 +827,26 @@ def report_blocked_versions(
                 f"(published: {sorted(variants)}). Adoption is deferred until they appear."
             )
         print(f"  [warn] {reason}", file=sys.stderr)
-        reasons.append(reason)
+        blocked_reasons.append(reason)
 
     if blocked:
         emit_github_annotation(
             "warning",
             "DocumentDB adoption blocked",
-            f"{len(blocked)} upstream release(s) cannot be adopted yet. " + " ".join(reasons),
+            f"{len(blocked)} upstream release(s) cannot be adopted yet. "
+            + " ".join(blocked_reasons),
         )
-    return blocked
+
+    if backfill:
+        message = (
+            f"skipping backfill candidate(s) {[str(v) for v in backfill]} - older than "
+            f"shipped max {newest_known}; open a manual PR if intentional, or add them to "
+            "ACKNOWLEDGED_SKIPS to stop reporting them."
+        )
+        print(f"  [warn] {message}", file=sys.stderr)
+        emit_github_annotation("warning", "DocumentDB backfill candidate skipped", message)
+
+    return blocked, backfill
 
 
 def main() -> int:
@@ -742,10 +870,16 @@ def main() -> int:
     print(f"  GH releases parsed   : {len(gh_versions)}")
     print(f"  GHCR versions parsed : {len(ghcr_map)}")
 
-    known_assignments = parse_known_versions(VERSIONS_FILE)
+    versions_source = VersionsSource.load(VERSIONS_FILE)
+    known_assignments = versions_source.values
     known = sorted(known_assignments.keys())
     max_known = max(known) if known else None
     print(f"  Known to package    : {[str(v) for v in known]}")
+
+    # Unconditional, because the failure it catches (a release cut that renamed the
+    # "## [Unreleased]" heading and did not re-add it) is followed by weeks of runs with nothing
+    # to adopt. Checking only on the write path would let every one of those pass silently.
+    changelog_misplaced = check_changelog_placement(CHANGELOG_FILE)
 
     # Intersection: must be in BOTH sources, and ALL required pg variants must be present.
     intersected = sorted(
@@ -754,12 +888,23 @@ def main() -> int:
     )
     print(f"  Intersection found  : {[str(v) for v in intersected]}")
 
-    # Surface versions that exist upstream but are held back by a missing required variant,
-    # so "stuck" adoption is never silent.
-    report_blocked_versions(gh_versions, ghcr_map, max_known)
+    # Surface versions that exist upstream but were not adopted - held back by a missing required
+    # variant, or leapfrogged - so "stuck" adoption is never silent.
+    report_unadopted_versions(gh_versions, ghcr_map, set(known))
 
     if not intersected:
-        print("No fully-supported versions found in intersection. Nothing to do.")
+        # Not a routine no-op. REQUIRED_PG_SET is narrow enough that only a handful of releases
+        # clear it, so "not one of them does" is also what a GHCR tag list or release feed that
+        # changed shape looks like - and that fetch returns an empty result rather than raising.
+        # Saying so is the difference between a detected regression and a permanently green cron.
+        message = (
+            f"no upstream release has the full required variant set {sorted(REQUIRED_PG_SET)} "
+            f"({len(gh_versions)} release(s) and {len(ghcr_map)} tagged version(s) parsed). "
+            "Nothing can be adopted; if that is unexpected, check whether the GHCR tag list or "
+            "the release feed changed shape."
+        )
+        print(f"  [warn] {message}", file=sys.stderr)
+        emit_github_annotation("warning", "DocumentDB version detection found nothing", message)
         return 0
 
     # Append-only: never remove a version we already shipped, even if it disappears upstream.
@@ -769,16 +914,11 @@ def main() -> int:
     # existing members must never shift, so adopting an older version is a manual decision.
     # Skipping just those candidates (rather than failing the whole run) keeps adoption of
     # NEWER versions working, which matters because a required variant can lag a release.
+    # report_unadopted_versions has already warned and annotated for the ones at or above the
+    # oldest curated version; anything below that was never a candidate and is dropped silently
+    # on purpose, because the curated list starts where it starts.
     if max_known is not None:
-        backfill = [v for v in new_versions if v < max_known]
-        if backfill:
-            message = (
-                f"skipping backfill candidate(s) {[str(v) for v in backfill]} - older than "
-                f"shipped max {max_known}; open a manual PR if intentional."
-            )
-            print(f"  [warn] {message}", file=sys.stderr)
-            emit_github_annotation("warning", "DocumentDB backfill candidate skipped", message)
-            new_versions = [v for v in new_versions if v > max_known]
+        new_versions = [v for v in new_versions if v > max_known]
 
     if not new_versions:
         print("No new versions detected. Nothing to do.")
@@ -786,12 +926,27 @@ def main() -> int:
 
     print(f"  NEW versions        : {[str(v) for v in new_versions]}")
 
+    if changelog_misplaced:
+        # Checked here, before anything is written, so a misplaced block cannot leave
+        # DocumentDBVersion.cs adopted and the CHANGELOG filed under the wrong release.
+        message = (
+            f"refusing to adopt {[str(v) for v in new_versions]}: the auto-generated block in "
+            f"{CHANGELOG_FILE.name} is not inside '{UNRELEASED_HEADING}', so the release notes "
+            "would be filed under an already-released version. Move the markers (and their "
+            "body) back into [Unreleased] and re-run."
+        )
+        print(f"ERROR: {message}", file=sys.stderr)
+        emit_github_annotation(
+            "error", "DocumentDB adoption blocked by CHANGELOG placement", message
+        )
+        return 2
+
     target_assignments = assign_numeric_values(known_assignments, new_versions)
 
     # The append-only guard lives inside write_versions_file, which applies it to the RENDERED
     # text rather than to `target_assignments`: checking the dict here could never fail, because
     # assign_numeric_values starts from a copy of `known_assignments` and only adds keys.
-    write_versions_file(VERSIONS_FILE, target_assignments)
+    write_versions_file(versions_source, target_assignments)
     print(f"Updated {VERSIONS_FILE.relative_to(REPO_ROOT)}")
 
     update_changelog(CHANGELOG_FILE, new_versions)

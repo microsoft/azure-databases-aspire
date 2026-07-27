@@ -33,6 +33,24 @@ internal static partial class DocumentDBContainerImageTags
     /// </summary>
     internal static readonly Version MinimumPostgresEndpointVersion = new(0, 112, 0);
 
+    /// <summary>
+    /// The earliest DocumentDB version for which upstream publishes each PostgreSQL backend
+    /// variant. Every combination of <see cref="DocumentDBVersion"/> and
+    /// <see cref="DocumentDBPostgresVersion"/> produces a well-formed <c>pg{NN}-X.Y.Z</c> tag,
+    /// but not every one of them exists: upstream only started building <c>pg18-</c> images at
+    /// DocumentDB <c>0.114.0</c>, so <c>pg18-0.113.0</c> is selectable through the
+    /// strongly-typed API and absent from GHCR. Without a floor the app fails at container-pull
+    /// time with an opaque manifest-not-found error;
+    /// <see cref="Aspire.Hosting.DocumentDBBuilderExtensions.AddDocumentDB(IDistributedApplicationBuilder, string, int?, IResourceBuilder{ParameterResource}?, IResourceBuilder{ParameterResource}?)"/>
+    /// uses this map at startup to turn that into a loud, actionable
+    /// <see cref="InvalidOperationException"/>. Variants absent from the map have no floor.
+    /// </summary>
+    internal static readonly IReadOnlyDictionary<int, Version> MinimumVersionByPgVariant =
+        new Dictionary<int, Version>
+        {
+            [(int)DocumentDBPostgresVersion.Pg18] = new Version(0, 114, 0),
+        };
+
     // Anchored (^ ... \z, NOT $ which also matches before a final \n) and ASCII-only
     // ([0-9] not \d, so unicode-digit categories cannot slip through). Case-insensitive
     // on the "pg" prefix only. Requires exactly three numeric version segments; any
