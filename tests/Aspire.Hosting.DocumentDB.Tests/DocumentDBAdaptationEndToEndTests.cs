@@ -180,12 +180,23 @@ public class DocumentDBAdaptationEndToEndTests
 
         // Control: the same endpoint, spoken to over TLS, must work. This also waits out
         // container startup so the negative assertion below is not just a race.
-        var tlsConnectionString = plainConnectionString! + "&tls=true&tlsInsecure=true";
+        var tlsConnectionString = WithTlsOptions(plainConnectionString!);
         var database = await ConnectAsync(tlsConnectionString, "appdb", cts.Token);
         await database.RunCommandAsync((Command<BsonDocument>)"{ ping: 1 }", cancellationToken: cts.Token);
 
         // The claim under test: plain is refused.
-        await Assert.ThrowsAnyAsync<Exception>(() => PingOnceAsync(plainConnectionString!, "appdb", cts.Token));
+        //
+        // Deliberately NOT the end-to-end token. Cancelling it would make PingOnceAsync throw
+        // OperationCanceledException, which any "some exception was thrown" assertion would
+        // happily accept - so a timed-out run would report success for the one assertion this
+        // test exists to make. PingOnceAsync carries its own 10s driver timeouts.
+        var rejection = await Record.ExceptionAsync(
+            () => PingOnceAsync(plainConnectionString!, "appdb", CancellationToken.None));
+
+        Assert.NotNull(rejection);
+        Assert.True(
+            rejection is TimeoutException or MongoException,
+            $"Expected the plain connection to be refused by TLS enforcement, but got: {rejection}");
     }
 
     [Fact]
@@ -369,17 +380,48 @@ public class DocumentDBAdaptationEndToEndTests
 
     private static async Task<bool> DockerImageExistsLocallyAsync(string image)
     {
-        var startInfo = new ProcessStartInfo("docker", $"image inspect {image}")
+        // Both streams are redirected to keep the test output clean, so both must be drained
+        // concurrently with the wait: 'docker image inspect' emits the full manifest JSON on
+        // success (~4.3 KB, larger than the pipe buffer), so waiting first would deadlock as soon
+        // as the image being probed actually exists locally. The timeout covers a wedged daemon,
+        // which would otherwise stall the whole run.
+        var startInfo = new ProcessStartInfo("docker")
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        startInfo.ArgumentList.Add("image");
+        startInfo.ArgumentList.Add("inspect");
+        startInfo.ArgumentList.Add(image);
 
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Failed to start 'docker image inspect'.");
 
-        await process.WaitForExitAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        var drainStdout = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        var drainStderr = process.StandardError.ReadToEndAsync(timeout.Token);
+
+        try
+        {
+            await Task.WhenAll(drainStdout, drainStderr, process.WaitForExitAsync(timeout.Token));
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException)
+            {
+                // Already exited between the timeout firing and the kill.
+            }
+
+            throw new InvalidOperationException(
+                $"'docker image inspect {image}' did not complete within 30s; the Docker daemon appears unresponsive.");
+        }
+
         return process.ExitCode == 0;
     }
 
@@ -400,6 +442,16 @@ public class DocumentDBAdaptationEndToEndTests
         Assert.Equal(1, deleteResult.DeletedCount);
         Assert.Equal(0, await collection.CountDocumentsAsync(filter, cancellationToken: cancellationToken));
     }
+
+    /// <summary>
+    /// Appends the TLS options to a connection string produced with <c>UseTls(false)</c>, picking
+    /// the query separator rather than assuming one is already present. The resource only emits a
+    /// query string when it has a password parameter; hard-coding <c>&amp;</c> would silently
+    /// produce a malformed URI if that ever stopped being true, and a malformed URI would make the
+    /// TLS control in this test fail for a reason unrelated to TLS.
+    /// </summary>
+    private static string WithTlsOptions(string connectionString) =>
+        connectionString + (connectionString.Contains('?', StringComparison.Ordinal) ? "&" : "?") + "tls=true&tlsInsecure=true";
 
     private static IMongoDatabase GetDatabase(string connectionString, string databaseName, TimeSpan timeout)
     {
