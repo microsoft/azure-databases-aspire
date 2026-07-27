@@ -20,7 +20,7 @@ docker info
 **Symptom:** Timeout or network error pulling `ghcr.io/documentdb/documentdb/documentdb-local`.
 
 **Solution:**
-1. Verify network connectivity: `docker pull ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.109.0`
+1. Verify network connectivity: `docker pull ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.114.0`
 2. Check if you need to authenticate to GitHub Container Registry (public images should not require auth)
 3. If behind a corporate proxy, configure Docker's proxy settings
 
@@ -60,6 +60,22 @@ Common causes:
    mongodb://admin:<password>@localhost:<port>/?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true&tlsAllowInvalidCertificates=true
    ```
    `mongosh` accepts `tlsAllowInvalidCertificates=true`. For .NET applications, prefer `tlsInsecure=true`.
+
+### Plain (non-TLS) connections are refused
+
+**Symptom:** `UseTls(false)` is set, but the client or health check cannot connect to the container.
+
+**Causes and solutions:**
+1. **Container image is older than `0.114.0`.** Images up to and including `0.113.0` always enforced TLS on the gateway and rejected plain connections, regardless of the `TLS_MODE` setting. Use the default (`0.114.0` or newer) image tag, or keep TLS enabled in the connection string.
+2. **`TLS_MODE` is set to `requireTLS`.** This makes the container reject plain connections by design, which contradicts `UseTls(false)`. Remove the environment variable to fall back to the default `allowTLS` (accepts both plain and TLS connections), or re-enable TLS with `UseTls(true)`.
+
+   ```csharp
+   // Only if you want plain connections rejected — do NOT combine with UseTls(false).
+   var server = builder.AddDocumentDB("documentdb")
+                       .WithEnvironment("TLS_MODE", "requireTLS");
+   ```
+
+   `TLS_MODE=disabled` is not a plain-only mode; the gateway treats it exactly like `allowTLS` and the entrypoint logs a warning.
 
 ### Connection refused / timeout
 
