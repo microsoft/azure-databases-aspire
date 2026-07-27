@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import re
 import sys
 import tempfile
 import unittest
@@ -133,15 +134,21 @@ public static class DocumentDBVersions
         self.changelog_file = self.root / "CHANGELOG.md"
         self.changelog_file.write_text(CHANGELOG_TEMPLATE, encoding="utf-8")
 
-    def run_main(self, gh_versions, ghcr_map) -> tuple[int, str, str]:
-        """Run main() against this fake repo; returns (exit_code, stdout, stderr)."""
+    def run_main(self, gh_versions, ghcr_map, *, github_actions: bool = False) -> tuple[int, str, str]:
+        """Run main() against this fake repo; returns (exit_code, stdout, stderr).
+
+        ``GITHUB_ACTIONS`` is blanked unless a test asks for it, so the workflow-command output
+        of `emit_github_annotation` is opt-in: the Python suite itself runs inside Actions, and
+        an annotation emitted from a test would show up on the build summary as a real one.
+        """
         stdout, stderr = io.StringIO(), io.StringIO()
+        env = {"GITHUB_OUTPUT": "", "GITHUB_ACTIONS": "true" if github_actions else ""}
         with mock.patch.object(script, "REPO_ROOT", self.root), \
                 mock.patch.object(script, "VERSIONS_FILE", self.versions_file), \
                 mock.patch.object(script, "CHANGELOG_FILE", self.changelog_file), \
                 mock.patch.object(script, "fetch_github_releases", return_value=gh_versions), \
                 mock.patch.object(script, "fetch_ghcr_pg_tags", return_value=ghcr_map), \
-                mock.patch.dict(script.os.environ, {"GITHUB_OUTPUT": ""}), \
+                mock.patch.dict(script.os.environ, env), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = script.main()
         return code, stdout.getvalue(), stderr.getvalue()
@@ -166,6 +173,38 @@ class RequiredPgSetTests(unittest.TestCase):
         # DEFERRED_PG_SET exists to acknowledge enum members that the adoption gate deliberately
         # ignores; a variant cannot be both required and deferred.
         self.assertEqual(set(), script.REQUIRED_PG_SET & script.DEFERRED_PG_SET)
+
+
+class UnknownPgVariantWarningTests(unittest.TestCase):
+    """The GHCR scan must treat deferred variants as known, or DEFERRED_PG_SET is decorative."""
+
+    @staticmethod
+    def _scan(tags: list[str]) -> tuple[dict, str]:
+        """Run fetch_ghcr_pg_tags against a canned GHCR response; returns (result, stderr)."""
+        stderr = io.StringIO()
+        with mock.patch.object(script, "_http_get_json", return_value={"token": "t"}), \
+                mock.patch.object(
+                    script, "_http_get_json_and_link", return_value=({"tags": tags}, None)), \
+                contextlib.redirect_stderr(stderr):
+            result = script.fetch_ghcr_pg_tags("documentdb/documentdb/documentdb-local")
+        return result, stderr.getvalue()
+
+    def test_deferred_variant_does_not_produce_unknown_variant_noise(self):
+        # The scenario DEFERRED_PG_SET was added for: a maintainer adds Pg19 to the enum and
+        # defers it, then upstream starts publishing pg19- tags. Warning here would be false
+        # (the member exists) and would recur every single week - the exact noise the pg18 fix
+        # removed.
+        with mock.patch.object(script, "DEFERRED_PG_SET", frozenset({19})):
+            by_version, stderr = self._scan(["pg17-0.115.0", "pg19-0.115.0"])
+
+        self.assertNotIn("unknown PG variants", stderr)
+        self.assertEqual({19, 17}, by_version[_semver("0.115.0")] & {17, 19})
+
+    def test_variant_in_neither_set_is_still_reported(self):
+        with mock.patch.object(script, "DEFERRED_PG_SET", frozenset({19})):
+            _, stderr = self._scan(["pg17-0.115.0", "pg19-0.115.0", "pg99-0.115.0"])
+
+        self.assertIn("unknown PG variants [99]", stderr)
 
 
 class UpdateChangelogTests(unittest.TestCase):
@@ -299,6 +338,185 @@ class BlockedVersionReportingTests(unittest.TestCase):
         self.assertNotIn("blocked", stderr)
 
 
+class GitHubAnnotationTests(unittest.TestCase):
+    """A2(b): every "cannot adopt yet" path exits 0, so it must annotate the run, not just log."""
+
+    def test_blocked_version_is_annotated(self):
+        # Without this the weekly cron is green and unannotated while adoption is stuck, which is
+        # indistinguishable from "nothing new upstream" to anyone not reading the log.
+        repo = FakeRepo()
+
+        _, stdout, _ = repo.run_main(
+            [_semver("0.102.0")], _full_variants("0.101.0"), github_actions=True
+        )
+
+        self.assertIn("::warning title=DocumentDB adoption blocked::", stdout)
+        self.assertIn("0.102.0 blocked", stdout)
+
+    def test_skipped_backfill_candidate_is_annotated(self):
+        repo = FakeRepo()
+
+        _, stdout, _ = repo.run_main(
+            [_semver("0.100.5")], _full_variants("0.100.5"), github_actions=True
+        )
+
+        self.assertIn("::warning title=DocumentDB backfill candidate skipped::", stdout)
+
+    def test_no_annotation_outside_github_actions(self):
+        repo = FakeRepo()
+
+        _, stdout, stderr = repo.run_main([_semver("0.102.0")], _full_variants("0.101.0"))
+
+        self.assertNotIn("::warning", stdout)
+        self.assertIn("0.102.0 blocked", stderr)  # the local run still says so on stderr
+
+    def test_a_clean_run_emits_no_annotation(self):
+        repo = FakeRepo()
+
+        _, stdout, _ = repo.run_main(
+            [_semver("0.102.0")], _full_variants("0.102.0"), github_actions=True
+        )
+
+        self.assertNotIn("::warning", stdout)
+
+    def test_annotation_message_is_escaped(self):
+        # Raw newlines would truncate a workflow command to its first line.
+        with mock.patch.dict(script.os.environ, {"GITHUB_ACTIONS": "true"}):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                script.emit_github_annotation("warning", "a:title, with commas", "line1\nline2")
+
+        self.assertEqual(
+            "::warning title=a%3Atitle%2C with commas::line1%0Aline2\n", stdout.getvalue()
+        )
+
+
+class ObsoleteAttributeTests(unittest.TestCase):
+    """A5: DocumentDBVersion's XML docs prescribe [Obsolete] for retiring a member, and that
+    attribute has to live inside the auto-generated region. It must neither crash the parser nor
+    be dropped by the next rewrite."""
+
+    ATTRIBUTE = '[Obsolete("DocumentDB 0.100.0 is no longer published upstream.")]'
+
+    def _repo_with_obsolete_member(self) -> FakeRepo:
+        repo = FakeRepo()
+        text = repo.versions_text()
+        text = text.replace(
+            "    V0_100_0 = 1,", f"    {self.ATTRIBUTE}\n    V0_100_0 = 1,"
+        ).replace(
+            '    public const string V0_100_0 = "0.100.0";',
+            f'    {self.ATTRIBUTE}\n    public const string V0_100_0 = "0.100.0";',
+        )
+        repo.versions_file.write_text(text, encoding="utf-8")
+        return repo
+
+    def test_attribute_line_is_parsed_not_rejected(self):
+        repo = self._repo_with_obsolete_member()
+
+        known = script.parse_known_versions(repo.versions_file)
+
+        self.assertEqual({_semver("0.100.0"): 1, _semver("0.101.0"): 2}, known)
+
+    def test_attribute_survives_a_rewrite_that_adopts_a_new_version(self):
+        repo = self._repo_with_obsolete_member()
+
+        code, _, _ = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+
+        self.assertEqual(0, code)
+        text = repo.versions_text()
+        self.assertIn(f"    {self.ATTRIBUTE}\n    V0_100_0 = 1,", text)
+        self.assertIn(f'    {self.ATTRIBUTE}\n    public const string V0_100_0 = "0.100.0";', text)
+        # ... and only on the member it was attached to.
+        self.assertEqual(2, text.count(self.ATTRIBUTE))
+        self.assertIn("V0_102_0 = 3,", text)
+
+    def test_multi_line_attribute_is_a_hard_error(self):
+        repo = FakeRepo()
+        repo.versions_file.write_text(
+            repo.versions_text().replace(
+                "    V0_100_0 = 1,", '    [Obsolete(\n        "wrapped")]\n    V0_100_0 = 1,'
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            script.parse_known_versions(repo.versions_file)
+
+        self.assertIn("single line", str(ctx.exception))
+
+    def test_attribute_attached_to_nothing_is_a_hard_error(self):
+        repo = FakeRepo()
+        repo.versions_file.write_text(
+            repo.versions_text().replace(
+                "    // <auto-generated-versions-end>\n}",
+                f"    {self.ATTRIBUTE}\n    // <auto-generated-versions-end>\n}}",
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            script.parse_known_versions(repo.versions_file)
+
+        self.assertIn("not attached to any member", str(ctx.exception))
+
+    def test_unrecognized_constant_line_is_a_hard_error(self):
+        # The constant region is regenerated wholesale, so a line the parser does not understand
+        # is a line that would be silently deleted.
+        repo = FakeRepo()
+        repo.versions_file.write_text(
+            repo.versions_text().replace(
+                '    public const string V0_100_0 = "0.100.0";',
+                '    public static readonly string V0_100_0 = "0.100.0";',
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            script.parse_known_versions(repo.versions_file)
+
+        self.assertIn("constant region", str(ctx.exception))
+
+
+class WriteVersionsFileGuardTests(unittest.TestCase):
+    """A3(c): the append-only guard must run against the rendered output, where it can fail."""
+
+    def test_rendering_bug_that_drops_a_member_is_caught_before_writing(self):
+        repo = FakeRepo()
+        before = repo.versions_text()
+        target = {_semver("0.100.0"): 1, _semver("0.101.0"): 2, _semver("0.102.0"): 3}
+        real_render = script.render_versions_file
+
+        def drops_the_oldest(assignments, enum_attributes=None, const_attributes=None):
+            pruned = {v: n for v, n in assignments.items() if v != _semver("0.100.0")}
+            return real_render(pruned, enum_attributes, const_attributes)
+
+        with mock.patch.object(script, "render_versions_file", side_effect=drops_the_oldest):
+            with self.assertRaises(RuntimeError) as ctx:
+                script.write_versions_file(repo.versions_file, target)
+
+        self.assertIn("V0_100_0 would be removed", str(ctx.exception))
+        # The failure must not leave a half-written file behind.
+        self.assertEqual(before, repo.versions_text())
+
+    def test_rendering_bug_that_renumbers_a_member_is_caught_before_writing(self):
+        repo = FakeRepo()
+        before = repo.versions_text()
+        target = {_semver("0.100.0"): 1, _semver("0.101.0"): 2, _semver("0.102.0"): 3}
+        real_render = script.render_versions_file
+
+        def renumbers(assignments, enum_attributes=None, const_attributes=None):
+            shifted = dict(assignments)
+            shifted[_semver("0.101.0")] = 9
+            return real_render(shifted, enum_attributes, const_attributes)
+
+        with mock.patch.object(script, "render_versions_file", side_effect=renumbers):
+            with self.assertRaises(RuntimeError) as ctx:
+                script.write_versions_file(repo.versions_file, target)
+
+        self.assertIn("renumbered", str(ctx.exception))
+        self.assertEqual(before, repo.versions_text())
+
+
 class ParseKnownVersionsTests(unittest.TestCase):
     """A3: a degraded parse must crash instead of silently shrinking the shipped enum."""
 
@@ -381,8 +599,24 @@ class ChangelogMarkerPlacementTests(unittest.TestCase):
 
         self.assertFalse(misplaced, stderr.getvalue())
 
+    @staticmethod
+    def _check(text: str) -> tuple[bool, str]:
+        """Run the placement guard over `text`; returns (misplaced, stderr)."""
+        path = Path(tempfile.mkdtemp()) / "CHANGELOG.md"
+        path.write_text(text, encoding="utf-8")
+        match = script.CHANGELOG_AUTO_GEN_RE.search(text)
+        assert match is not None
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        # stdout is captured too: the guard emits a workflow-command annotation, which must not
+        # leak into the log of the CI job that runs this suite.
+        with mock.patch.dict(script.os.environ, {"GITHUB_ACTIONS": ""}), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            misplaced = script.warn_if_markers_outside_unreleased(path, text, match.start())
+        return misplaced, stderr.getvalue()
+
     def test_markers_inside_a_released_section_are_reported(self):
-        text = (
+        misplaced, stderr = self._check(
             "# Changelog\n"
             "\n"
             "## [Unreleased]\n"
@@ -393,16 +627,40 @@ class ChangelogMarkerPlacementTests(unittest.TestCase):
             "body\n"
             "<!-- auto-generated:documentdb-versions-end -->\n"
         )
-        path = Path(tempfile.mkdtemp()) / "CHANGELOG.md"
-        path.write_text(text, encoding="utf-8")
-        match = script.CHANGELOG_AUTO_GEN_RE.search(text)
-
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            misplaced = script.warn_if_markers_outside_unreleased(path, text, match.start())
 
         self.assertTrue(misplaced)
-        self.assertIn("[Unreleased]", stderr.getvalue())
+        self.assertIn("[Unreleased]", stderr)
+
+    def test_missing_unreleased_heading_is_reported(self):
+        # A release cut renames "## [Unreleased]" to "## [0.115.0] - <date>". If the heading is
+        # not re-added, the markers are now inside a released section - the very bug this guard
+        # exists for - so "no [Unreleased] section" must never short-circuit to "placement fine".
+        misplaced, stderr = self._check(
+            "# Changelog\n"
+            "\n"
+            "## [0.115.0] - 2026-08-03\n"
+            "\n"
+            "<!-- auto-generated:documentdb-versions-start -->\n"
+            "body\n"
+            "<!-- auto-generated:documentdb-versions-end -->\n"
+        )
+
+        self.assertTrue(misplaced)
+        self.assertIn("[Unreleased]", stderr)
+
+    def test_unreleased_block_does_not_restate_an_already_released_version(self):
+        # Moving the markers into [Unreleased] carried the old body along once, so 0.114.0 was
+        # listed as a pending addition while a dated ## [0.114.0] section documented it as
+        # shipped. Reset the block body when cutting a release.
+        text = REAL_CHANGELOG_FILE.read_text(encoding="utf-8")
+        block = script.CHANGELOG_AUTO_GEN_RE.search(text).group(2)
+
+        for version in re.findall(r"DocumentDB `([\d.]+)` upstream release detected", block):
+            self.assertNotIn(
+                f"## [{version}] - ", text,
+                f"CHANGELOG.md lists {version} in the [Unreleased] auto-generated block and also "
+                f"in a dated '## [{version}]' section.",
+            )
 
 
 class RoundTripTests(unittest.TestCase):

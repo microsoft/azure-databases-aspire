@@ -34,7 +34,9 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
    `pg15-X.Y.Z`, `pg16-X.Y.Z`, `pg17-X.Y.Z`, and `pg18-X.Y.Z` published on GHCR.
 2. The set of required PG variants is the script-level constant `REQUIRED_PG_SET` (currently
    `{15, 16, 17, 18}`; `pg18` is published upstream from DocumentDB 0.114.0 onwards). It is
-   never auto-extended — see [Adding a PG variant](#adding-a-pg-variant).
+   never auto-extended — see [Adding a PG variant](#adding-a-pg-variant). A `pgN-` tag on GHCR
+   whose variant is in neither `REQUIRED_PG_SET` nor `DEFERRED_PG_SET` is reported as an unknown
+   variant; a deferred one is not, because the package already knows about it.
 3. The version list in `DocumentDBVersion.cs` is **append-only**. The script never removes a
    version that was previously shipped, even if it disappears from upstream.
 4. Numeric enum values are derived deterministically from sort order (1, 2, 3, ...) and must
@@ -43,7 +45,9 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
 5. The CHANGELOG block is **replace-in-place** (bounded by HTML comments) so reruns on the
    same auto-PR branch don't accumulate duplicate entries. It lives at the end of the
    `## [Unreleased]` section of `CHANGELOG.md`; the script warns if the markers have drifted
-   into an already-released section (regenerated notes would be filed under the wrong release).
+   into an already-released section, or if there is no `## [Unreleased]` heading at all (a
+   release cut renames it), because regenerated notes would then be filed under the wrong
+   release.
 6. A candidate **older** than the newest already-shipped version ("backfill") is skipped with a
    warning instead of adopted, because numeric enum values must never shift. Newer candidates in
    the same run are still adopted, so one backfill candidate cannot wedge adoption forever.
@@ -51,8 +55,19 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
    `[warn] X.Y.Z blocked: ...` — both when it is missing a required variant and when it has no
    container tags at all (the common case: the GitHub release lands before the image build
    finishes). Stalled adoption is therefore never silent.
-8. Parsing is fail-fast: an enum region line the script cannot parse, or a rewrite that would
-   drop or renumber a shipped member, is a hard error rather than a silent partial rewrite.
+8. Parsing is fail-fast: a line the script cannot parse in the enum or string-constant region is
+   a hard error rather than a silent partial rewrite. The append-only check runs against the
+   **rendered text**, re-parsed just before it would be written, so a rendering or
+   region-replacement bug that dropped or renumbered a shipped member fails the run and leaves
+   the file untouched.
+9. Single-line attributes attached to a generated member — `[Obsolete("…")]`, which
+   `DocumentDBVersion`'s XML docs prescribe for retiring a member instead of removing it — are
+   parsed and re-emitted verbatim in the enum and string-constant regions, so regenerating never
+   strips them. See [Retiring a version](#retiring-a-version).
+10. Every warning that means "a candidate exists upstream but was not adopted" (blocked version,
+    skipped backfill, misplaced CHANGELOG markers) is also emitted as a GitHub Actions
+    `::warning` annotation. The script exits 0 in all of those cases by design, so without the
+    annotation a stalled weekly run looks exactly like a run with nothing to do.
 
 ### Adding a PG variant
 
@@ -91,11 +106,29 @@ rewritten. The rest is deliberately manual, and CI stays red until it is done:
 | Public API baseline `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` (new enum member + string constant) | `VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` |
 | `WithImageTag("pgNN-X.Y.Z")` pin in `tests/Aspire.Hosting.DocumentDB.PostgresEndToEndApp/Program.cs`, plus the comments quoting it in `DocumentDBIntegrationTests.cs` | `VersionAutomationScriptTests.PostgresEndToEndAppPinsTheCurrentLatestVersion` |
 | `\| Image tag \|` row in `docs/configuration.md` and the `docker pull` example in `docs/troubleshooting.md` | `VersionAutomationScriptTests.DocsQuoteTheCurrentDefaultImageTag` |
-| Release notes: move the generated block's content into a dated `## [X.Y.Z]` section when you cut the package release | none — editorial |
+| Release notes: move the generated block's content into a dated `## [X.Y.Z]` section when you cut the package release, and reset the block body to its "nothing detected" placeholder line | `test_unreleased_block_does_not_restate_an_already_released_version` (Python suite) — a version left in both places fails it |
+| Release cut: keep a `## [Unreleased]` heading above the markers after renaming the old one | none directly; the next detection run warns and annotates |
 | Optional: an `InlineData` case in `DocumentDBVersionSelectionTests.WithDocumentDBVersionAloneSetsExpectedTag` | none — the drift guard in that file already covers correctness |
 
 Deliberately NOT updated per version: the `0.112.0` floor in `DocumentDBContainerImageTags.MinimumPostgresEndpointVersion`
 and the doc examples explaining it.
+
+### Retiring a version
+
+`DocumentDBVersion` is append-only, so a version that should no longer be used is marked
+`[Obsolete("…")]` rather than removed. Put the attribute on its own single line directly above
+the member (and, if you also want to deprecate the string constant, above that `public const
+string` line). Both regions are auto-generated, and the script parses and re-emits attribute lines
+verbatim, so the deprecation survives every later rewrite.
+
+Two caveats:
+
+- Keep the attribute on **one** line. A wrapped attribute is a hard error, because the script
+  cannot reattach it to its member when regenerating the region.
+- The `All` array and the `ToVersionString` switch still reference the obsoleted member, which
+  raises `CS0618`. Put `#pragma warning disable CS0618` / `restore` around the whole
+  `All` property and the whole `ToVersionString` method — **outside** the auto-generated markers.
+  Anything placed inside a marker block is discarded on the next rewrite.
 
 ### Trust assumption
 
@@ -104,8 +137,9 @@ not "image bytes are immutable". Pinning by digest is a future enhancement.
 
 ### Tests
 
-`tests/test_check_documentdb_versions.py` covers `REQUIRED_PG_SET`, the CHANGELOG block rewrite,
-backfill/blocked-version handling, and the fail-fast parse guards, by executing the real script
+`tests/test_check_documentdb_versions.py` covers `REQUIRED_PG_SET`/`DEFERRED_PG_SET`, the CHANGELOG
+block rewrite and placement guard, backfill/blocked-version handling and their annotations, the
+`[Obsolete]` round-trip, and the fail-fast parse/write guards, by executing the real script
 functions (standard library `unittest` only, no pip dependencies):
 
 ```bash

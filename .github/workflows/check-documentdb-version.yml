@@ -17,6 +17,11 @@ name: Check DocumentDB Versions
 #      and pushes a follow-up commit. This keeps the baseline an independent, human-reviewed
 #      record of public API changes.
 #
+# A run with nothing to adopt is a no-op and exits 0 - and so does a run whose adoption is
+# STUCK (a release whose container images are missing a required pg variant, or a backfill
+# candidate that must be adopted by hand). The script emits a `::warning` annotation in those
+# cases, so a green scheduled run still shows why nothing was adopted without opening the log.
+#
 # PR creation: The microsoft org restricts GITHUB_TOKEN from creating PRs, so
 # this workflow pushes the branch and prints a link for the maintainer to open
 # the PR manually (one click). This avoids needing PATs or GitHub Apps.
