@@ -16,7 +16,6 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
-import shutil
 import sys
 import tempfile
 import unittest
@@ -315,10 +314,10 @@ class ParseKnownVersionsTests(unittest.TestCase):
         self.assertEqual(sorted(known.values()), list(range(1, len(known) + 1)))
 
     def test_member_without_numeric_value_is_a_hard_error(self):
-        text = REAL_VERSIONS_FILE.read_text(encoding="utf-8").replace(
-            "V0_113_0 = 5,", "V0_113_0,"
-        )
-        path = self._write_versions_file(text)
+        original = REAL_VERSIONS_FILE.read_text(encoding="utf-8")
+        # V0_113_0 = 5 is shipped, so it is in the file forever (the enum is append-only).
+        self.assertIn("V0_113_0 = 5,", original)
+        path = self._write_versions_file(original.replace("V0_113_0 = 5,", "V0_113_0,"))
 
         with self.assertRaises(RuntimeError) as ctx:
             script.parse_known_versions(path)
@@ -404,6 +403,43 @@ class ChangelogMarkerPlacementTests(unittest.TestCase):
 
         self.assertTrue(misplaced)
         self.assertIn("[Unreleased]", stderr.getvalue())
+
+
+class RoundTripTests(unittest.TestCase):
+    """The renderer's output must satisfy the (now stricter) parser, or the NEXT run crashes."""
+
+    def test_written_versions_file_is_reparsable_and_rerun_is_a_no_op(self):
+        repo = FakeRepo()
+
+        code, _, _ = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+        self.assertEqual(0, code)
+
+        known = script.parse_known_versions(repo.versions_file)
+        self.assertEqual(
+            {_semver("0.100.0"): 1, _semver("0.101.0"): 2, _semver("0.102.0"): FakeRepo.NEXT_VALUE},
+            known,
+        )
+
+        # Re-running against the same upstream state must change nothing (the workflow reruns
+        # on the same auto-PR branch).
+        before = repo.versions_text()
+        code, stdout, _ = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+        self.assertEqual(0, code)
+        self.assertIn("No new versions detected", stdout)
+        self.assertEqual(before, repo.versions_text())
+
+    def test_every_auto_generated_region_is_rewritten(self):
+        # A rewrite that updated the enum but not the const/list/switch regions would ship a
+        # version the package cannot resolve at runtime.
+        repo = FakeRepo()
+
+        repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+        text = repo.versions_text()
+
+        self.assertIn("V0_102_0 = 3,", text)
+        self.assertIn('public const string V0_102_0 = "0.102.0";', text)
+        self.assertIn("        V0_102_0,", text)
+        self.assertIn("DocumentDBVersion.V0_102_0 => V0_102_0,", text)
 
 
 if __name__ == "__main__":

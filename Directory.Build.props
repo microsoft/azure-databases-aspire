@@ -14,7 +14,12 @@
     <DebugSymbols>true</DebugSymbols>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <UsePublicApiAnalyzers>true</UsePublicApiAnalyzers>
+    <!--
+      The public API baseline at src/Aspire.Hosting.DocumentDB/api/ is NOT enforced by an
+      analyzer (no PublicApiAnalyzers package is referenced, and the folder is excluded from
+      compilation). It is enforced by the unit test
+      VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember.
+    -->
     <SharedDir>$(MSBuildThisFileDirectory)/src/Shared/</SharedDir>
 
     <!-- Issue: https://github.com/dotnet/aspire/issues/8488 -->

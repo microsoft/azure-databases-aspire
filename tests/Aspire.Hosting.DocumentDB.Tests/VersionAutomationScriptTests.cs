@@ -216,6 +216,28 @@ public class VersionAutomationScriptTests
     }
 
     [Fact]
+    public void DocsQuoteTheCurrentDefaultImageTag()
+    {
+        // Two documentation spots state the *current* default tag as a fact rather than as a
+        // formula, so they silently go stale on every version adoption (both did before this
+        // branch). Everything else that mentions an older tag - the WithPostgresEndpoint 0.112.0
+        // floor examples, historical CHANGELOG entries - is intentionally version-specific and
+        // deliberately not covered here.
+        var defaultTag = DocumentDBContainerImageTags.Tag;
+
+        var defaultsRow = ReadRepoFile("docs", "configuration.md")
+            .Split('\n')
+            .FirstOrDefault(line => line.TrimStart().StartsWith("| Image tag |", StringComparison.Ordinal));
+        Assert.True(defaultsRow is not null, "Could not find the \"| Image tag |\" defaults row in docs/configuration.md.");
+        Assert.True(defaultsRow!.Contains(defaultTag, StringComparison.Ordinal),
+            $"The defaults table in docs/configuration.md does not quote the current default tag '{defaultTag}': {defaultsRow.Trim()}");
+
+        var troubleshooting = ReadRepoFile("docs", "troubleshooting.md");
+        Assert.True(troubleshooting.Contains($"documentdb-local:{defaultTag}", StringComparison.Ordinal),
+            $"The 'docker pull' example in docs/troubleshooting.md does not use the current default tag '{defaultTag}'.");
+    }
+
+    [Fact]
     public void ApiBaselineListsEveryPublicEnumMember()
     {
         // The version-detection workflow appends members to DocumentDBVersion.cs but deliberately

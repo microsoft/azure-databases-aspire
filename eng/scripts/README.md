@@ -81,6 +81,22 @@ explicit `pg17-X.Y.Z` tag because it gates the NuGet publish workflow; bump that
 adopting a new DocumentDB version (`VersionAutomationScriptTests.PostgresEndToEndAppPinsTheCurrentLatestVersion`
 fails until you do).
 
+### Adopting a new DocumentDB version
+
+The script opens the auto-PR with `DocumentDBVersion.cs` and the CHANGELOG block already
+rewritten. The rest is deliberately manual, and CI stays red until it is done:
+
+| Place | Guard |
+|---|---|
+| Public API baseline `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` (new enum member + string constant) | `VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` |
+| `WithImageTag("pgNN-X.Y.Z")` pin in `tests/Aspire.Hosting.DocumentDB.PostgresEndToEndApp/Program.cs`, plus the comments quoting it in `DocumentDBIntegrationTests.cs` | `VersionAutomationScriptTests.PostgresEndToEndAppPinsTheCurrentLatestVersion` |
+| `\| Image tag \|` row in `docs/configuration.md` and the `docker pull` example in `docs/troubleshooting.md` | `VersionAutomationScriptTests.DocsQuoteTheCurrentDefaultImageTag` |
+| Release notes: move the generated block's content into a dated `## [X.Y.Z]` section when you cut the package release | none — editorial |
+| Optional: an `InlineData` case in `DocumentDBVersionSelectionTests.WithDocumentDBVersionAloneSetsExpectedTag` | none — the drift guard in that file already covers correctness |
+
+Deliberately NOT updated per version: the `0.112.0` floor in `DocumentDBContainerImageTags.MinimumPostgresEndpointVersion`
+and the doc examples explaining it.
+
 ### Trust assumption
 
 GHCR tags are mutable. "Version supported" here means "tag exists at the time of the check",
