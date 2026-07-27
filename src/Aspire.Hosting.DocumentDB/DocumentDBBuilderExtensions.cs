@@ -802,9 +802,18 @@ public static class DocumentDBBuilderExtensions
 
     /// <summary>
     /// Enables TLS for the DocumentDB connection string. TLS is enabled by default
-    /// because the DocumentDB Local container requires TLS connections.
+    /// because the DocumentDB Local container serves TLS on its gateway port using a
+    /// self-signed certificate.
     /// Call <c>UseTls(false)</c> to disable TLS if connecting to a non-TLS endpoint.
     /// </summary>
+    /// <remarks>
+    /// From DocumentDB <c>0.114.0</c> the container's default <c>TLS_MODE=allowTLS</c> accepts
+    /// both plain and TLS connections, so <c>UseTls(false)</c> works against the default image.
+    /// Container images up to and including <c>0.113.0</c> rejected plain connections regardless
+    /// of that setting. Set <c>.WithEnvironment("TLS_MODE", "requireTLS")</c> to make the
+    /// container reject plain connections; combining that with <c>UseTls(false)</c> is
+    /// self-contradictory and connections will fail.
+    /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="useTls">Whether to enable TLS. Defaults to <see langword="true"/>.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>

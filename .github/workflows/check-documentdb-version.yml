@@ -8,12 +8,14 @@ name: Check DocumentDB Versions
 #      auto-generated block in CHANGELOG.md (replace-in-place).
 #   2. The workflow commits and pushes to the `auto/documentdb-versions-update` branch,
 #      then prints a link for the maintainer to open the PR.
-#   3. CI on that PR will FAIL because the public API analyzer baseline at
-#      src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs has not been updated.
+#   3. CI on that PR will FAIL, because the public API baseline at
+#      src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs has not been updated:
+#      the unit test VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember
+#      asserts that every DocumentDBVersion / DocumentDBPostgresVersion member appears there.
 #      THIS IS BY DESIGN: the maintainer reviewing the PR appends the new
-#      DocumentDBVersion.V0_X_Y enum members to that file by hand and pushes a follow-up
-#      commit. This preserves the analyzer as an independent guard against unintentional
-#      public API changes.
+#      DocumentDBVersion.V0_X_Y enum members (and their string constants) to that file by hand
+#      and pushes a follow-up commit. This keeps the baseline an independent, human-reviewed
+#      record of public API changes.
 #
 # PR creation: The microsoft org restricts GITHUB_TOKEN from creating PRs, so
 # this workflow pushes the branch and prints a link for the maintainer to open
@@ -48,9 +50,6 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
-      - name: Script self-tests
-        run: python3 -m unittest discover -s eng/scripts/tests
 
       - name: Detect new DocumentDB versions
         id: detect
