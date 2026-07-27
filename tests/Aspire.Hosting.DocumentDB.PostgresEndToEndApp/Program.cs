@@ -11,12 +11,13 @@ public class Program
     {
         var builder = DistributedApplication.CreateBuilder(args);
 
-        // Pin to pg17-0.112.0 explicitly so this AppHost does not depend on
-        // DocumentDBVersions.Latest being bumped to >= 0.112.0 (tracked by issue
-        // #70). The v0.112-0 floor is enforced by WithPostgresEndpoint() itself;
-        // see https://github.com/microsoft/azure-databases-aspire/issues/71.
+        // Pinned deliberately: this end-to-end app gates the NuGet publish workflow, so it must
+        // run against a deterministic, known-good tag instead of floating on
+        // DocumentDBVersions.Latest (a mutable GHCR tag). Bump this pin as part of adopting each
+        // new DocumentDB version. The v0.112-0 floor is enforced by WithPostgresEndpoint()
+        // itself; see https://github.com/microsoft/azure-databases-aspire/issues/71.
         builder.AddDocumentDB("documentdb")
-            .WithImageTag("pg17-0.112.0")
+            .WithImageTag("pg17-0.114.0")
             .WithPostgresEndpoint();
 
         var app = builder.Build();

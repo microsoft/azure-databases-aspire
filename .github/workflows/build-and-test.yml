@@ -35,6 +35,21 @@ jobs:
       - name: Unit Tests
         run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build --filter "Category=Unit"
 
+  script-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Version-automation script tests
+        run: python3 -m unittest discover -s eng/scripts/tests -v
+
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 30

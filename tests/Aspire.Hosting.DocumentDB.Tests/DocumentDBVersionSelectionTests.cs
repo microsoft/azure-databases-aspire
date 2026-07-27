@@ -31,6 +31,8 @@ public class DocumentDBVersionSelectionTests
     [InlineData(DocumentDBVersion.V0_110_0, "pg17-0.110.0")]
     [InlineData(DocumentDBVersion.V0_111_0, "pg17-0.111.0")]
     [InlineData(DocumentDBVersion.V0_112_0, "pg17-0.112.0")]
+    [InlineData(DocumentDBVersion.V0_113_0, "pg17-0.113.0")]
+    [InlineData(DocumentDBVersion.V0_114_0, "pg17-0.114.0")]
     public void WithDocumentDBVersionAloneSetsExpectedTag(DocumentDBVersion version, string expectedTag)
     {
         var appBuilder = DistributedApplication.CreateBuilder();
@@ -299,7 +301,7 @@ public class DocumentDBVersionSelectionTests
     public void WithPostgresVersionRejectsZero()
     {
         // The default(DocumentDBPostgresVersion) value is 0, which is not a defined member
-        // (Pg15, Pg16, Pg17 use explicit numeric values 15/16/17).
+        // (every member uses an explicit numeric value equal to its PostgreSQL major version).
         var appBuilder = DistributedApplication.CreateBuilder();
         var resourceBuilder = appBuilder.AddDocumentDB("documentdb");
 

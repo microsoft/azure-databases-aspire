@@ -270,7 +270,7 @@ var server = builder.AddDocumentDB("documentdb")
 
 ## UseTls
 
-Controls whether TLS is included in the generated connection string. TLS is **enabled by default** because the DocumentDB Local container requires TLS connections.
+Controls whether TLS is included in the generated connection string. TLS is **enabled by default** because the DocumentDB Local container serves TLS on its gateway port.
 
 ```csharp
 // Disable TLS (for example, connecting to a non-TLS endpoint)
@@ -285,6 +285,19 @@ var server = builder.AddDocumentDB("documentdb")
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `useTls` | `bool` | `true` | Whether to add `tls=true` to the connection string. |
+
+> [!NOTE]
+> **Container TLS enforcement changed in DocumentDB `0.114.0`.** In container images up to and including `0.113.0`, the gateway always enforced TLS and rejected plain (non-TLS) connections regardless of the documented `TLS_MODE` setting, so `UseTls(false)` produced a connection string the container would refuse. From `0.114.0` the container honors `TLS_MODE`, whose default value `allowTLS` accepts **both** plain and TLS connections — so `UseTls(false)` now works against the default container.
+
+To make the container *reject* plain connections, set the `TLS_MODE` environment variable (there is no dedicated API for this):
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithEnvironment("TLS_MODE", "requireTLS");
+```
+
+> [!WARNING]
+> Combining `.WithEnvironment("TLS_MODE", "requireTLS")` with `UseTls(false)` is self-contradictory: the generated connection string omits `tls=true` while the container rejects plain connections, so health checks and client connections will fail. `TLS_MODE=disabled` behaves identically to `allowTLS` — the gateway has no plain-only mode — and the container entrypoint prints a warning when it is used. The value is case-sensitive and must be exactly `allowTLS`, `requireTLS`, or `disabled`; the entrypoint exits with an error on anything else (for example `requiretls`), so the container fails at startup.
 
 ## AllowInsecureTls
 
@@ -329,7 +342,7 @@ var server = builder.AddDocumentDB("documentdb")
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`. |
+| `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`, `Pg18`. `Pg18` images are available upstream from DocumentDB `0.114.0` onwards; pairing `Pg18` with an older `DocumentDBVersion` throws at startup rather than failing the container pull with an opaque manifest error. |
 
 ## WithPostgresEndpoint
 
@@ -418,14 +431,14 @@ The supplied `userName`/`password` (default `admin` + auto-generated) are usable
 
 ## Supported versions
 
-The `DocumentDBVersion` enum is the **curated, append-only** list of versions known to this build of the package. New entries are added by the `check-documentdb-version` GitHub Actions workflow only when the version is published as a non-prerelease GitHub Release on [`documentdb/documentdb`](https://github.com/documentdb/documentdb/releases) AND the `pg15-X.Y.Z`, `pg16-X.Y.Z`, and `pg17-X.Y.Z` container tags all exist on GHCR. Existing entries are never renamed, removed, or renumbered.
+The `DocumentDBVersion` enum is the **curated, append-only** list of versions known to this build of the package. New entries are added by the `check-documentdb-version` GitHub Actions workflow only when the version is published as a non-prerelease GitHub Release on [`documentdb/documentdb`](https://github.com/documentdb/documentdb/releases) AND the `pg15-X.Y.Z`, `pg16-X.Y.Z`, `pg17-X.Y.Z`, and `pg18-X.Y.Z` container tags all exist on GHCR. Existing entries are never renamed, removed, or renumbered.
 
 You can enumerate the full list at runtime via `DocumentDBVersions.All`, and read the newest version known to the current package build via `DocumentDBVersions.Latest` (a property, not a `const`, so it is re-resolved after a package upgrade rather than inlined).
 
 | Symbol | Notes |
 |---|---|
 | `enum DocumentDBVersion` | Curated members like `V0_109_0`, `V0_110_0`, `V0_111_0`. Stable forever once shipped. |
-| `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`. Default `Pg17`. |
+| `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`, `Pg18`. Default `Pg17`. `Pg18` requires DocumentDB `0.114.0` or newer — enforced at startup, so an unpublished combination fails with an actionable message. |
 | `DocumentDBVersions.All` | All known version strings, ascending semver. |
 | `DocumentDBVersions.Latest` | The newest version known to *this build* of the package. |
 
@@ -481,7 +494,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.112.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.114.0`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |

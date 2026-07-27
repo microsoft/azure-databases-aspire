@@ -86,7 +86,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |
 | `.WithDocumentDBVersion(version)` | Pin a curated DocumentDB version (default: latest known to this build) |
-| `.WithPostgresVersion(pgVersion)` | Choose PG15/16/17 backend variant (default: Pg17) |
+| `.WithPostgresVersion(pgVersion)` | Choose PG15/16/17/18 backend variant (default: Pg17) |
 
 ### Additional container configuration
 

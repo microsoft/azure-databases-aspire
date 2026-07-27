@@ -127,7 +127,74 @@ public static class DocumentDBBuilderExtensions
                 context.EnvironmentVariables[UserEnvVarName] = DocumentDBContainer.UserNameReference;
                 context.EnvironmentVariables[PasswordEnvVarName] = DocumentDBContainer.PasswordParameter!;
             })
-            .WithHealthCheck(healthCheckKey);
+            .WithHealthCheck(healthCheckKey)
+            .SubscribeMinimumPgVariantImageGuard();
+    }
+
+    /// <summary>
+    /// Subscribes a <see cref="BeforeResourceStartedEvent"/> handler that throws
+    /// <see cref="InvalidOperationException"/> when the resource's effective image tag names a
+    /// PostgreSQL backend variant upstream does not publish for that DocumentDB version — see
+    /// <see cref="DocumentDBContainerImageTags.MinimumVersionByPgVariant"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Subscribed from <c>AddDocumentDB</c> rather than from <see cref="WithPostgresVersion"/>,
+    /// because neither half of the tag is a problem on its own and the documented precedence is
+    /// "last call wins": selecting <c>Pg18</c> before <c>V0_114_0</c> is perfectly legitimate,
+    /// so only the effective tag at start time can be judged.
+    /// </para>
+    /// <para>
+    /// Same carve-outs as <see cref="SubscribeMinimumPostgresImageGuard"/>: custom images and
+    /// tags outside the strict <c>pg{NN}-X.Y.Z</c> grammar are exempt, and the guard is run-mode
+    /// only, so manifest generation is unaffected. Unlike that guard this one is always
+    /// subscribed, so the exempt paths stay silent rather than warning on every app that pins a
+    /// custom image.
+    /// </para>
+    /// </remarks>
+    private static IResourceBuilder<DocumentDBServerResource> SubscribeMinimumPgVariantImageGuard(
+        this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(
+            builder.Resource,
+            (evt, ct) =>
+            {
+                var imageAnnotation = evt.Resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
+                if (imageAnnotation is null)
+                {
+                    // Defensive: AddDocumentDB sets ContainerImageAnnotation eagerly via WithImage.
+                    return Task.CompletedTask;
+                }
+
+                // A fork publishing its own images decides its own variant matrix.
+                if (!string.Equals(imageAnnotation.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
+                {
+                    return Task.CompletedTask;
+                }
+
+                if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(imageAnnotation.Tag, out var pg, out var docVersion))
+                {
+                    return Task.CompletedTask;
+                }
+
+                if (!DocumentDBContainerImageTags.MinimumVersionByPgVariant.TryGetValue(pg, out var minimum) ||
+                    docVersion >= minimum)
+                {
+                    return Task.CompletedTask;
+                }
+
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{evt.Resource.Name}' resolves to image tag " +
+                    $"'{imageAnnotation.Tag}', but upstream only publishes pg{pg} images from " +
+                    $"DocumentDB v{minimum} onwards. That tag does not exist on " +
+                    $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}, " +
+                    $"so starting the resource would fail with an opaque manifest-not-found error. " +
+                    $"Recovery: pair '.WithPostgresVersion(DocumentDBPostgresVersion.Pg{pg})' with " +
+                    $"DocumentDB v{minimum} or newer, or choose a PostgreSQL variant that exists " +
+                    $"for v{docVersion}.");
+            });
+
+        return builder;
     }
 
     /// <summary>
@@ -802,9 +869,18 @@ public static class DocumentDBBuilderExtensions
 
     /// <summary>
     /// Enables TLS for the DocumentDB connection string. TLS is enabled by default
-    /// because the DocumentDB Local container requires TLS connections.
+    /// because the DocumentDB Local container serves TLS on its gateway port using a
+    /// self-signed certificate.
     /// Call <c>UseTls(false)</c> to disable TLS if connecting to a non-TLS endpoint.
     /// </summary>
+    /// <remarks>
+    /// From DocumentDB <c>0.114.0</c> the container's default <c>TLS_MODE=allowTLS</c> accepts
+    /// both plain and TLS connections, so <c>UseTls(false)</c> works against the default image.
+    /// Container images up to and including <c>0.113.0</c> rejected plain connections regardless
+    /// of that setting. Set <c>.WithEnvironment("TLS_MODE", "requireTLS")</c> to make the
+    /// container reject plain connections; combining that with <c>UseTls(false)</c> is
+    /// self-contradictory and connections will fail.
+    /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="useTls">Whether to enable TLS. Defaults to <see langword="true"/>.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>

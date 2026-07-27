@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- Pairing `WithPostgresVersion(DocumentDBPostgresVersion.Pg18)` with a DocumentDB version older than `0.114.0` now fails at startup with an actionable message naming the recovery, instead of failing the container pull with an opaque manifest-not-found error. Upstream only publishes `pg18-` images from `0.114.0` onwards, so every older pairing produces a well-formed tag that does not exist. Custom images and tags outside the `pg{NN}-X.Y.Z` grammar are exempt, and manifest generation is unaffected.
+
+### Fixed
+- Corrected the `UseTls` XML documentation (and the Markdown docs) that claimed the DocumentDB Local container *requires* TLS connections. From DocumentDB `0.114.0` the container's default `TLS_MODE=allowTLS` accepts both plain and TLS connections, so `UseTls(false)` now works against the default image; images up to `0.113.0` rejected plain connections regardless of that setting. Documented `.WithEnvironment("TLS_MODE", "requireTLS")` as the way to reject plain connections, including that it contradicts `UseTls(false)` and that the value is case-sensitive.
+
+<!-- auto-generated:documentdb-versions-start -->
+_No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
+<!-- auto-generated:documentdb-versions-end -->
+
 ## [0.114.0] - 2026-07-20
 
 ### Added
@@ -46,12 +56,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Fixed
 - Default data volume path changed from `/home/documentdb/postgresql/data` to `/data` to match the DocumentDB Local container default ([documentdb/documentdb#556](https://github.com/documentdb/documentdb/issues/556))
 - `WithPostgresEndpoint()` now validates the effective container image tag at startup (via `BeforeResourceStartedEvent`) and throws `InvalidOperationException` if the tag is older than `pg{NN}-0.112.0`, preventing the previously silent PostgreSQL authentication failure caused by the legacy `docdb_admin`/`Admin100` admin role in pre-v0.112-0 `documentdb-local` images. Custom images and unknown tag patterns are exempt with a warning. ([#71](https://github.com/microsoft/azure-databases-aspire/issues/71))
-
-<!-- auto-generated:documentdb-versions-start -->
-### Added (auto-detected upstream DocumentDB versions)
-
-- DocumentDB `0.114.0` upstream release detected on 2026-07-20 (container tags `pg15-0.114.0`, `pg16-0.114.0`, `pg17-0.114.0`).
-<!-- auto-generated:documentdb-versions-end -->
 
 ## [0.110.0] - 2026-05-12
 

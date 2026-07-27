@@ -1373,15 +1373,15 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithPostgresEndpointDefaultTagThrowsUntilLatestReachesV0_112_0()
+    public async Task WithPostgresEndpointDefaultTagStartsOnceLatestMeetsFloor()
     {
-        // Documents the intentional behavior described in issue #71's docs callout:
-        // when DocumentDBVersions.Latest is < 0.112.0, AddDocumentDB().WithPostgresEndpoint()
-        // (no explicit tag override) will throw at startup. This is the whole point of
-        // the issue - converting a silent auth failure into a loud one. Once issue #70
-        // bumps Latest to >= 0.112.0, this test's branch becomes the "no-throw" path.
-        var latestParsed = Version.Parse(DocumentDBVersions.Latest);
-        var floor = DocumentDBContainerImageTags.MinimumPostgresEndpointVersion;
+        // The WithPostgresEndpoint() guard (issue #71) rejects container tags older than
+        // MinimumPostgresEndpointVersion, converting a silent PostgreSQL auth failure into a
+        // loud one. DocumentDBVersions.Latest is now at or above that floor, so the default
+        // flow - AddDocumentDB().WithPostgresEndpoint() with no explicit tag - must start
+        // cleanly. If a future Latest ever regressed below the floor, this test would fail,
+        // which is the intent.
+        Assert.True(Version.Parse(DocumentDBVersions.Latest) >= DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
 
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
@@ -1390,18 +1390,7 @@ public class AddDocumentDBTests
         using var app = appBuilder.Build();
         var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
 
-        if (latestParsed < floor)
-        {
-            // Current branch: Latest is 0.111.0, guard throws.
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => PublishBeforeResourceStartedAsync(app, resource));
-            Assert.Contains($"pg17-{DocumentDBVersions.Latest}", ex.Message);
-        }
-        else
-        {
-            // After #70 lands: Latest is >= 0.112.0, default flow succeeds.
-            await PublishBeforeResourceStartedAsync(app, resource);
-        }
+        await PublishBeforeResourceStartedAsync(app, resource);
     }
 
     [Fact]
@@ -1442,6 +1431,124 @@ public class AddDocumentDBTests
 
         // Must NOT throw - the final tag is >= floor.
         await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    // ---------------------------------------------------------------------
+    // PG-variant availability floor (pg18 exists upstream only from 0.114.0)
+    //
+    // Every DocumentDBVersion x DocumentDBPostgresVersion pair produces a
+    // well-formed pg{NN}-X.Y.Z tag, but not every pair exists on GHCR. Same
+    // BeforeResourceStartedEvent mechanism as the WithPostgresEndpoint floor
+    // above, because only the effective tag at start time can be judged:
+    // "last call wins" means selecting Pg18 before V0_114_0 is legitimate.
+    // ---------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("pg18-0.113.0")]
+    [InlineData("pg18-0.112.0")]
+    [InlineData("pg18-0.100.0")]
+    public async Task Pg18WithADocumentDBVersionBelowV0_114_0Throws(string tag)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(tag);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains(tag, ex.Message);
+        Assert.Contains("pg18", ex.Message);
+        Assert.Contains("0.114.0", ex.Message);
+    }
+
+    [Fact]
+    public async Task Pg18ViaStronglyTypedSelectorsBelowV0_114_0Throws()
+    {
+        // The combination the strongly-typed API makes easiest to reach: neither call is wrong
+        // on its own, and the resulting tag has never existed on GHCR.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresVersion(DocumentDBPostgresVersion.Pg18)
+            .WithDocumentDBVersion(DocumentDBVersion.V0_113_0);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("pg18-0.113.0", ex.Message);
+        Assert.Contains("WithPostgresVersion", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("pg18-0.114.0")]
+    [InlineData("pg18-1.0.0")]
+    [InlineData("pg17-0.109.0")]
+    [InlineData("pg15-0.100.0")]
+    public async Task PgVariantFloorAllowsPublishedCombinations(string tag)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(tag);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorHonoursLastCallWins()
+    {
+        // Pg18 selected before the version that publishes it must NOT throw: the guard reads the
+        // effective ContainerImageAnnotation at event time, not at WithPostgresVersion() time.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresVersion(DocumentDBPostgresVersion.Pg18)
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Theory]
+    [InlineData("nightly")]
+    [InlineData("pg18-0.113.0-rc.1")]
+    public async Task PgVariantFloorIsNotEnforcedOnUnrecognisedTags(string tag)
+    {
+        // Consistent with the WithPostgresEndpoint floor: a caller pinning a pre-release or a
+        // custom build is not surprised by an unactionable hard failure.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(tag);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorIsNotEnforcedOnCustomImages()
+    {
+        // A fork publishing its own images decides its own variant matrix — and, unlike the
+        // WithPostgresEndpoint guard, this one is always subscribed, so it must stay silent
+        // rather than warn on every app that pins a custom image.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB").WithImage("forks/my-build", "pg18-0.110.0");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
 
     private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)

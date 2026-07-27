@@ -55,7 +55,7 @@ public enum DocumentDBVersion
 /// <remarks>
 /// Upstream publishes the same DocumentDB version against multiple PostgreSQL backend versions.
 /// Use with <see cref="Aspire.Hosting.DocumentDBBuilderExtensions.WithPostgresVersion"/> to select
-/// a non-default backend. Adding new variants (for example <c>Pg18</c>) is intentionally a manual
+/// a non-default backend. Adding new variants (a future <c>Pg19</c>, say) is intentionally a manual
 /// code change that requires review.
 /// </remarks>
 public enum DocumentDBPostgresVersion
