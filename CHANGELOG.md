@@ -10,9 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Corrected the `UseTls` XML documentation (and the Markdown docs) that claimed the DocumentDB Local container *requires* TLS connections. From DocumentDB `0.114.0` the container's default `TLS_MODE=allowTLS` accepts both plain and TLS connections, so `UseTls(false)` now works against the default image; images up to `0.113.0` rejected plain connections regardless of that setting. Documented `.WithEnvironment("TLS_MODE", "requireTLS")` as the way to reject plain connections, including that it contradicts `UseTls(false)` and that the value is case-sensitive.
 
 <!-- auto-generated:documentdb-versions-start -->
-### Added (auto-detected upstream DocumentDB versions)
-
-- DocumentDB `0.114.0` upstream release detected on 2026-07-20 (container tags `pg15-0.114.0`, `pg16-0.114.0`, `pg17-0.114.0`, `pg18-0.114.0`).
+_No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
 ## [0.114.0] - 2026-07-20
