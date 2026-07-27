@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- Pairing `WithPostgresVersion(DocumentDBPostgresVersion.Pg18)` with a DocumentDB version older than `0.114.0` now fails at startup with an actionable message naming the recovery, instead of failing the container pull with an opaque manifest-not-found error. Upstream only publishes `pg18-` images from `0.114.0` onwards, so every older pairing produces a well-formed tag that does not exist. Custom images and tags outside the `pg{NN}-X.Y.Z` grammar are exempt, and manifest generation is unaffected.
+
 ### Fixed
 - Corrected the `UseTls` XML documentation (and the Markdown docs) that claimed the DocumentDB Local container *requires* TLS connections. From DocumentDB `0.114.0` the container's default `TLS_MODE=allowTLS` accepts both plain and TLS connections, so `UseTls(false)` now works against the default image; images up to `0.113.0` rejected plain connections regardless of that setting. Documented `.WithEnvironment("TLS_MODE", "requireTLS")` as the way to reject plain connections, including that it contradicts `UseTls(false)` and that the value is case-sensitive.
 

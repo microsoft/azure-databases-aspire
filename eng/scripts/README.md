@@ -10,8 +10,10 @@ Detects new upstream DocumentDB releases and rewrites
 `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` — that file is the public API
 baseline and must be updated by hand on the auto-PR before merging, so it stays an independent,
 human-reviewed record of public-API changes. The unit test
-`VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` enforces this: CI fails on
-the auto-PR until every new enum member (and its string constant) is present in the baseline.
+`VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` enforces this for the
+generated surface: CI fails on the auto-PR until every new enum member (and its string constant)
+is present in the baseline. It checks nothing else — no analyzer compares the rest of the
+baseline, so any other public-API change relies on PR review.
 
 ### Usage
 
@@ -44,17 +46,28 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
    re-renders the entire enum so values for existing members never change.
 5. The CHANGELOG block is **replace-in-place** (bounded by HTML comments) so reruns on the
    same auto-PR branch don't accumulate duplicate entries. It lives at the end of the
-   `## [Unreleased]` section of `CHANGELOG.md`; the script warns if the markers have drifted
-   into an already-released section, or if there is no `## [Unreleased]` heading at all (a
-   release cut renames it), because regenerated notes would then be filed under the wrong
-   release.
+   `## [Unreleased]` section of `CHANGELOG.md`. **Every** run checks the placement — not just
+   runs that adopt something, because the failure this catches (a release cut renames the
+   heading and does not re-add it) is followed by weeks of no-op runs — and warns if the markers
+   have drifted into an already-released section or if there is no `## [Unreleased]` heading at
+   all. While the markers are misplaced the script refuses to adopt anything and exits non-zero,
+   rather than filing regenerated notes under an already-released version.
 6. A candidate **older** than the newest already-shipped version ("backfill") is skipped with a
    warning instead of adopted, because numeric enum values must never shift. Newer candidates in
-   the same run are still adopted, so one backfill candidate cannot wedge adoption forever.
-7. A released version newer than the newest shipped one that cannot be adopted is reported as
-   `[warn] X.Y.Z blocked: ...` — both when it is missing a required variant and when it has no
-   container tags at all (the common case: the GitHub release lands before the image build
-   finishes). Stalled adoption is therefore never silent.
+   the same run are still adopted, so one backfill candidate cannot wedge adoption forever. Once
+   the decision not to backfill is final, list the version in `ACKNOWLEDGED_SKIPS` to stop the
+   weekly warning; it is the version-level analogue of `DEFERRED_PG_SET`.
+7. Every released version **at or above the oldest curated one** that is not in the list is
+   reported, so stalled adoption is never silent: `[warn] X.Y.Z blocked: ...` when it is missing
+   a required variant or has no container tags at all (the common case — the GitHub release
+   lands before the image build finishes), and `[warn] skipping backfill candidate(s) ...` when
+   a newer adoption has leapfrogged it. Filtering on "newer than the newest shipped version"
+   instead would drop that second case exactly when the stall becomes permanent. Releases below
+   the oldest curated version were never candidates and are not reported. An **empty
+   intersection** is reported as well: both fetches return an empty result rather than raising
+   when the GHCR tag list or the release feed changes shape, and `REQUIRED_PG_SET` is narrow
+   enough that only a handful of releases clear it, so "nothing matched at all" is as likely to
+   be a broken detector as a quiet week.
 8. Parsing is fail-fast: a line the script cannot parse in the enum or string-constant region is
    a hard error rather than a silent partial rewrite. The append-only check runs against the
    **rendered text**, re-parsed just before it would be written, so a rendering or
@@ -65,9 +78,11 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
    parsed and re-emitted verbatim in the enum and string-constant regions, so regenerating never
    strips them. See [Retiring a version](#retiring-a-version).
 10. Every warning that means "a candidate exists upstream but was not adopted" (blocked version,
-    skipped backfill, misplaced CHANGELOG markers) is also emitted as a GitHub Actions
-    `::warning` annotation. The script exits 0 in all of those cases by design, so without the
-    annotation a stalled weekly run looks exactly like a run with nothing to do.
+    skipped backfill, empty intersection, misplaced CHANGELOG markers) is also emitted as a
+    GitHub Actions `::warning` annotation. The script exits 0 in all of those cases by design, so
+    without the annotation a stalled weekly run looks exactly like a run with nothing to do. The
+    one case that exits non-zero — refusing to adopt while the CHANGELOG markers are misplaced —
+    annotates as `::error`.
 
 ### Adding a PG variant
 
@@ -79,10 +94,12 @@ the Guard column names a test, that test fails until you do — the rows marked 
 | `DocumentDBPostgresVersion` in `src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs` (append-only; numeric value is the PG major) | compile-time |
 | `WithPostgresVersion` validation message in `src/Aspire.Hosting.DocumentDB/DocumentDBBuilderExtensions.cs` | none — check by hand |
 | Public API baseline `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` | `VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` |
-| `REQUIRED_PG_SET` here in the script — or `DEFERRED_PG_SET` if upstream has not published the tag for every version you intend to adopt yet — and the matching docstring line | `VersionAutomationScriptTests.EveryPgVariantIsRequiredOrExplicitlyDeferred`, `RequiredPgSetIsASubsetOfDocumentDBPostgresVersion`, `ScriptDocstringListsTheSameRequiredPgSet` |
+| `REQUIRED_PG_SET` here in the script — or `DEFERRED_PG_SET` if upstream has not published the tag for every version you intend to adopt yet — and the matching docstring line | `VersionAutomationScriptTests.EveryPgVariantIsRequiredOrExplicitlyDeferred`, `RequiredPgSetIsASubsetOfDocumentDBPostgresVersion`, `ProseRestatementsOfRequiredPgSetMatchTheConstant` |
+| The `` `{15, 16, 17, 18}` `` restatement in [Output rules](#output-rules) above | `ProseRestatementsOfRequiredPgSetMatchTheConstant` |
 | The expected set in `eng/scripts/tests/test_check_documentdb_versions.py` (`RequiredPgSetTests`) | itself |
 | `PG15/16/17/18` lists in `README.md` and `src/Aspire.Hosting.DocumentDB/README.md`; the `pgVersion` and `enum DocumentDBPostgresVersion` rows in `docs/configuration.md` | `ReadmeApiTableListsEverySelectablePgVariant`, `ConfigurationDocRowsListEverySelectablePgVariant` |
-| The `pgNN-X.Y.Z` adoption-policy sentences in this file and `docs/configuration.md` | `AdoptionPolicyDocsMentionEveryRequiredPgVariant` |
+| The `pgNN-X.Y.Z` adoption-policy sentences in this file and `docs/configuration.md` | `AdoptionPolicyDocsListExactlyTheRequiredPgVariants` |
+| A version floor in `DocumentDBContainerImageTags.MinimumVersionByPgVariant`, if upstream only publishes the variant from some release onwards | none — add it, or every older `DocumentDBVersion` pairing produces a tag that does not exist |
 | Tag-prefix theory case in `tests/Aspire.Hosting.DocumentDB.Tests/DocumentDBVersionSelectionTests.cs` | none — add the `InlineData` |
 
 Note that `REQUIRED_PG_SET` is the *adoption gate*, not the list of selectable variants: it may
@@ -107,7 +124,7 @@ rewritten. The rest is deliberately manual, and CI stays red until it is done:
 | `WithImageTag("pgNN-X.Y.Z")` pin in `tests/Aspire.Hosting.DocumentDB.PostgresEndToEndApp/Program.cs`, plus the comments quoting it in `DocumentDBIntegrationTests.cs` | `VersionAutomationScriptTests.PostgresEndToEndAppPinsTheCurrentLatestVersion` |
 | `\| Image tag \|` row in `docs/configuration.md` and the `docker pull` example in `docs/troubleshooting.md` | `VersionAutomationScriptTests.DocsQuoteTheCurrentDefaultImageTag` |
 | Release notes: move the generated block's content into a dated `## [X.Y.Z]` section when you cut the package release, and reset the block body to its "nothing detected" placeholder line | `test_unreleased_block_does_not_restate_an_already_released_version` (Python suite) — a version left in both places fails it |
-| Release cut: keep a `## [Unreleased]` heading above the markers after renaming the old one | none directly; the next detection run warns and annotates |
+| Release cut: keep a `## [Unreleased]` heading above the markers after renaming the old one | `test_repo_changelog_markers_live_in_the_unreleased_section` (Python suite); every detection run also warns, annotates, and refuses to adopt until it is fixed |
 | Optional: an `InlineData` case in `DocumentDBVersionSelectionTests.WithDocumentDBVersionAloneSetsExpectedTag` | none — the drift guard in that file already covers correctness |
 
 Deliberately NOT updated per version: the `0.112.0` floor in `DocumentDBContainerImageTags.MinimumPostgresEndpointVersion`
@@ -128,7 +145,10 @@ Two caveats:
 - The `All` array and the `ToVersionString` switch still reference the obsoleted member, which
   raises `CS0618`. Put `#pragma warning disable CS0618` / `restore` around the whole
   `All` property and the whole `ToVersionString` method — **outside** the auto-generated markers.
-  Anything placed inside a marker block is discarded on the next rewrite.
+  Inside the `All` and `ToVersionString` marker blocks anything you add is silently discarded on
+  the next rewrite; inside the **enum** and **string-constant** blocks it is worse than that —
+  the parser only accepts member lines and single-line attributes, so a stray `#pragma` there is
+  a hard error that aborts the whole detection run until someone removes it.
 
 ### Trust assumption
 
@@ -137,10 +157,12 @@ not "image bytes are immutable". Pinning by digest is a future enhancement.
 
 ### Tests
 
-`tests/test_check_documentdb_versions.py` covers `REQUIRED_PG_SET`/`DEFERRED_PG_SET`, the CHANGELOG
-block rewrite and placement guard, backfill/blocked-version handling and their annotations, the
-`[Obsolete]` round-trip, and the fail-fast parse/write guards, by executing the real script
-functions (standard library `unittest` only, no pip dependencies):
+`tests/test_check_documentdb_versions.py` covers `REQUIRED_PG_SET`/`DEFERRED_PG_SET`/
+`ACKNOWLEDGED_SKIPS`, the CHANGELOG block rewrite and placement guard (including that the guard
+runs on a no-op run and blocks adoption while it fires), blocked/leapfrogged/empty-intersection
+reporting and their annotations, the `[Obsolete]` round-trip, and the fail-fast parse/write
+guards, by executing the real script functions (standard library `unittest` only, no pip
+dependencies):
 
 ```bash
 # From the repo root.

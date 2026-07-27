@@ -12,6 +12,8 @@ name: Check DocumentDB Versions
 #      src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs has not been updated:
 #      the unit test VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember
 #      asserts that every DocumentDBVersion / DocumentDBPostgresVersion member appears there.
+#      (That test covers the generated members only - other public-API changes are reviewed by
+#      hand on the PR, with nothing failing if the baseline is stale for those.)
 #      THIS IS BY DESIGN: the maintainer reviewing the PR appends the new
 #      DocumentDBVersion.V0_X_Y enum members (and their string constants) to that file by hand
 #      and pushes a follow-up commit. This keeps the baseline an independent, human-reviewed

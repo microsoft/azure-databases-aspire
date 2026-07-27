@@ -17,8 +17,12 @@
     <!--
       The public API baseline at src/Aspire.Hosting.DocumentDB/api/ is NOT enforced by an
       analyzer (no PublicApiAnalyzers package is referenced, and the folder is excluded from
-      compilation). It is enforced by the unit test
-      VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember.
+      compilation). The only automated check is the unit test
+      VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember, and it covers just the
+      generated surface: every DocumentDBVersion / DocumentDBPostgresVersion member and its
+      string constant. Every OTHER public-API change - a new extension method, a changed
+      signature or default - is reviewed by hand on the PR; nothing fails if the baseline is
+      left stale for those.
     -->
     <SharedDir>$(MSBuildThisFileDirectory)/src/Shared/</SharedDir>
 

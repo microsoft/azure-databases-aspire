@@ -342,7 +342,7 @@ var server = builder.AddDocumentDB("documentdb")
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`, `Pg18`. `Pg18` images are available upstream from DocumentDB `0.114.0` onwards. |
+| `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`, `Pg18`. `Pg18` images are available upstream from DocumentDB `0.114.0` onwards; pairing `Pg18` with an older `DocumentDBVersion` throws at startup rather than failing the container pull with an opaque manifest error. |
 
 ## WithPostgresEndpoint
 
@@ -438,7 +438,7 @@ You can enumerate the full list at runtime via `DocumentDBVersions.All`, and rea
 | Symbol | Notes |
 |---|---|
 | `enum DocumentDBVersion` | Curated members like `V0_109_0`, `V0_110_0`, `V0_111_0`. Stable forever once shipped. |
-| `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`, `Pg18`. Default `Pg17`. `Pg18` requires DocumentDB `0.114.0` or newer. |
+| `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`, `Pg18`. Default `Pg17`. `Pg18` requires DocumentDB `0.114.0` or newer — enforced at startup, so an unpublished combination fails with an actionable message. |
 | `DocumentDBVersions.All` | All known version strings, ascending semver. |
 | `DocumentDBVersions.Latest` | The newest version known to *this build* of the package. |
 

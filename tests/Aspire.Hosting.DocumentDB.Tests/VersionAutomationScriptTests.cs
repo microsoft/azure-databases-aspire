@@ -122,36 +122,59 @@ public class VersionAutomationScriptTests
             "(with a comment) if adoption must not depend on them yet.");
     }
 
-    [Fact]
-    public void ScriptDocstringListsTheSameRequiredPgSet()
+    [Theory]
+    // The script's own docstring: "REQUIRED_PG_SET (currently {15, 16, 17, 18})".
+    [InlineData(@"REQUIRED_PG_SET \(currently \{(?<items>[^}]*)\}\)", "eng", "scripts", "check-documentdb-versions.py")]
+    // eng/scripts/README.md: "the script-level constant `REQUIRED_PG_SET` (currently `{15, 16, 17, 18}`; …".
+    [InlineData(@"`REQUIRED_PG_SET`\s+\(currently\s+`\{(?<items>[^}]*)\}`", "eng", "scripts", "README.md")]
+    public void ProseRestatementsOfRequiredPgSetMatchTheConstant(string pattern, params string[] relativeSegments)
     {
-        var script = ReadScript();
+        // Spelling the set out in prose is exactly the hand-maintained-list drift these guards
+        // exist to catch, so every restatement of it needs a row here — the README copy was
+        // unguarded, and the "Adding a PG variant" table listing guards for the neighbouring
+        // rows made that easy to miss.
+        var text = ReadRepoFile(relativeSegments);
 
-        var docstring = Regex.Match(script, @"REQUIRED_PG_SET \(currently \{(?<items>[^}]*)\}\)");
-        Assert.True(docstring.Success, "Could not locate the REQUIRED_PG_SET mention in the script docstring.");
+        var match = Regex.Match(text, pattern, RegexOptions.Singleline);
+        Assert.True(match.Success,
+            $"Could not locate the REQUIRED_PG_SET restatement in {string.Join("/", relativeSegments)}. " +
+            "If the file was reformatted, update this pattern to match the new layout.");
 
-        var documented = docstring.Groups["items"].Value
+        var documented = match.Groups["items"].Value
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(int.Parse)
             .Order()
             .ToArray();
 
-        Assert.Equal(ParseRequiredPgSet(script), documented);
+        Assert.Equal(ParseRequiredPgSet(ReadScript()), documented);
     }
 
     [Theory]
     [InlineData("eng", "scripts", "README.md")]
     [InlineData("docs", "configuration.md")]
-    public void AdoptionPolicyDocsMentionEveryRequiredPgVariant(params string[] relativeSegments)
+    public void AdoptionPolicyDocsListExactlyTheRequiredPgVariants(params string[] relativeSegments)
     {
         // Both files state the "a version is only adopted when every pgNN-X.Y.Z tag exists"
-        // policy, which must stay consistent with REQUIRED_PG_SET.
+        // policy, which must stay consistent with REQUIRED_PG_SET. Compared for equality like
+        // its sibling guards, not containment: the gate may legitimately SHRINK when upstream
+        // drops a variant, and a one-directional check would leave both files advertising the
+        // dropped variant as an adoption requirement forever.
         var text = ReadRepoFile(relativeSegments);
 
-        foreach (var pg in ParseRequiredPgSet(ReadScript()))
-        {
-            Assert.Contains($"pg{pg}-X.Y.Z", text, StringComparison.Ordinal);
-        }
+        // The policy sentence spells the variants out as one contiguous run of `pgNN-X.Y.Z`.
+        // Other spots quote a single such tag for unrelated reasons (the end-to-end AppHost
+        // pin), so compare the longest run rather than every match in the file.
+        var runs = Regex.Matches(text, @"`pg\d+-X\.Y\.Z`(?:,\s+(?:and\s+)?`pg\d+-X\.Y\.Z`)*");
+        Assert.True(runs.Count > 0,
+            $"Could not find the pgNN-X.Y.Z adoption-policy list in {string.Join("/", relativeSegments)}.");
+
+        var listed = Regex.Matches(runs.MaxBy(m => m.Length)!.Value, @"`pg(?<pg>\d+)-X\.Y\.Z`")
+            .Select(m => int.Parse(m.Groups["pg"].Value))
+            .Distinct()
+            .Order()
+            .ToArray();
+
+        Assert.Equal(ParseRequiredPgSet(ReadScript()), listed);
     }
 
     [Theory]

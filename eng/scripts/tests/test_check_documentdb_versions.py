@@ -17,6 +17,7 @@ import contextlib
 import importlib.util
 import io
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -126,8 +127,8 @@ public static class DocumentDBVersions
 }
 """
 
-    def __init__(self) -> None:
-        self.root = Path(tempfile.mkdtemp())
+    def __init__(self, root: Path) -> None:
+        self.root = root
         self.versions_file = self.root / "src" / "Aspire.Hosting.DocumentDB" / "DocumentDBVersion.cs"
         self.versions_file.parent.mkdir(parents=True)
         self.versions_file.write_text(self.VERSIONS_FIXTURE, encoding="utf-8")
@@ -158,6 +159,27 @@ public static class DocumentDBVersions
 
     def changelog_text(self) -> str:
         return self.changelog_file.read_text(encoding="utf-8")
+
+
+class ScriptTestCase(unittest.TestCase):
+    """Base class giving every fixture a temp directory that is removed when the test ends.
+
+    Without this each fixture leaks a directory holding a copy of DocumentDBVersion.cs and
+    CHANGELOG.md, and a full run leaves ~20 of them behind in the system temp directory.
+    """
+
+    def make_temp_dir(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        return root
+
+    def make_repo(self) -> FakeRepo:
+        return FakeRepo(self.make_temp_dir())
+
+    def temp_file(self, name: str, text: str) -> Path:
+        path = self.make_temp_dir() / name
+        path.write_text(text, encoding="utf-8")
+        return path
 
 
 class RequiredPgSetTests(unittest.TestCase):
@@ -207,13 +229,11 @@ class UnknownPgVariantWarningTests(unittest.TestCase):
         self.assertIn("unknown PG variants [99]", stderr)
 
 
-class UpdateChangelogTests(unittest.TestCase):
+class UpdateChangelogTests(ScriptTestCase):
     TEMPLATE = CHANGELOG_TEMPLATE
 
     def _write_changelog(self) -> Path:
-        path = Path(tempfile.mkdtemp()) / "CHANGELOG.md"
-        path.write_text(self.TEMPLATE, encoding="utf-8")
-        return path
+        return self.temp_file("CHANGELOG.md", self.TEMPLATE)
 
     def test_tag_list_covers_every_required_pg_variant(self):
         path = self._write_changelog()
@@ -250,14 +270,14 @@ class UpdateChangelogTests(unittest.TestCase):
         self.assertIn("hand-written release notes", text)
 
 
-class BackfillHandlingTests(unittest.TestCase):
+class BackfillHandlingTests(ScriptTestCase):
     """A1: a backfill candidate must not wedge adoption of newer versions."""
 
     def test_backfill_candidate_is_skipped_but_newer_version_is_adopted(self):
         # Week 2 of the finding's scenario: a newer version was adopted while a required
         # variant for an older release was still building. Now the older release is complete
         # (a backfill candidate) and must not block adoption of a genuinely newer one.
-        repo = FakeRepo()
+        repo = self.make_repo()
         gh = [_semver("0.100.5"), _semver("0.102.0")]
 
         code, stdout, stderr = repo.run_main(gh, _full_variants("0.100.5", "0.102.0"))
@@ -272,14 +292,14 @@ class BackfillHandlingTests(unittest.TestCase):
         self.assertIn("`0.102.0` upstream release detected", repo.changelog_text())
 
     def test_run_with_only_backfill_candidates_is_a_warned_no_op(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
         before = repo.versions_text()
 
         code, stdout, stderr = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
         self.assertEqual(0, code)  # sanity: a newer version alone is adopted
         self.assertIn(f"V0_102_0 = {FakeRepo.NEXT_VALUE},", repo.versions_text())
 
-        repo = FakeRepo()
+        repo = self.make_repo()
         code, stdout, stderr = repo.run_main([_semver("0.100.5")], _full_variants("0.100.5"))
 
         self.assertEqual(0, code)
@@ -288,11 +308,11 @@ class BackfillHandlingTests(unittest.TestCase):
         self.assertEqual(before, repo.versions_text())
 
 
-class BlockedVersionReportingTests(unittest.TestCase):
+class BlockedVersionReportingTests(ScriptTestCase):
     """A2: a version held back on GHCR must be reported, not silent."""
 
     def test_missing_required_variant_is_reported_on_stderr(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
         before = repo.versions_text()
         incomplete = sorted(script.REQUIRED_PG_SET)[:-1]
         withheld = max(script.REQUIRED_PG_SET)
@@ -309,7 +329,7 @@ class BlockedVersionReportingTests(unittest.TestCase):
     def test_release_without_any_container_tags_is_reported_on_stderr(self):
         # The common case: the GitHub release is published before (or instead of) the images.
         # Reporting only partial tag sets would leave this failure mode completely silent.
-        repo = FakeRepo()
+        repo = self.make_repo()
         before = repo.versions_text()
 
         code, stdout, stderr = repo.run_main([_semver("0.102.0")], _full_variants("0.101.0"))
@@ -320,7 +340,7 @@ class BlockedVersionReportingTests(unittest.TestCase):
         self.assertEqual(before, repo.versions_text())
 
     def test_complete_versions_are_not_reported_as_blocked(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         _, _, stderr = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
 
@@ -329,7 +349,7 @@ class BlockedVersionReportingTests(unittest.TestCase):
     def test_already_shipped_versions_are_not_reported_as_blocked(self):
         # Shipped versions are never adoption candidates, so an incomplete (or absent) tag set
         # for them is not a stall.
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         _, _, stderr = repo.run_main(
             [_semver("0.100.0"), _semver("0.101.0")], {_semver("0.100.0"): {15}}
@@ -338,13 +358,13 @@ class BlockedVersionReportingTests(unittest.TestCase):
         self.assertNotIn("blocked", stderr)
 
 
-class GitHubAnnotationTests(unittest.TestCase):
+class GitHubAnnotationTests(ScriptTestCase):
     """A2(b): every "cannot adopt yet" path exits 0, so it must annotate the run, not just log."""
 
     def test_blocked_version_is_annotated(self):
         # Without this the weekly cron is green and unannotated while adoption is stuck, which is
         # indistinguishable from "nothing new upstream" to anyone not reading the log.
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         _, stdout, _ = repo.run_main(
             [_semver("0.102.0")], _full_variants("0.101.0"), github_actions=True
@@ -354,7 +374,7 @@ class GitHubAnnotationTests(unittest.TestCase):
         self.assertIn("0.102.0 blocked", stdout)
 
     def test_skipped_backfill_candidate_is_annotated(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         _, stdout, _ = repo.run_main(
             [_semver("0.100.5")], _full_variants("0.100.5"), github_actions=True
@@ -363,7 +383,7 @@ class GitHubAnnotationTests(unittest.TestCase):
         self.assertIn("::warning title=DocumentDB backfill candidate skipped::", stdout)
 
     def test_no_annotation_outside_github_actions(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         _, stdout, stderr = repo.run_main([_semver("0.102.0")], _full_variants("0.101.0"))
 
@@ -371,7 +391,7 @@ class GitHubAnnotationTests(unittest.TestCase):
         self.assertIn("0.102.0 blocked", stderr)  # the local run still says so on stderr
 
     def test_a_clean_run_emits_no_annotation(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         _, stdout, _ = repo.run_main(
             [_semver("0.102.0")], _full_variants("0.102.0"), github_actions=True
@@ -391,7 +411,7 @@ class GitHubAnnotationTests(unittest.TestCase):
         )
 
 
-class ObsoleteAttributeTests(unittest.TestCase):
+class ObsoleteAttributeTests(ScriptTestCase):
     """A5: DocumentDBVersion's XML docs prescribe [Obsolete] for retiring a member, and that
     attribute has to live inside the auto-generated region. It must neither crash the parser nor
     be dropped by the next rewrite."""
@@ -399,7 +419,7 @@ class ObsoleteAttributeTests(unittest.TestCase):
     ATTRIBUTE = '[Obsolete("DocumentDB 0.100.0 is no longer published upstream.")]'
 
     def _repo_with_obsolete_member(self) -> FakeRepo:
-        repo = FakeRepo()
+        repo = self.make_repo()
         text = repo.versions_text()
         text = text.replace(
             "    V0_100_0 = 1,", f"    {self.ATTRIBUTE}\n    V0_100_0 = 1,"
@@ -431,7 +451,7 @@ class ObsoleteAttributeTests(unittest.TestCase):
         self.assertIn("V0_102_0 = 3,", text)
 
     def test_multi_line_attribute_is_a_hard_error(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
         repo.versions_file.write_text(
             repo.versions_text().replace(
                 "    V0_100_0 = 1,", '    [Obsolete(\n        "wrapped")]\n    V0_100_0 = 1,'
@@ -445,7 +465,7 @@ class ObsoleteAttributeTests(unittest.TestCase):
         self.assertIn("single line", str(ctx.exception))
 
     def test_attribute_attached_to_nothing_is_a_hard_error(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
         repo.versions_file.write_text(
             repo.versions_text().replace(
                 "    // <auto-generated-versions-end>\n}",
@@ -462,7 +482,7 @@ class ObsoleteAttributeTests(unittest.TestCase):
     def test_unrecognized_constant_line_is_a_hard_error(self):
         # The constant region is regenerated wholesale, so a line the parser does not understand
         # is a line that would be silently deleted.
-        repo = FakeRepo()
+        repo = self.make_repo()
         repo.versions_file.write_text(
             repo.versions_text().replace(
                 '    public const string V0_100_0 = "0.100.0";',
@@ -477,11 +497,11 @@ class ObsoleteAttributeTests(unittest.TestCase):
         self.assertIn("constant region", str(ctx.exception))
 
 
-class WriteVersionsFileGuardTests(unittest.TestCase):
+class WriteVersionsFileGuardTests(ScriptTestCase):
     """A3(c): the append-only guard must run against the rendered output, where it can fail."""
 
     def test_rendering_bug_that_drops_a_member_is_caught_before_writing(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
         before = repo.versions_text()
         target = {_semver("0.100.0"): 1, _semver("0.101.0"): 2, _semver("0.102.0"): 3}
         real_render = script.render_versions_file
@@ -492,14 +512,14 @@ class WriteVersionsFileGuardTests(unittest.TestCase):
 
         with mock.patch.object(script, "render_versions_file", side_effect=drops_the_oldest):
             with self.assertRaises(RuntimeError) as ctx:
-                script.write_versions_file(repo.versions_file, target)
+                script.write_versions_file(script.VersionsSource.load(repo.versions_file), target)
 
         self.assertIn("V0_100_0 would be removed", str(ctx.exception))
         # The failure must not leave a half-written file behind.
         self.assertEqual(before, repo.versions_text())
 
     def test_rendering_bug_that_renumbers_a_member_is_caught_before_writing(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
         before = repo.versions_text()
         target = {_semver("0.100.0"): 1, _semver("0.101.0"): 2, _semver("0.102.0"): 3}
         real_render = script.render_versions_file
@@ -511,19 +531,17 @@ class WriteVersionsFileGuardTests(unittest.TestCase):
 
         with mock.patch.object(script, "render_versions_file", side_effect=renumbers):
             with self.assertRaises(RuntimeError) as ctx:
-                script.write_versions_file(repo.versions_file, target)
+                script.write_versions_file(script.VersionsSource.load(repo.versions_file), target)
 
         self.assertIn("renumbered", str(ctx.exception))
         self.assertEqual(before, repo.versions_text())
 
 
-class ParseKnownVersionsTests(unittest.TestCase):
+class ParseKnownVersionsTests(ScriptTestCase):
     """A3: a degraded parse must crash instead of silently shrinking the shipped enum."""
 
     def _write_versions_file(self, text: str) -> Path:
-        path = Path(tempfile.mkdtemp()) / "DocumentDBVersion.cs"
-        path.write_text(text, encoding="utf-8")
-        return path
+        return self.temp_file("DocumentDBVersion.cs", text)
 
     def test_parses_the_real_versions_file(self):
         known = script.parse_known_versions(REAL_VERSIONS_FILE)
@@ -583,37 +601,40 @@ class AssertAppendOnlyTests(unittest.TestCase):
         self.assertIn("renumbered", str(ctx.exception))
 
 
-class ChangelogMarkerPlacementTests(unittest.TestCase):
+class ChangelogMarkerPlacementTests(ScriptTestCase):
     """A4: the rewritten block must live in [Unreleased], never in a released section."""
 
     def test_repo_changelog_markers_live_in_the_unreleased_section(self):
         text = REAL_CHANGELOG_FILE.read_text(encoding="utf-8")
-        match = script.CHANGELOG_AUTO_GEN_RE.search(text)
-        self.assertIsNotNone(match, "CHANGELOG.md lost its auto-generated markers.")
+        self.assertIsNotNone(
+            script.CHANGELOG_AUTO_GEN_RE.search(text), "CHANGELOG.md lost its auto-generated markers."
+        )
 
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            misplaced = script.warn_if_markers_outside_unreleased(
-                REAL_CHANGELOG_FILE, text, match.start()
-            )
+        misplaced, stderr = self._guard(REAL_CHANGELOG_FILE, text)
 
-        self.assertFalse(misplaced, stderr.getvalue())
+        self.assertFalse(misplaced, stderr)
 
-    @staticmethod
-    def _check(text: str) -> tuple[bool, str]:
-        """Run the placement guard over `text`; returns (misplaced, stderr)."""
-        path = Path(tempfile.mkdtemp()) / "CHANGELOG.md"
-        path.write_text(text, encoding="utf-8")
+    def _guard(self, changelog_file: Path, text: str) -> tuple[bool, str]:
+        """Run the placement guard over `text`; returns (misplaced, stderr).
+
+        ``GITHUB_ACTIONS`` is blanked and stdout captured for every caller, including the one
+        that runs against the REAL CHANGELOG.md: the guard emits a workflow-command annotation
+        on failure, and letting that escape would render as a genuine ::warning on the build
+        summary of the CI job running this suite.
+        """
         match = script.CHANGELOG_AUTO_GEN_RE.search(text)
         assert match is not None
 
         stdout, stderr = io.StringIO(), io.StringIO()
-        # stdout is captured too: the guard emits a workflow-command annotation, which must not
-        # leak into the log of the CI job that runs this suite.
         with mock.patch.dict(script.os.environ, {"GITHUB_ACTIONS": ""}), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            misplaced = script.warn_if_markers_outside_unreleased(path, text, match.start())
+            misplaced = script.warn_if_markers_outside_unreleased(
+                changelog_file, text, match.start()
+            )
         return misplaced, stderr.getvalue()
+
+    def _check(self, text: str) -> tuple[bool, str]:
+        return self._guard(self.temp_file("CHANGELOG.md", text), text)
 
     def test_markers_inside_a_released_section_are_reported(self):
         misplaced, stderr = self._check(
@@ -663,11 +684,11 @@ class ChangelogMarkerPlacementTests(unittest.TestCase):
             )
 
 
-class RoundTripTests(unittest.TestCase):
+class RoundTripTests(ScriptTestCase):
     """The renderer's output must satisfy the (now stricter) parser, or the NEXT run crashes."""
 
     def test_written_versions_file_is_reparsable_and_rerun_is_a_no_op(self):
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         code, _, _ = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
         self.assertEqual(0, code)
@@ -689,7 +710,7 @@ class RoundTripTests(unittest.TestCase):
     def test_every_auto_generated_region_is_rewritten(self):
         # A rewrite that updated the enum but not the const/list/switch regions would ship a
         # version the package cannot resolve at runtime.
-        repo = FakeRepo()
+        repo = self.make_repo()
 
         repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
         text = repo.versions_text()
@@ -698,6 +719,184 @@ class RoundTripTests(unittest.TestCase):
         self.assertIn('public const string V0_102_0 = "0.102.0";', text)
         self.assertIn("        V0_102_0,", text)
         self.assertIn("DocumentDBVersion.V0_102_0 => V0_102_0,", text)
+
+
+class LeapfroggedVersionReportingTests(ScriptTestCase):
+    """A version that a newer adoption overtook must keep being reported, then be silenceable."""
+
+    def test_leapfrogged_version_missing_a_variant_is_still_reported(self):
+        # The case that used to vanish: 0.100.5 is older than the newest shipped version (so the
+        # blocked report skipped it) AND missing a required variant (so it is not in the
+        # intersection either, which is what the backfill warning was computed from). It fell
+        # through both, and a permanently stalled version went silent precisely when the stall
+        # became permanent.
+        repo = self.make_repo()
+        incomplete = set(sorted(script.REQUIRED_PG_SET)[:-1])
+
+        code, _, stderr = repo.run_main(
+            [_semver("0.100.5"), _semver("0.102.0")],
+            {_semver("0.100.5"): incomplete, **_full_variants("0.102.0")},
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn("skipping backfill candidate(s) ['0.100.5']", stderr)
+        # ... and the newer version is still adopted in the same run.
+        self.assertIn(f"V0_102_0 = {FakeRepo.NEXT_VALUE},", repo.versions_text())
+
+    def test_acknowledged_skip_silences_the_recurring_warning(self):
+        # Without an acknowledgement mechanism the warning above recurs every week forever - the
+        # version-level twin of the "unknown PG variant" noise DEFERRED_PG_SET removes.
+        repo = self.make_repo()
+
+        with mock.patch.object(script, "ACKNOWLEDGED_SKIPS", frozenset({"0.100.5"})):
+            code, stdout, stderr = repo.run_main(
+                [_semver("0.100.5")], _full_variants("0.100.5"), github_actions=True
+            )
+
+        self.assertEqual(0, code)
+        self.assertNotIn("0.100.5", stderr)
+        self.assertNotIn("::warning", stdout)
+
+    def test_releases_older_than_the_oldest_curated_version_are_not_reported(self):
+        # The curated list starts at 0.100.0; upstream releases below it were never candidates,
+        # and reporting them would bury the versions that are genuinely stuck.
+        repo = self.make_repo()
+
+        code, _, stderr = repo.run_main([_semver("0.99.0")], {})
+
+        self.assertEqual(0, code)
+        self.assertNotIn("0.99.0", stderr)
+
+    def test_malformed_acknowledged_skip_is_a_hard_error(self):
+        # A typo would silently match nothing and quietly restore the warning it was added to
+        # silence, which is worse than crashing.
+        with mock.patch.object(script, "ACKNOWLEDGED_SKIPS", frozenset({"0.100"})):
+            with self.assertRaises(RuntimeError) as ctx:
+                script.acknowledged_skips()
+
+        self.assertIn("MAJOR.MINOR.PATCH", str(ctx.exception))
+
+
+class EmptyIntersectionTests(ScriptTestCase):
+    """An empty intersection is a symptom, not a routine no-op."""
+
+    def test_empty_intersection_is_reported_and_annotated(self):
+        # Both fetches return empty rather than raising when the GHCR tag list or the release
+        # feed changes shape, and REQUIRED_PG_SET is narrow enough that only a handful of
+        # releases clear it. Exiting green and silent here is what a permanently dead detector
+        # looks like from the outside.
+        repo = self.make_repo()
+
+        code, stdout, stderr = repo.run_main(
+            [_semver("0.100.0"), _semver("0.101.0")], {}, github_actions=True
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn("no upstream release has the full required variant set", stderr)
+        self.assertIn("::warning title=DocumentDB version detection found nothing::", stdout)
+
+    def test_a_normal_run_does_not_emit_the_empty_intersection_warning(self):
+        repo = self.make_repo()
+
+        _, _, stderr = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+
+        self.assertNotIn("full required variant set", stderr)
+
+
+class ChangelogPlacementEnforcementTests(ScriptTestCase):
+    """The placement guard must run on every run, and must stop adoption rather than misfile it."""
+
+    MISPLACED = (
+        "# Changelog\n"
+        "\n"
+        "## [Unreleased]\n"
+        "\n"
+        "## [0.114.0] - 2026-07-20\n"
+        "\n"
+        "<!-- auto-generated:documentdb-versions-start -->\n"
+        "previous content\n"
+        "<!-- auto-generated:documentdb-versions-end -->\n"
+    )
+
+    def _misplaced_repo(self) -> FakeRepo:
+        repo = self.make_repo()
+        repo.changelog_file.write_text(self.MISPLACED, encoding="utf-8")
+        return repo
+
+    def test_guard_runs_on_a_run_that_adopts_nothing(self):
+        # A release cut that renames "## [Unreleased]" and forgets to re-add it is followed by
+        # weeks of runs with nothing to adopt. A guard reachable only from the write path would
+        # sit unexecuted through every one of them.
+        repo = self._misplaced_repo()
+
+        code, stdout, stderr = repo.run_main(
+            [_semver("0.101.0")], _full_variants("0.101.0"), github_actions=True
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn("No new versions detected", stdout)
+        self.assertIn("[Unreleased]", stderr)
+        self.assertIn("::warning title=CHANGELOG auto-generated block is misplaced::", stdout)
+
+    def test_adoption_is_refused_while_the_block_is_misplaced(self):
+        repo = self._misplaced_repo()
+        versions_before = repo.versions_text()
+
+        code, _, stderr = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+
+        self.assertEqual(2, code)
+        self.assertIn("refusing to adopt ['0.102.0']", stderr)
+        # Nothing is half-written: the version file is checked before it would be rewritten.
+        self.assertEqual(versions_before, repo.versions_text())
+        self.assertEqual(self.MISPLACED, repo.changelog_text())
+
+    def test_update_changelog_refuses_rather_than_writing_to_a_released_section(self):
+        # Last-line defence. Warning and then rewriting anyway would annotate the run AND commit
+        # the generated notes into the shipped 0.114.0 section.
+        path = self.temp_file("CHANGELOG.md", self.MISPLACED)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(script.os.environ, {"GITHUB_ACTIONS": ""}), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(RuntimeError) as ctx:
+                script.update_changelog(path, [_semver("0.115.0")])
+
+        self.assertIn("Refusing to rewrite", str(ctx.exception))
+        self.assertEqual(self.MISPLACED, path.read_text(encoding="utf-8"))
+
+    def test_a_correctly_placed_block_is_still_rewritten(self):
+        repo = self.make_repo()
+
+        code, _, _ = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+
+        self.assertEqual(0, code)
+        self.assertIn("`0.102.0` upstream release detected", repo.changelog_text())
+
+
+class AutoGeneratedRegionCountTests(ScriptTestCase):
+    """An unexpected region count must produce the actionable message, not an IndexError."""
+
+    def test_extra_region_raises_the_actionable_error(self):
+        repo = self.make_repo()
+        # A fifth region the enum/constant parser is happy to ignore, so the failure surfaces
+        # where the regions are paired with rendered blocks rather than during parsing.
+        repo.versions_file.write_text(
+            repo.versions_text().replace(
+                "    private static readonly string[] s_all =",
+                "    // <auto-generated-versions-start>\n"
+                "    // stray fifth region\n"
+                "    // <auto-generated-versions-end>\n"
+                "\n"
+                "    private static readonly string[] s_all =",
+            ),
+            encoding="utf-8",
+        )
+        source = script.VersionsSource.load(repo.versions_file)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            script.write_versions_file(source, dict(source.values))
+
+        self.assertIn("found 5", str(ctx.exception))
 
 
 if __name__ == "__main__":
