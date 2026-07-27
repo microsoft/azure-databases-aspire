@@ -49,6 +49,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Script self-tests
+        run: python3 -m unittest discover -s eng/scripts/tests
+
       - name: Detect new DocumentDB versions
         id: detect
         env:
