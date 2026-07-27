@@ -46,3 +46,19 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
 
 GHCR tags are mutable. "Version supported" here means "tag exists at the time of the check",
 not "image bytes are immutable". Pinning by digest is a future enhancement.
+
+### Tests
+
+`tests/test_check_documentdb_versions.py` covers `REQUIRED_PG_SET` and the CHANGELOG block
+rewrite (standard library `unittest` only, no pip dependencies):
+
+```bash
+# From the repo root.
+python3 -m unittest discover -s eng/scripts/tests
+```
+
+It runs in CI as the `script-test` job of `.github/workflows/build-and-test.yml`, and as a
+pre-flight step of `.github/workflows/check-documentdb-version.yml`. The companion C# drift guard
+`VersionAutomationScriptTests` (in `tests/Aspire.Hosting.DocumentDB.Tests`) asserts that
+`REQUIRED_PG_SET`, the `DocumentDBPostgresVersion` enum, and the adoption-policy documentation all
+list the same PG variants.
