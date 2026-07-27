@@ -14,8 +14,8 @@ What this script does:
   3. Computes the intersection of (GH releases) and (GHCR tags), where each version is only
      considered "supported" if every PG variant in REQUIRED_PG_SET (currently {15, 16, 17, 18})
      has a `pgN-X.Y.Z` tag on GHCR. Released versions newer than the newest shipped one that
-     are missing a required variant are reported as `[warn] ... blocked: ...`, so stalled
-     adoption is never silent.
+     cannot be adopted - missing a required variant, or with no container tags published at
+     all - are reported as `[warn] ... blocked: ...`, so stalled adoption is never silent.
   4. Parses the auto-generated regions in `src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs`
      to learn the current curated list. Any line it cannot parse is a hard error: re-rendering
      a partially parsed enum would delete shipped members.
@@ -63,6 +63,13 @@ GH_REPO = "documentdb"
 GHCR_IMAGE_PATH = "documentdb/documentdb/documentdb-local"
 
 REQUIRED_PG_SET: frozenset[int] = frozenset({15, 16, 17, 18})
+
+# PG variants that exist as DocumentDBPostgresVersion members (so users can select them) but are
+# deliberately NOT part of the adoption gate above - for example a variant upstream has only
+# started publishing for the newest releases. Every enum member must appear in one of these two
+# sets: VersionAutomationScriptTests.EveryPgVariantIsRequiredOrExplicitlyDeferred fails otherwise,
+# which is what catches "the enum gained a variant but the adoption gate never heard about it".
+DEFERRED_PG_SET: frozenset[int] = frozenset()
 
 GH_TAG_RE = re.compile(r"^v(\d+)\.(\d+)-(\d+)$")
 GHCR_TAG_RE = re.compile(r"^pg(\d+)-(\d+)\.(\d+)\.(\d+)$")
@@ -500,29 +507,38 @@ def report_blocked_versions(
     ghcr_map: dict[SemVer, set[int]],
     minimum: SemVer | None,
 ) -> list[SemVer]:
-    """Warn about released versions that cannot be adopted because a required variant is missing.
+    """Warn about released versions that cannot be adopted yet.
 
-    Without this, a version blocked by (say) a missing ``pg18-`` tag is indistinguishable from
-    "nothing new upstream": the run is silent and green while adoption is stuck. Only versions
-    newer than `minimum` (the newest version already shipped) are reported, because older ones
-    are never adoption candidates.
+    Covers both stall modes: a version whose container images are missing entirely (the GitHub
+    release usually lands before the image build finishes), and one that has some tags but is
+    missing a required PG variant. Without this, either case is indistinguishable from "nothing
+    new upstream": the run is silent and green while adoption is stuck. Only versions newer than
+    `minimum` (the newest version already shipped) are reported, because older ones are never
+    adoption candidates.
     """
     blocked: list[SemVer] = []
     for version in sorted(gh_versions):
         if minimum is not None and version <= minimum:
             continue
-        variants = ghcr_map.get(version)
-        if variants is None:
-            continue
+        variants = ghcr_map.get(version) or set()
         missing = REQUIRED_PG_SET - variants
         if not missing:
             continue
         blocked.append(version)
-        print(
-            f"  [warn] {version} blocked: missing required variants {sorted(missing)} on GHCR "
-            f"(published: {sorted(variants)}). Adoption is deferred until they appear.",
-            file=sys.stderr,
-        )
+        if not variants:
+            # The usual cause: the GitHub release landed before the image build finished
+            # (or the image build failed outright).
+            print(
+                f"  [warn] {version} blocked: no pg tags published on GHCR yet. Adoption is "
+                "deferred until the container images appear.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  [warn] {version} blocked: missing required variants {sorted(missing)} on "
+                f"GHCR (published: {sorted(variants)}). Adoption is deferred until they appear.",
+                file=sys.stderr,
+            )
     return blocked
 
 
