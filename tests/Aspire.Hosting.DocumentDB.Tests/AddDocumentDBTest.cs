@@ -1373,15 +1373,15 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithPostgresEndpointDefaultTagThrowsUntilLatestReachesV0_112_0()
+    public async Task WithPostgresEndpointDefaultTagStartsOnceLatestMeetsFloor()
     {
-        // Documents the intentional behavior described in issue #71's docs callout:
-        // when DocumentDBVersions.Latest is < 0.112.0, AddDocumentDB().WithPostgresEndpoint()
-        // (no explicit tag override) will throw at startup. This is the whole point of
-        // the issue - converting a silent auth failure into a loud one. Once issue #70
-        // bumps Latest to >= 0.112.0, this test's branch becomes the "no-throw" path.
-        var latestParsed = Version.Parse(DocumentDBVersions.Latest);
-        var floor = DocumentDBContainerImageTags.MinimumPostgresEndpointVersion;
+        // The WithPostgresEndpoint() guard (issue #71) rejects container tags older than
+        // MinimumPostgresEndpointVersion, converting a silent PostgreSQL auth failure into a
+        // loud one. DocumentDBVersions.Latest is now at or above that floor, so the default
+        // flow - AddDocumentDB().WithPostgresEndpoint() with no explicit tag - must start
+        // cleanly. If a future Latest ever regressed below the floor, this test would fail,
+        // which is the intent.
+        Assert.True(Version.Parse(DocumentDBVersions.Latest) >= DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
 
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
@@ -1390,18 +1390,7 @@ public class AddDocumentDBTests
         using var app = appBuilder.Build();
         var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
 
-        if (latestParsed < floor)
-        {
-            // Current branch: Latest is 0.111.0, guard throws.
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => PublishBeforeResourceStartedAsync(app, resource));
-            Assert.Contains($"pg17-{DocumentDBVersions.Latest}", ex.Message);
-        }
-        else
-        {
-            // After #70 lands: Latest is >= 0.112.0, default flow succeeds.
-            await PublishBeforeResourceStartedAsync(app, resource);
-        }
+        await PublishBeforeResourceStartedAsync(app, resource);
     }
 
     [Fact]

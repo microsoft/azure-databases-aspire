@@ -29,10 +29,11 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
 ### Output rules
 
 1. A version is considered **supported** only if it appears in BOTH the GitHub releases AND has
-   `pg15-X.Y.Z`, `pg16-X.Y.Z`, and `pg17-X.Y.Z` published on GHCR.
-2. The set of required PG variants is the script-level constant `REQUIRED_PG_SET`. Adding a new
-   PG variant (for example `pg18`) is intentionally a manual code change in three places:
-   `DocumentDBPostgresVersion`, this constant, and the documentation.
+   `pg15-X.Y.Z`, `pg16-X.Y.Z`, `pg17-X.Y.Z`, and `pg18-X.Y.Z` published on GHCR.
+2. The set of required PG variants is the script-level constant `REQUIRED_PG_SET` (currently
+   `{15, 16, 17, 18}`; `pg18` is published upstream from DocumentDB 0.114.0 onwards). Adding a
+   new PG variant (for example a future `pg19`) is intentionally a manual code change in three
+   places: `DocumentDBPostgresVersion`, this constant, and the documentation.
 3. The version list in `DocumentDBVersion.cs` is **append-only**. The script never removes a
    version that was previously shipped, even if it disappears from upstream.
 4. Numeric enum values are derived deterministically from sort order (1, 2, 3, ...) and must

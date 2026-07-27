@@ -12,7 +12,7 @@ What this script does:
      - Uses the anonymous Bearer token flow (no auth required for public images).
      - Detects all `pgN-` prefixes and warns about any not in REQUIRED_PG_SET.
   3. Computes the intersection of (GH releases) and (GHCR tags), where each version is only
-     considered "supported" if every PG variant in REQUIRED_PG_SET (currently {15, 16, 17})
+     considered "supported" if every PG variant in REQUIRED_PG_SET (currently {15, 16, 17, 18})
      has a `pgN-X.Y.Z` tag on GHCR.
   4. Parses the auto-generated regions in `src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs`
      to learn the current curated list.
@@ -56,7 +56,7 @@ GH_OWNER = "documentdb"
 GH_REPO = "documentdb"
 GHCR_IMAGE_PATH = "documentdb/documentdb/documentdb-local"
 
-REQUIRED_PG_SET: frozenset[int] = frozenset({15, 16, 17})
+REQUIRED_PG_SET: frozenset[int] = frozenset({15, 16, 17, 18})
 
 GH_TAG_RE = re.compile(r"^v(\d+)\.(\d+)-(\d+)$")
 GHCR_TAG_RE = re.compile(r"^pg(\d+)-(\d+)\.(\d+)\.(\d+)$")
@@ -359,9 +359,10 @@ def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
         "",
     ]
     for v in new_versions:
+        tag_list = ", ".join(f"`pg{pg}-{v}`" for pg in sorted(REQUIRED_PG_SET))
         body_lines.append(
             f"- DocumentDB `{v}` upstream release detected on {today} "
-            f"(container tags `pg15-{v}`, `pg16-{v}`, `pg17-{v}`)."
+            f"(container tags {tag_list})."
         )
     body_lines.append("")
     body_lines.append(
