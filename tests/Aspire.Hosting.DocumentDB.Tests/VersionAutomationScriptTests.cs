@@ -57,19 +57,20 @@ public class VersionAutomationScriptTests
         Enum.GetValues<DocumentDBPostgresVersion>().Select(v => (int)v).Distinct().Order().ToArray();
 
     /// <summary>
-    /// Parses the <c>REQUIRED_PG_SET</c> assignment out of the Python script. Anchored on the
+    /// Parses a <c>frozenset({...})</c> constant out of the Python script. Anchored on the
     /// identifier and non-greedy up to the first <c>{...}</c> so a trailing comment (or a
     /// reformat that moves the literal onto its own line) cannot silently change the result.
+    /// An empty <c>frozenset()</c> parses to an empty array.
     /// </summary>
-    private static int[] ParseRequiredPgSet(string script)
+    private static int[] ParsePgSet(string script, string constantName)
     {
         var match = Regex.Match(
             script,
-            @"^REQUIRED_PG_SET[^=]*=\s*frozenset\(\s*\{(?<items>[^}]*)\}",
+            $@"^{Regex.Escape(constantName)}[^=]*=\s*frozenset\(\s*(?:\{{(?<items>[^}}]*)\}})?\s*\)",
             RegexOptions.Multiline | RegexOptions.Singleline);
 
         Assert.True(match.Success,
-            "Could not parse the REQUIRED_PG_SET assignment in eng/scripts/check-documentdb-versions.py. " +
+            $"Could not parse the {constantName} assignment in eng/scripts/check-documentdb-versions.py. " +
             "If the file was reformatted, update this regex to match the new layout.");
 
         return match.Groups["items"].Value
@@ -79,6 +80,8 @@ public class VersionAutomationScriptTests
             .ToArray();
     }
 
+    private static int[] ParseRequiredPgSet(string script) => ParsePgSet(script, "REQUIRED_PG_SET");
+
     [Fact]
     public void RequiredPgSetIsASubsetOfDocumentDBPostgresVersion()
     {
@@ -86,6 +89,8 @@ public class VersionAutomationScriptTests
         // user-selectable option can never be removed), while REQUIRED_PG_SET is the adoption
         // gate and may legitimately shrink when upstream drops a variant, or lag a newly added
         // option. What must never happen is gating adoption on a variant users cannot select.
+        // The reverse direction (an enum member the gate never heard about) is covered by
+        // EveryPgVariantIsRequiredOrExplicitlyDeferred.
         var enumVariants = PgVariantsInEnum();
         var required = ParseRequiredPgSet(ReadScript());
 
@@ -94,6 +99,27 @@ public class VersionAutomationScriptTests
             notSelectable.Length == 0,
             $"REQUIRED_PG_SET gates adoption on PG variant(s) [{string.Join(", ", notSelectable)}] " +
             "that have no DocumentDBPostgresVersion member, so no user could select them.");
+    }
+
+    [Fact]
+    public void EveryPgVariantIsRequiredOrExplicitlyDeferred()
+    {
+        // This is the guard for the drift that started all of this: Pg18 was added to the enum
+        // while REQUIRED_PG_SET stayed {15, 16, 17}, and nothing noticed. Because the gate is
+        // allowed to lag the enum, the rule is "accounted for", not "equal": a new variant must
+        // either join REQUIRED_PG_SET or be listed in DEFERRED_PG_SET with a reason.
+        var script = ReadScript();
+        var accountedFor = ParseRequiredPgSet(script).Concat(ParsePgSet(script, "DEFERRED_PG_SET")).ToHashSet();
+
+        var unaccounted = PgVariantsInEnum().Where(pg => !accountedFor.Contains(pg)).ToArray();
+
+        Assert.True(
+            unaccounted.Length == 0,
+            $"DocumentDBPostgresVersion member(s) [{string.Join(", ", unaccounted.Select(pg => $"Pg{pg}"))}] " +
+            "appear in neither REQUIRED_PG_SET nor DEFERRED_PG_SET in " +
+            "eng/scripts/check-documentdb-versions.py. Add them to REQUIRED_PG_SET once upstream " +
+            "publishes the tags for every version you intend to adopt, or to DEFERRED_PG_SET " +
+            "(with a comment) if adoption must not depend on them yet.");
     }
 
     [Fact]
@@ -133,12 +159,17 @@ public class VersionAutomationScriptTests
     [InlineData("src", "Aspire.Hosting.DocumentDB", "README.md")]
     public void ReadmeApiTableListsEverySelectablePgVariant(params string[] relativeSegments)
     {
-        // e.g. "Choose PG15/16/17/18 backend variant (default: Pg17)" — hand-maintained prose
-        // that silently went stale when Pg18 shipped. Expectation is derived from the enum.
-        var expected = "PG" + string.Join("/", PgVariantsInEnum());
+        // e.g. "Choose PG15/16/17/18 backend variant (default: Pg17)" - hand-maintained prose
+        // that silently went stale when Pg18 shipped. Compared for equality, not containment, so
+        // over-listing (announcing a variant that does not exist) fails too.
         var text = ReadRepoFile(relativeSegments);
 
-        Assert.Contains(expected, text, StringComparison.Ordinal);
+        var match = Regex.Match(text, @"PG(?<items>\d+(?:/\d+)*) backend variant");
+        Assert.True(match.Success,
+            $"Could not find the \"PGnn/nn backend variant\" list in {string.Join("/", relativeSegments)}.");
+
+        var listed = match.Groups["items"].Value.Split('/').Select(int.Parse).Order().ToArray();
+        Assert.Equal(PgVariantsInEnum(), listed);
     }
 
     [Theory]
@@ -146,13 +177,42 @@ public class VersionAutomationScriptTests
     [InlineData("| `enum DocumentDBPostgresVersion` |")]
     public void ConfigurationDocRowsListEverySelectablePgVariant(string rowPrefix)
     {
-        var expected = string.Join(", ", PgVariantsInEnum().Select(pg => $"`Pg{pg}`"));
         var row = ReadRepoFile("docs", "configuration.md")
             .Split('\n')
             .FirstOrDefault(line => line.TrimStart().StartsWith(rowPrefix, StringComparison.Ordinal));
 
         Assert.True(row is not null, $"Could not find a row starting with \"{rowPrefix}\" in docs/configuration.md.");
-        Assert.Contains(expected, row, StringComparison.Ordinal);
+
+        // Set equality: the row may mention a variant more than once (e.g. a caveat about Pg18),
+        // but it must not omit a selectable variant or advertise one that does not exist.
+        var listed = Regex.Matches(row, @"`Pg(?<pg>\d+)`")
+            .Select(m => int.Parse(m.Groups["pg"].Value))
+            .Distinct()
+            .Order()
+            .ToArray();
+
+        Assert.Equal(PgVariantsInEnum(), listed);
+    }
+
+    [Fact]
+    public void PostgresEndToEndAppPinsTheCurrentLatestVersion()
+    {
+        // The AppHost pins an explicit tag because it gates the NuGet publish workflow, and the
+        // pin plus its explanatory comments are hand-maintained in two files. Nothing else would
+        // notice if the pin were left behind at an older version.
+        var program = ReadRepoFile("tests", "Aspire.Hosting.DocumentDB.PostgresEndToEndApp", "Program.cs");
+
+        var match = Regex.Match(program, @"WithImageTag\(""(?<tag>pg\d+-(?<version>[\d.]+))""\)");
+        Assert.True(match.Success, "Could not find the WithImageTag(...) pin in the Postgres end-to-end AppHost.");
+
+        Assert.True(
+            match.Groups["version"].Value == DocumentDBVersions.Latest,
+            $"The Postgres end-to-end AppHost pins '{match.Groups["tag"].Value}' but " +
+            $"DocumentDBVersions.Latest is {DocumentDBVersions.Latest}. Bump the pin (and the " +
+            "comments referencing it) as part of adopting a new DocumentDB version.");
+
+        var integrationTests = ReadRepoFile("tests", "Aspire.Hosting.DocumentDB.Tests", "DocumentDBIntegrationTests.cs");
+        Assert.Contains(match.Groups["tag"].Value, integrationTests, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -166,13 +226,28 @@ public class VersionAutomationScriptTests
 
         foreach (var version in Enum.GetValues<DocumentDBVersion>())
         {
-            Assert.Contains($"{version} = {(int)version},", baseline, StringComparison.Ordinal);
+            AssertBaselineDeclaresMember(baseline, version.ToString(), (int)version);
             Assert.Contains($"public const string {version} = ", baseline, StringComparison.Ordinal);
         }
 
         foreach (var pg in Enum.GetValues<DocumentDBPostgresVersion>())
         {
-            Assert.Contains($"{pg} = {(int)pg},", baseline, StringComparison.Ordinal);
+            AssertBaselineDeclaresMember(baseline, pg.ToString(), (int)pg);
         }
+    }
+
+    /// <summary>
+    /// Asserts the baseline declares <paramref name="member"/> with <paramref name="value"/>.
+    /// The trailing comma is optional: dropping it on the last member of an enum is valid C# and
+    /// must not fail this guard.
+    /// </summary>
+    private static void AssertBaselineDeclaresMember(string baseline, string member, int value)
+    {
+        var declared = Regex.IsMatch(baseline, $@"\b{Regex.Escape(member)}\s*=\s*{value}\s*[,}}\r\n]");
+
+        Assert.True(declared,
+            $"The public API baseline (src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs) " +
+            $"does not declare '{member} = {value}'. Add it by hand - the baseline is the " +
+            "human-reviewed record of public API changes and is never written by automation.");
     }
 }

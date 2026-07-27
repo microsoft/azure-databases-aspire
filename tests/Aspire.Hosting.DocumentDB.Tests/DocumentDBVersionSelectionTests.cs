@@ -301,7 +301,7 @@ public class DocumentDBVersionSelectionTests
     public void WithPostgresVersionRejectsZero()
     {
         // The default(DocumentDBPostgresVersion) value is 0, which is not a defined member
-        // (Pg15, Pg16, Pg17 use explicit numeric values 15/16/17).
+        // (every member uses an explicit numeric value equal to its PostgreSQL major version).
         var appBuilder = DistributedApplication.CreateBuilder();
         var resourceBuilder = appBuilder.AddDocumentDB("documentdb");
 

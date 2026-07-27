@@ -47,22 +47,24 @@ unauthenticated rate limit). Used automatically inside GitHub Actions.
 6. A candidate **older** than the newest already-shipped version ("backfill") is skipped with a
    warning instead of adopted, because numeric enum values must never shift. Newer candidates in
    the same run are still adopted, so one backfill candidate cannot wedge adoption forever.
-7. A released version that is missing a required variant on GHCR is reported as
-   `[warn] X.Y.Z blocked: missing required variants [...]`, so stalled adoption is never silent.
+7. A released version newer than the newest shipped one that cannot be adopted is reported as
+   `[warn] X.Y.Z blocked: ...` — both when it is missing a required variant and when it has no
+   container tags at all (the common case: the GitHub release lands before the image build
+   finishes). Stalled adoption is therefore never silent.
 8. Parsing is fail-fast: an enum region line the script cannot parse, or a rewrite that would
    drop or renumber a shipped member, is a hard error rather than a silent partial rewrite.
 
 ### Adding a PG variant
 
-Adding a variant (for example a future `pg19`) is intentionally manual. Touch all of these — the
-listed guard test fails until you do:
+Adding a variant (for example a future `pg19`) is intentionally manual. Touch all of these; where
+the Guard column names a test, that test fails until you do — the rows marked "none" are on you:
 
 | Place | Guard |
 |---|---|
 | `DocumentDBPostgresVersion` in `src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs` (append-only; numeric value is the PG major) | compile-time |
 | `WithPostgresVersion` validation message in `src/Aspire.Hosting.DocumentDB/DocumentDBBuilderExtensions.cs` | none — check by hand |
 | Public API baseline `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` | `VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` |
-| `REQUIRED_PG_SET` here in the script (only once upstream publishes the tag for every version you intend to adopt) and the matching docstring line | `VersionAutomationScriptTests.RequiredPgSetIsASubsetOfDocumentDBPostgresVersion`, `ScriptDocstringListsTheSameRequiredPgSet` |
+| `REQUIRED_PG_SET` here in the script — or `DEFERRED_PG_SET` if upstream has not published the tag for every version you intend to adopt yet — and the matching docstring line | `VersionAutomationScriptTests.EveryPgVariantIsRequiredOrExplicitlyDeferred`, `RequiredPgSetIsASubsetOfDocumentDBPostgresVersion`, `ScriptDocstringListsTheSameRequiredPgSet` |
 | The expected set in `eng/scripts/tests/test_check_documentdb_versions.py` (`RequiredPgSetTests`) | itself |
 | `PG15/16/17/18` lists in `README.md` and `src/Aspire.Hosting.DocumentDB/README.md`; the `pgVersion` and `enum DocumentDBPostgresVersion` rows in `docs/configuration.md` | `ReadmeApiTableListsEverySelectablePgVariant`, `ConfigurationDocRowsListEverySelectablePgVariant` |
 | The `pgNN-X.Y.Z` adoption-policy sentences in this file and `docs/configuration.md` | `AdoptionPolicyDocsMentionEveryRequiredPgVariant` |
@@ -70,11 +72,14 @@ listed guard test fails until you do:
 
 Note that `REQUIRED_PG_SET` is the *adoption gate*, not the list of selectable variants: it may
 lag the enum (a variant users can select before it is required for adoption) and may shrink when
-upstream drops a variant. The guard test therefore asserts subset, not equality.
+upstream drops a variant. The guard tests therefore assert two weaker things instead of equality:
+every gated variant must be selectable (subset), and every selectable variant must be either
+gated or explicitly listed in `DEFERRED_PG_SET`, so a new enum member can never be forgotten here.
 
 Unrelated but adjacent: `tests/Aspire.Hosting.DocumentDB.PostgresEndToEndApp/Program.cs` pins an
 explicit `pg17-X.Y.Z` tag because it gates the NuGet publish workflow; bump that pin when
-adopting a new DocumentDB version.
+adopting a new DocumentDB version (`VersionAutomationScriptTests.PostgresEndToEndAppPinsTheCurrentLatestVersion`
+fails until you do).
 
 ### Trust assumption
 
