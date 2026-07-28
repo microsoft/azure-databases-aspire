@@ -84,6 +84,18 @@ var server = builder.AddDocumentDB("documentdb")
 
 This method mounts the volume at `targetPath` (which defaults to `/data`, matching the container default) and sets the `DATA_PATH` environment variable to match so DocumentDB writes to the mounted directory.
 
+> **Pin your credentials when you persist data.** The container hashes the configured password into a PostgreSQL role the first time it initialises a data directory, and that role then lives in the volume. `AddDocumentDB` generates a random password when you do not supply one, so the *second* run presents a different password than the one stored in the volume and every connection fails with `MongoAuthenticationException: ... Command saslContinue failed: Invalid key`. The data is intact but unreachable. Pass explicit `userName`/`password` parameters whenever you use `WithDataVolume` or `WithDataBindMount`:
+>
+> ```csharp
+> var userName = builder.AddParameter("documentdb-user");
+> var password = builder.AddParameter("documentdb-password", secret: true);
+>
+> var server = builder.AddDocumentDB("documentdb", userName: userName, password: password)
+>                     .WithDataVolume();
+> ```
+>
+> To change the password later, delete the volume (losing its contents) or alter the role through the PostgreSQL endpoint — see [WithPostgresEndpoint](#withpostgresendpoint).
+
 ## WithDataBindMount
 
 Mounts a host directory into the container for data persistence. Prefer `WithDataVolume` for most cases; bind mounts are useful when you need direct access to the data files on the host.
@@ -99,6 +111,8 @@ var server = builder.AddDocumentDB("documentdb")
 | `isReadOnly` | `bool` | `false` | Mount as read-only. |
 
 By default, this helper mounts data at `/data` inside the container (matching the container default) and sets `DATA_PATH` accordingly.
+
+> The credential caveat under [WithDataVolume](#withdatavolume) applies here too: supply explicit `userName`/`password` parameters, or the generated password will stop matching the role stored in the mounted directory on the next run.
 
 ## WithLogLevel
 

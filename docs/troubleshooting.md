@@ -95,7 +95,7 @@ Common causes:
 **Symptom:** `MongoAuthenticationException: Unable to authenticate`.
 
 **Causes and solutions:**
-1. **Wrong credentials.** The extension generates a random password on each run (unless you provide fixed parameters). Always use the Aspire-injected connection string rather than hardcoding credentials.
+1. **Wrong credentials.** The extension generates a random password on each run (unless you provide fixed parameters). Always use the Aspire-injected connection string rather than hardcoding credentials. If you persist data with `WithDataVolume()`/`WithDataBindMount()`, a generated password also stops matching the role stored in the volume — see [Authentication fails on the second run after adding a data volume](#authentication-fails-on-the-second-run-after-adding-a-data-volume).
 2. **Auth mechanism mismatch.** DocumentDB uses `SCRAM-SHA-256`. The connection string includes `authMechanism=SCRAM-SHA-256` automatically. If you construct your own connection string, include this parameter.
 3. **Auth database.** Credentials are created in the `admin` database. The connection string includes `authSource=admin` automatically.
 
@@ -140,19 +140,33 @@ builder.AddProject<Projects.MyService>("myservice")
 
 **Cause:** By default, DocumentDB stores data inside the container filesystem. This storage is ephemeral.
 
-**Solution:** Use `WithDataVolume()` to persist data in a Docker named volume:
+**Solution:** Use `WithDataVolume()` to persist data in a Docker named volume, and pin the credentials at the same time (see the next entry for why):
 
 ```csharp
-var server = builder.AddDocumentDB("documentdb")
+var userName = builder.AddParameter("documentdb-user");
+var password = builder.AddParameter("documentdb-password", secret: true);
+
+var server = builder.AddDocumentDB("documentdb", userName: userName, password: password)
                     .WithDataVolume();
 ```
 
 Or use `WithDataBindMount()` to persist data to a specific host directory:
 
 ```csharp
-var server = builder.AddDocumentDB("documentdb")
+var server = builder.AddDocumentDB("documentdb", userName: userName, password: password)
                     .WithDataBindMount("./data/documentdb");
 ```
+
+### Authentication fails on the second run after adding a data volume
+
+**Symptom:** The first run works. Every later run fails with `MongoAuthenticationException: Unable to authenticate using sasl protocol mechanism SCRAM-SHA-256` and an inner `Command saslContinue failed: Invalid key`. Removing the volume "fixes" it — and loses the data.
+
+**Cause:** The container hashes the configured password into a PostgreSQL role the first time it initialises a data directory, and that role is stored in the volume. `AddDocumentDB` generates a random password when you do not supply one, so the next run presents a password that no longer matches the persisted role. The data is intact; the credentials no longer open it.
+
+**Solutions:**
+1. **Supply explicit credential parameters** (the fix — see [Data lost after container restart](#data-lost-after-container-restart) above). Persisted data needs a password whose lifetime you control.
+2. **Already stuck with a volume you want to keep?** Change the role's password through the PostgreSQL backend instead of discarding the volume: enable [`WithPostgresEndpoint()`](configuration.md#withpostgresendpoint), connect with the credentials the volume was created with, and `ALTER ROLE ... PASSWORD ...`.
+3. **Do not need the data?** `docker volume rm <name>` and start again with pinned credentials.
 
 ### Corrupted data volume
 
