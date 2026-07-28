@@ -1,0 +1,608 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Net;
+using System.Net.Sockets;
+using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Testing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Logging;
+using MongoDB.Bson;
+using MongoDB.Driver;
+using Npgsql;
+using Xunit;
+using static Aspire.Hosting.DocumentDB.Tests.DocumentDBEndToEndSupport;
+using AppHost = Aspire.Hosting.DocumentDB.FeatureMatrixEndToEndApp.Program;
+
+namespace Aspire.Hosting.DocumentDB.Tests;
+
+/// <summary>
+/// Container-backed coverage for the parts of the public API that only had model-level tests:
+/// data persistence, credential parameters, multi-database topologies, every PostgreSQL backend
+/// variant, the observable container-configuration knobs, and the negative TLS and image-floor
+/// paths.
+/// </summary>
+/// <remarks>
+/// Model-level tests prove the resource graph is shaped correctly. These prove the container
+/// actually honours it — which is a different claim, and the one that breaks when an image
+/// changes underneath the package.
+/// </remarks>
+[Trait("Category", "Integration")]
+public class DocumentDBFeatureMatrixEndToEndTests
+{
+    // ------------------------------------------------------------------
+    // Credentials, multiple databases, database naming
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task CustomCredentialParametersAuthenticateAndBothDatabasesWork()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.CustomCredentialsMultiDbScenario));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        // Model-level facts that the container run then has to honour.
+        Assert.Equal("docdbuser", server.UserNameParameter?.Name);
+        Assert.Equal("docdbpass", server.PasswordParameter?.Name);
+        Assert.Equal(2, server.Databases.Count);
+
+        var primary = server.Databases.Single(d => d.Name == "primary");
+        var orders = server.Databases.Single(d => d.Name == "orders");
+        Assert.Equal("primary", primary.DatabaseName);
+        Assert.Equal("orders_db", orders.DatabaseName);   // resource name != database name
+        Assert.Same(server, orders.Parent);
+
+        await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var primaryConnectionString = await app.GetConnectionStringAsync("primary", cts.Token);
+        var ordersConnectionString = await app.GetConnectionStringAsync("orders", cts.Token);
+
+        // The custom credentials must be the ones in the connection string AND the ones the
+        // container provisioned - a mismatch shows up as an auth failure below.
+        Assert.Contains($"{AppHost.CustomUserName}:{AppHost.CustomPassword}@", primaryConnectionString!, StringComparison.Ordinal);
+        Assert.Contains("/orders_db", ordersConnectionString!, StringComparison.Ordinal);
+
+        await AssertRoundTripAsync(primaryConnectionString!, "primary", "widgets", "primary-widget", cts.Token);
+        await AssertRoundTripAsync(ordersConnectionString!, "orders_db", "orders", "order-1", cts.Token);
+
+        // The two databases must be genuinely distinct on the server.
+        var database = await ConnectAsync(primaryConnectionString!, "primary", cts.Token);
+        await database.GetCollection<BsonDocument>("marker").InsertOneAsync(
+            new BsonDocument { ["_id"] = "only-in-primary" }, cancellationToken: cts.Token);
+
+        var ordersDatabase = await ConnectAsync(ordersConnectionString!, "orders_db", cts.Token);
+        var strayCount = await ordersDatabase.GetCollection<BsonDocument>("marker")
+            .CountDocumentsAsync(Builders<BsonDocument>.Filter.Eq("_id", "only-in-primary"), cancellationToken: cts.Token);
+        Assert.Equal(0, strayCount);
+    }
+
+    // ------------------------------------------------------------------
+    // Data persistence
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task DataVolumeSurvivesTheContainerBeingReplaced()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var volumeName = $"aspire-documentdb-e2e-{Guid.NewGuid():N}";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
+            (AppHost.VolumeNameEnvironmentVariable, volumeName));
+
+        try
+        {
+            // First run: write a document, then tear the whole application down.
+            await using (var app = await BuildAndStartAsync(cts.Token))
+            {
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+
+                await database.GetCollection<BsonDocument>("persisted").InsertOneAsync(
+                    new BsonDocument { ["_id"] = "survivor", ["run"] = 1 },
+                    cancellationToken: cts.Token);
+
+                await app.StopAsync(cts.Token);
+            }
+
+            // Second run: a brand new container, same named volume.
+            await using (var app = await BuildAndStartAsync(cts.Token))
+            {
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+
+                var survivor = await database.GetCollection<BsonDocument>("persisted")
+                    .Find(Builders<BsonDocument>.Filter.Eq("_id", "survivor"))
+                    .SingleOrDefaultAsync(cts.Token);
+
+                Assert.NotNull(survivor);
+                Assert.Equal(1, survivor!["run"].AsInt32);
+
+                await app.StopAsync(cts.Token);
+            }
+        }
+        finally
+        {
+            await RemoveVolumeAsync(volumeName);
+        }
+    }
+
+    [Fact]
+    public async Task DataBindMountWritesToTheHostPathAndSurvivesARestart()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var bindMountPath = Path.Combine(Path.GetTempPath(), "aspire-documentdb-e2e", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(bindMountPath);
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.DataBindMountScenario),
+            (AppHost.BindMountPathEnvironmentVariable, bindMountPath));
+
+        try
+        {
+            await using (var app = await BuildAndStartAsync(cts.Token))
+            {
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+
+                await database.GetCollection<BsonDocument>("persisted").InsertOneAsync(
+                    new BsonDocument { ["_id"] = "bind-survivor" },
+                    cancellationToken: cts.Token);
+
+                await app.StopAsync(cts.Token);
+            }
+
+            // The PostgreSQL data directory must be visible on the host side of the mount.
+            Assert.True(
+                Directory.EnumerateFileSystemEntries(bindMountPath).Any(),
+                $"Expected the DocumentDB data directory to be materialised under '{bindMountPath}'.");
+
+            await using (var app = await BuildAndStartAsync(cts.Token))
+            {
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+
+                var survivor = await database.GetCollection<BsonDocument>("persisted")
+                    .Find(Builders<BsonDocument>.Filter.Eq("_id", "bind-survivor"))
+                    .SingleOrDefaultAsync(cts.Token);
+
+                Assert.NotNull(survivor);
+
+                await app.StopAsync(cts.Token);
+            }
+        }
+        finally
+        {
+            TryDeleteDirectory(bindMountPath);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // PostgreSQL backend variants
+    // ------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(AppHost.Pg15Scenario, "pg15-")]
+    [InlineData(AppHost.Pg16Scenario, "pg16-")]
+    public async Task EveryPostgresVariantResolvesToARealImageAndServesTraffic(string scenarioName, string expectedTagPrefix)
+    {
+        // Pg17 (the default) and Pg18 are covered elsewhere; together these four mean every
+        // member of DocumentDBPostgresVersion is proven to name an image that exists and runs,
+        // not merely a well-formed tag.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope((AppHost.ScenarioEnvironmentVariable, scenarioName));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
+        Assert.StartsWith(expectedTagPrefix, image.Tag, StringComparison.Ordinal);
+
+        await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "widgets", $"{scenarioName}-widget", cts.Token);
+    }
+
+    [Fact]
+    public async Task AnOlderCuratedDocumentDBVersionStillRuns()
+    {
+        // WithDocumentDBVersion is only meaningful if the older curated members still resolve to
+        // images that work; the curated list is append-only and claims support for all of them.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope((AppHost.ScenarioEnvironmentVariable, AppHost.OlderVersionScenario));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
+        Assert.Equal("pg17-0.112.0", image.Tag);
+
+        await app.StartAsync(cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+
+        // 0.112.0 predates the TLS_MODE fix, so it rejects plain connections - the connection
+        // string keeps TLS on by default, which is exactly why that default exists.
+        await AssertRoundTripAsync(connectionString!, "appdb", "widgets", "legacy-widget", cts.Token);
+    }
+
+    // ------------------------------------------------------------------
+    // Container configuration knobs, asserted against the container
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachTheContainer()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var otelEndpoint = "http://localhost:4317";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.ObservableConfigScenario),
+            (AppHost.OtelEndpointEnvironmentVariable, otelEndpoint));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        // Deliberately not gated on the health check. The claim under test is "this configuration
+        // reaches the container", and the OTLP endpoint points at a collector that is not running
+        // — which is realistic for this assertion but can slow the gateway's startup. Waiting for
+        // the container to exist is sufficient and keeps the test honest about what it proves.
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+
+        // WithOpenTelemetryMetrics: every argument must land as its documented variable.
+        Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]);
+        Assert.Equal(otelEndpoint, environment["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
+        Assert.Equal("15000", environment["OTEL_METRIC_EXPORT_INTERVAL"]);
+        Assert.Equal("7000", environment["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
+        Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
+        Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
+
+        // WithLogLevel and WithOwner.
+        Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("aspireowner", environment["OWNER"]);
+
+        // WithOwner is not just an environment variable: the entrypoint acts on it and says so.
+        // Polled, because the container id is available as soon as the container is created,
+        // which can be marginally before the entrypoint has written its banner.
+        var logs = await WaitForContainerLogAsync(containerId, "Using owner: aspireowner", cts.Token);
+        Assert.Contains("Using owner: aspireowner", logs, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithoutUserCreationLeavesTheContainerWithoutTheConfiguredUser()
+    {
+        // The container is told not to provision the user, while the connection string still
+        // carries those credentials - so the documented effect is an authentication failure, and
+        // the health check never goes healthy.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.WithoutUserCreationScenario));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+        Assert.Equal("false", environment["CREATE_USER"]);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+
+        // Not the end-to-end token: a cancelled run would throw OperationCanceledException and
+        // make this assertion pass without the container having refused anything.
+        var failure = await Record.ExceptionAsync(
+            () => PingOnceAsync(connectionString!, "appdb", CancellationToken.None));
+
+        Assert.NotNull(failure);
+        Assert.True(
+            failure is TimeoutException or MongoException,
+            $"Expected authentication against a container with no provisioned user to fail, but got: {failure}");
+    }
+
+    // ------------------------------------------------------------------
+    // TLS certificate validation
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task AllowInsecureTlsFalseRejectsTheContainersSelfSignedCertificate()
+    {
+        // AllowInsecureTls defaults to true for a reason: the container serves a self-signed
+        // certificate. Withdrawing the escape hatch must therefore fail closed, and the same
+        // endpoint must still work once validation is relaxed - proving it is the certificate
+        // being rejected and not a container that never came up.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope((AppHost.ScenarioEnvironmentVariable, AppHost.StrictTlsScenario));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var strictConnectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        Assert.Contains("tls=true", strictConnectionString!, StringComparison.Ordinal);
+        Assert.DoesNotContain("tlsInsecure", strictConnectionString!, StringComparison.Ordinal);
+
+        // Control first: relax validation on the very same endpoint.
+        var relaxed = strictConnectionString!.Replace("tls=true", "tls=true&tlsInsecure=true", StringComparison.Ordinal);
+        var database = await ConnectAsync(relaxed, "appdb", cts.Token);
+        await database.RunCommandAsync((Command<BsonDocument>)"{ ping: 1 }", cancellationToken: cts.Token);
+
+        var failure = await Record.ExceptionAsync(
+            () => PingOnceAsync(strictConnectionString!, "appdb", CancellationToken.None));
+
+        Assert.NotNull(failure);
+        Assert.True(
+            failure is TimeoutException or MongoException,
+            $"Expected strict TLS validation to reject the self-signed certificate, but got: {failure}");
+    }
+
+    // ------------------------------------------------------------------
+    // PostgreSQL endpoint: explicit port, extended_rum, and the version floor
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task PostgresEndpointHonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var postgresPort = GetAvailableTcpPort();
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresExtrasScenario),
+            (AppHost.PostgresPortEnvironmentVariable, postgresPort.ToString()));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var postgresEndpoint = Assert.Single(
+            Snapshot<EndpointAnnotation>(server.Annotations).Where(e => e.Name == "postgres"));
+        Assert.Equal(postgresPort, postgresEndpoint.Port);
+
+        await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        // The URI must point at whatever host port the endpoint actually resolved to. Note this
+        // is NOT asserted to equal the requested port: DistributedApplicationTestingBuilder
+        // reassigns fixed host ports so suites can run in parallel, so only the annotation above
+        // reflects the request. A normal `dotnet run` does honour it (verified separately).
+        var postgresConnectionString = await server.PostgresConnectionStringExpression.GetValueAsync(cts.Token);
+        var allocatedPostgresPort = postgresEndpoint.AllocatedEndpoint!.Port;
+        Assert.True(
+            postgresConnectionString!.Contains($":{allocatedPostgresPort}/", StringComparison.Ordinal),
+            $"Expected the PostgreSQL URI to use the allocated port {allocatedPostgresPort}, but it was '{postgresConnectionString}'.");
+
+        // WithoutExtendedRum: the access method must not be installed in the backend. Asserting
+        // this through PostgreSQL is the only way to see the effect of DISABLE_EXTENDED_RUM.
+        var accessMethods = await QueryPostgresAsync(
+            postgresConnectionString!,
+            "SELECT count(*) FROM pg_am WHERE amname = 'extended_rum'",
+            cts.Token);
+
+        Assert.Equal(0L, Convert.ToInt64(accessMethods));
+    }
+
+    [Fact]
+    public async Task PostgresEndpointOnAnImageBelowTheFloorFailsAtStartup()
+    {
+        // The 0.112.0 floor for WithPostgresEndpoint, exercised through a real orchestrator run
+        // rather than by publishing the event by hand. Nothing is pulled: the guard runs first.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresEndpointFloorScenario));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("pg17-0.111.0", diagnostics, StringComparison.Ordinal);
+        Assert.Contains("0.112.0", diagnostics, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresEndpoint", diagnostics, StringComparison.Ordinal);
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    private static async Task<string> WaitForContainerLogAsync(
+        string containerId,
+        string expectedSubstring,
+        CancellationToken cancellationToken)
+    {
+        var logs = string.Empty;
+
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            logs = await GetContainerLogsAsync(containerId);
+
+            if (logs.Contains(expectedSubstring, StringComparison.Ordinal))
+            {
+                return logs;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        return logs;
+    }
+
+    private static async Task<DistributedApplication> BuildAndStartAsync(CancellationToken cancellationToken)
+    {
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cancellationToken);
+        var app = await appHost.BuildAsync(cancellationToken);
+        await app.StartAsync(cancellationToken);
+        return app;
+    }
+
+    private static async Task WaitForResourceFailureAsync(
+        DistributedApplication app,
+        string resourceName,
+        CancellationToken cancellationToken)
+    {
+        var notifications = app.Services.GetRequiredService<ResourceNotificationService>();
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(60));
+
+        try
+        {
+            await foreach (var resourceEvent in notifications.WatchAsync(timeout.Token))
+            {
+                if (!string.Equals(resourceEvent.Resource.Name, resourceName, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (resourceEvent.Snapshot.State?.Text is { } stateText &&
+                    (stateText.Contains("Fail", StringComparison.OrdinalIgnoreCase) ||
+                     stateText.Contains("Error", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new InvalidOperationException($"Resource '{resourceName}' never reported a failed state.");
+        }
+    }
+
+    private static async Task<object?> QueryPostgresAsync(string postgresqlUri, string sql, CancellationToken cancellationToken)
+    {
+        // Npgsql does not parse postgresql:// URIs; convert to key/value form.
+        var uri = new Uri(postgresqlUri);
+        var userInfo = uri.UserInfo.Split(':', 2);
+        var database = uri.AbsolutePath.TrimStart('/');
+
+        var keyValue = new NpgsqlConnectionStringBuilder
+        {
+            Host = uri.Host,
+            Port = uri.Port,
+            Username = Uri.UnescapeDataString(userInfo[0]),
+            Password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : string.Empty,
+            Database = string.IsNullOrEmpty(database) ? "postgres" : database,
+            Timeout = 5,
+            CommandTimeout = 5,
+        }.ConnectionString;
+
+        Exception? lastException = null;
+
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            try
+            {
+                await using var connection = new NpgsqlConnection(keyValue);
+                await connection.OpenAsync(cancellationToken);
+
+                await using var command = new NpgsqlCommand(sql, connection);
+                return await command.ExecuteScalarAsync(cancellationToken);
+            }
+            catch (NpgsqlException ex)
+            {
+                lastException = ex;
+            }
+            catch (SocketException ex)
+            {
+                lastException = ex;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        throw new InvalidOperationException("PostgreSQL did not become reachable in time.", lastException);
+    }
+
+    private static int GetAvailableTcpPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
+        }
+        catch (IOException)
+        {
+            // The container may still hold handles on Windows; a temp directory is acceptable leakage.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Files written by the container as root.
+        }
+    }
+}

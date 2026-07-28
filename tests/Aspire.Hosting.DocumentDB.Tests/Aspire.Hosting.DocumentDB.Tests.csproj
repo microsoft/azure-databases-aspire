@@ -11,6 +11,7 @@
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.AdvancedConfigEndToEndApp\Aspire.Hosting.DocumentDB.AdvancedConfigEndToEndApp.csproj" />
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.PostgresEndToEndApp\Aspire.Hosting.DocumentDB.PostgresEndToEndApp.csproj" />
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.AdaptationEndToEndApp\Aspire.Hosting.DocumentDB.AdaptationEndToEndApp.csproj" />
+    <ProjectReference Include="..\Aspire.Hosting.DocumentDB.FeatureMatrixEndToEndApp\Aspire.Hosting.DocumentDB.FeatureMatrixEndToEndApp.csproj" />
     <PackageReference Include="Aspire.MongoDB.Driver" />
     <PackageReference Include="Aspire.Hosting.Testing" />
     <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
