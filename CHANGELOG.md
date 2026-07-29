@@ -6,16 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
-### Added
-- Pairing `WithPostgresVersion(DocumentDBPostgresVersion.Pg18)` with a DocumentDB version older than `0.114.0` now fails at startup with an actionable message naming the recovery, instead of failing the container pull with an opaque manifest-not-found error. Upstream only publishes `pg18-` images from `0.114.0` onwards, so every older pairing produces a well-formed tag that does not exist. Custom images and tags outside the `pg{NN}-X.Y.Z` grammar are exempt, and manifest generation is unaffected.
-
-### Fixed
-- Corrected the `UseTls` XML documentation (and the Markdown docs) that claimed the DocumentDB Local container *requires* TLS connections. From DocumentDB `0.114.0` the container's default `TLS_MODE=allowTLS` accepts both plain and TLS connections, so `UseTls(false)` now works against the default image; images up to `0.113.0` rejected plain connections regardless of that setting. Documented `.WithEnvironment("TLS_MODE", "requireTLS")` as the way to reject plain connections, including that it contradicts `UseTls(false)` and that the value is case-sensitive.
-- Corrected the data-persistence documentation, which recommended `WithDataVolume()` and `WithDataBindMount()` without pinning credentials — the one combination that breaks. The container hashes the configured password into a PostgreSQL role the first time it initialises a data directory, and that role is stored in the volume; because `AddDocumentDB` generates a random password when none is supplied, the *second* run presents a password the volume no longer recognises and every connection fails with `MongoAuthenticationException` / `Command saslContinue failed: Invalid key`, with the data intact but unreachable. `docs/configuration.md` now documents the caveat under both methods, and `docs/troubleshooting.md` carries a dedicated symptom entry with recovery paths (including `ALTER ROLE` through `WithPostgresEndpoint()`, so an existing volume need not be discarded).
-
 <!-- auto-generated:documentdb-versions-start -->
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
+
+## [0.114.1] - 2026-07-29
+
+### Fixed
+- Pairing `WithPostgresVersion(DocumentDBPostgresVersion.Pg18)` with a DocumentDB version older than `0.114.0` now fails at startup with an actionable message naming the recovery, instead of failing the container pull with an opaque manifest-not-found error. Upstream only publishes `pg18-` images from `0.114.0` onwards, so every older pairing produces a well-formed tag that does not exist. `Pg18` was introduced in `0.114.0`, so this gap shipped with that release. Custom images and tags outside the `pg{NN}-X.Y.Z` grammar are exempt, and manifest generation is unaffected.
+- Corrected the `UseTls` XML documentation (and the Markdown docs) that claimed the DocumentDB Local container *requires* TLS connections. From DocumentDB `0.114.0` the container's default `TLS_MODE=allowTLS` accepts both plain and TLS connections, so `UseTls(false)` now works against the default image; images up to `0.113.0` rejected plain connections regardless of that setting. Documented `.WithEnvironment("TLS_MODE", "requireTLS")` as the way to reject plain connections, including that it contradicts `UseTls(false)` and that the value is case-sensitive.
+- Corrected the data-persistence documentation, which recommended `WithDataVolume()` and `WithDataBindMount()` without pinning credentials — the one combination that breaks. The container hashes the configured password into a PostgreSQL role the first time it initialises a data directory, and that role is stored in the volume; because `AddDocumentDB` generates a random password when none is supplied, the *second* run presents a password the volume no longer recognises and every connection fails with `MongoAuthenticationException` / `Command saslContinue failed: Invalid key`, with the data intact but unreachable. `docs/configuration.md` now documents the caveat under both methods, and `docs/troubleshooting.md` carries a dedicated symptom entry with recovery paths (including `ALTER ROLE` through `WithPostgresEndpoint()`, so an existing volume need not be discarded).
 
 ## [0.114.0] - 2026-07-20
 
@@ -138,7 +138,8 @@ _No upstream DocumentDB versions detected since the last release. This block is 
 - SCRAM-SHA-256 authentication support
 - Container image: `ghcr.io/documentdb/documentdb/documentdb-local`
 
-[Unreleased]: https://github.com/microsoft/azure-databases-aspire/compare/v0.114.0...HEAD
+[Unreleased]: https://github.com/microsoft/azure-databases-aspire/compare/v0.114.1...HEAD
+[0.114.1]: https://github.com/microsoft/azure-databases-aspire/compare/v0.114.0...v0.114.1
 [0.114.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.113.0...v0.114.0
 [0.113.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.112.0...v0.113.0
 [0.112.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.111.0...v0.112.0
