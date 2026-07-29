@@ -388,6 +388,58 @@ internal static class DocumentDBEndToEndSupport
         return output;
     }
 
+    /// <summary>
+    /// Runs a shell command as root against a host directory bind-mounted at <c>/probe</c>.
+    /// </summary>
+    /// <remarks>
+    /// The DocumentDB entrypoint runs <c>initdb</c> against <c>DATA_PATH</c>, which leaves the data
+    /// directory mode 0700 owned by the container's uid. Linux bind mounts share the host inode, so
+    /// once the container has started, a test process running under a different uid — which is the
+    /// case on CI runners — can no longer even enumerate the host path. Docker Desktop on Windows and
+    /// macOS hides that behind a filesystem translation layer, which is why host-side enumeration
+    /// only fails on Linux. Reading the mount back through a container behaves the same everywhere.
+    /// The curated DocumentDB image doubles as the probe so no additional image has to be pulled.
+    /// </remarks>
+    public static async Task<(int ExitCode, string StandardOutput)> RunInBindMountAsync(
+        string hostPath,
+        string shellCommand,
+        bool isReadOnly = true) =>
+        await RunDockerAsync(
+            "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
+            "-v", isReadOnly ? $"{hostPath}:/probe:ro" : $"{hostPath}:/probe",
+            $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{DocumentDBContainerImageTags.Tag}",
+            "-c", shellCommand);
+
+    /// <summary>Lists the entries of a bind-mounted host directory from inside a container.</summary>
+    public static async Task<string[]> ListBindMountEntriesAsync(string hostPath)
+    {
+        var (exitCode, output) = await RunInBindMountAsync(hostPath, "ls -A /probe");
+
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Could not list the bind-mounted host path '{hostPath}' from a container (exit code {exitCode}).");
+        }
+
+        return output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    /// <summary>
+    /// Widens the modes under a bind-mounted host directory so the test process can delete it.
+    /// </summary>
+    /// <remarks>Best effort: a leaked temp directory is acceptable, a masked test failure is not.</remarks>
+    public static async Task TryRelaxBindMountPermissionsAsync(string hostPath)
+    {
+        try
+        {
+            await RunInBindMountAsync(hostPath, "chmod -R 0777 /probe", isReadOnly: false);
+        }
+        catch (InvalidOperationException)
+        {
+            // Docker is unavailable or wedged; the host-side delete will fall back to leaking.
+        }
+    }
+
     public static async Task RemoveVolumeAsync(string volumeName) =>
         await RunDockerAsync("volume", "rm", "-f", volumeName);
 
