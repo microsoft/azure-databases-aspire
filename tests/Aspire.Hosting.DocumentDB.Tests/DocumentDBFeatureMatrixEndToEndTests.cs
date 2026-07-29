@@ -168,9 +168,11 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 await app.StopAsync(cts.Token);
             }
 
-            // The PostgreSQL data directory must be visible on the host side of the mount.
+            // The PostgreSQL data directory must be visible on the host side of the mount. It is
+            // read back through a container because initdb leaves the directory 0700 owned by the
+            // container's uid, which locks this process out of the host path on Linux.
             Assert.True(
-                Directory.EnumerateFileSystemEntries(bindMountPath).Any(),
+                (await ListBindMountEntriesAsync(bindMountPath)).Length > 0,
                 $"Expected the DocumentDB data directory to be materialised under '{bindMountPath}'.");
 
             await using (var app = await BuildAndStartAsync(cts.Token))
@@ -189,6 +191,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
         finally
         {
+            await TryRelaxBindMountPermissionsAsync(bindMountPath);
             TryDeleteDirectory(bindMountPath);
         }
     }
