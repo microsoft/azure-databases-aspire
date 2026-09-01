@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
+### Fixed
+- Preserved `WithOpenTelemetryMetrics(...)` behavior for the DocumentDB `0.116.0` candidate image in direct AppHost run mode. Upstream `0.116.0` added explicit disabled telemetry values to `SetupConfiguration.json`, and the gateway gives those JSON values precedence over the standard OpenTelemetry environment variables. The integration now injects a version-scoped compatibility configuration without `TelemetryOptions` into the stock Local image configuration directory, allowing the documented environment variables to remain authoritative without replacing a caller-supplied `CONFIG_DIR`. Private registry mirrors retaining the official image path and tag receive the same override. Aspire publish mode rejects this affected combination because publisher support for the required runtime file override is not universal.
+- Corrected troubleshooting guidance that claimed health checks were not registered. The integration uses an authenticated MongoDB `ping`; documentation now distinguishes gateway availability from completion of the one-shot initialization phase introduced in DocumentDB `0.116.0`.
+
+### Changed
+- Added candidate-only container coverage for DocumentDB `0.116.0`: PG15-PG18 runtime smoke tests, persisted PG17 `0.114.0` to `0.116.0` migration, one-shot initialization, reserved username rejection, external PostgreSQL access, the new `lz4` TOAST default, and real OTLP metrics export. `DocumentDBVersions.Latest` remains `0.114.0` until this compatibility matrix passes in Docker-backed CI.
+- Documented the `0.116.0` `/data` image volume, data-directory lock, credential lifetime, and initialization-readiness semantics.
+
 ## [0.114.1] - 2026-07-29
 
 ### Fixed

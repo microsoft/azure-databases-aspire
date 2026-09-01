@@ -84,6 +84,12 @@ var server = builder.AddDocumentDB("documentdb")
 
 This method mounts the volume at `targetPath` (which defaults to `/data`, matching the container default) and sets the `DATA_PATH` environment variable to match so DocumentDB writes to the mounted directory.
 
+Starting with DocumentDB `0.116.0`, the upstream image declares `/data` as a Docker
+`VOLUME` even when this helper is not called. That produces a Docker-managed anonymous volume;
+do not depend on that anonymous volume for durable or predictable storage. Use
+`WithDataVolume()` with an explicit or generated named volume when persistence is intentional.
+DocumentDB `0.116.0` also prevents two running containers from sharing the same data directory.
+
 > **Pin your credentials when you persist data.** The container hashes the configured password into a PostgreSQL role the first time it initialises a data directory, and that role then lives in the volume. `AddDocumentDB` generates a random password when you do not supply one, so the *second* run presents a different password than the one stored in the volume and every connection fails with `MongoAuthenticationException: ... Command saslContinue failed: Invalid key`. The data is intact but unreachable. Pass explicit `userName`/`password` parameters whenever you use `WithDataVolume` or `WithDataBindMount`:
 >
 > ```csharp
@@ -222,8 +228,8 @@ var server = builder.AddDocumentDB("documentdb")
 ## WithOpenTelemetryMetrics
 
 Enables OpenTelemetry metrics export from the DocumentDB gateway via OTLP/gRPC. Requires
-container image v0.112-0 or later. Only metrics are exported today; traces and logs are not yet
-supported by the gateway.
+container image v0.112-0 or later. This API configures metrics only. The upstream gateway also
+supports tracing starting in v0.116-0, but this package does not yet expose a typed tracing API.
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
@@ -259,14 +265,29 @@ Merge semantics across multiple calls on the same builder:
 `WithOpenTelemetryMetrics` and the obsolete `WithTelemetry` set disjoint environment variables
 and do not interact.
 
+DocumentDB `0.116.0` ships telemetry values in its stock `SetupConfiguration.json`, and those
+JSON values take precedence over the standard environment variables. To preserve the documented
+environment-variable behavior, this method injects a compatibility `SetupConfiguration.json`
+into the stock Local image configuration directory. It retains the stable ports, certificate
+defaults, and reserved username prefixes but omits `TelemetryOptions`, so the gateway resolves
+metrics settings from the environment on both older images and `0.116.0`. If the caller sets a
+custom `CONFIG_DIR`, that custom configuration remains authoritative.
+
+The compatibility file is injected when the AppHost runs the official `0.116.0` Local image.
+Aspire publish mode is rejected for that exact image with `WithOpenTelemetryMetrics`, because not
+every publisher carries the required runtime file override. Failing explicitly avoids publishing
+a deployment where metrics are silently disabled. Direct AppHost run mode is supported. A custom
+image with corrected upstream telemetry configuration is not subject to this guard. A private
+registry mirror that keeps the official `documentdb/documentdb-local:pgNN-0.116.0` image path and
+tag receives the same compatibility override and publish guard.
+
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
 larger granularities.
 
 The gateway also reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TIMEOUT` when the
 signal-specific variants above are unset, plus `OTEL_RESOURCE_ATTRIBUTES`. These are not exposed
-by the typed API — set them via `WithEnvironment(...)` if you need them. Note that
-`OTEL_RESOURCE_ATTRIBUTES` is parsed by the gateway but not yet wired into startup as of v0.112-0.
+by the typed API — set them via `WithEnvironment(...)` if you need them.
 
 
 ## WithOwner

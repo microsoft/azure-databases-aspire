@@ -126,13 +126,17 @@ TLS and insecure TLS are enabled by default so the .NET MongoDB driver can conne
 
 ### Data persistence
 
-By default, DocumentDB stores data inside the container, and restarting the container removes it. Use `WithDataVolume()` to persist it:
+Use `WithDataVolume()` when data must persist predictably across container replacement:
 
 ```csharp
 builder.AddDocumentDB("documentdb")
        .WithDataVolume()
        .AddDatabase("mydb");
 ```
+
+DocumentDB `0.116.0` declares `/data` as an image volume, so Docker may create an anonymous
+volume even without this helper. Anonymous-volume lifetime is controlled by the container
+runtime; use a named volume and stable credentials for intentional persistence.
 
 ## More information
 

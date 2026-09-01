@@ -749,6 +749,67 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public async Task WithOpenTelemetryMetricsInjectsEnvironmentAuthoritativeConfigurationOnce()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(endpoint: "http://first:4317")
+            .WithOpenTelemetryMetrics(serviceName: "documentdb-local");
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var configuration = Assert.Single(
+            containerResource.Annotations
+                .OfType<ContainerFileSystemCallbackAnnotation>()
+                .Where(annotation =>
+                    annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.False(env.ContainsKey("CONFIG_DIR"));
+        Assert.NotNull(configuration.Callback);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDoesNotReplaceCustomConfigDirectory()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("CONFIG_DIR", "/custom/documentdb/config")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal("/custom/documentdb/config", env["CONFIG_DIR"]);
+    }
+
+    [Fact]
+    public void WithOpenTelemetryMetricsAppliesCompatibilityConfigurationToPrivateMirrors()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageRegistry("registry.example.com")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        Assert.Single(
+            containerResource.Annotations
+                .OfType<ContainerFileSystemCallbackAnnotation>()
+                .Where(annotation =>
+                    annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
+    }
+
+    [Fact]
     public async Task WithOpenTelemetryMetricsRespectsExplicitFalse()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
@@ -969,6 +1030,21 @@ public class AddDocumentDBTests
         Assert.Equal("10000", manifest["env"]?["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]?.GetValue<string>());
         Assert.Equal("documentdb-local", manifest["env"]?["OTEL_SERVICE_NAME"]?.GetValue<string>());
         Assert.Equal("0.112.0", manifest["env"]?["OTEL_SERVICE_VERSION"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejects0116PublishMode()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ManifestUtils.GetManifest(documentDB.Resource));
+
+        Assert.Contains("v0.116.0", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("SetupConfiguration.json", exception.Message, StringComparison.Ordinal);
     }
 
 

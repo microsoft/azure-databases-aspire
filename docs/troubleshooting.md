@@ -42,6 +42,7 @@ Common causes:
 - Port already in use (see [Port conflicts](#port-conflicts) below)
 - Insufficient Docker resources (memory, disk)
 - Corrupted data volume (remove the volume and restart)
+- A username beginning with a reserved DocumentDB `0.116.0` prefix (`documentdb`, `citus`, `pg`, or `internal_role`)
 
 ## Connection issues
 
@@ -86,7 +87,11 @@ Common causes:
 1. **Container not ready yet.** DocumentDB takes a few seconds to initialize. Use `.WaitFor(db)` in your AppHost to improve startup ordering.
 
 > [!IMPORTANT]
-> This integration does not currently register health checks. Your service should handle transient connection failures with retry/backoff until DocumentDB is ready.
+> This integration registers an authenticated MongoDB `ping` health check. It proves that the
+> gateway is accepting authenticated requests, but on DocumentDB `0.116.0` the gateway can become
+> reachable before one-shot custom or sample initialization has completed. A dependent resource
+> that requires seeded data should still retry that data access rather than treating `WaitFor` as
+> proof that initialization scripts have finished.
 2. **Wrong port.** By default, Aspire assigns a random host port. Do not hardcode ports in your service — use `WithReference()` to inject the connection string automatically.
 3. **Firewall or network issue.** If running Docker in a VM or WSL2, ensure port forwarding is configured.
 
@@ -230,6 +235,7 @@ DocumentDB container logs can help diagnose startup and runtime issues:
 
 ## Known limitations
 
-- **Health checks are not enabled by default.** This integration does not currently register health checks. Use `.WaitFor()` to sequence resource startup.
+- **Health readiness is gateway readiness.** The built-in authenticated MongoDB health check does
+  not prove that DocumentDB `0.116.0` one-shot initialization scripts have completed.
 - **No built-in backup/restore.** For development data, use `WithDataVolume()` for persistence. For important data, use `mongodump` / `mongorestore` manually.
 - **Single server only.** The extension does not support replica sets or sharded clusters. It runs a single DocumentDB container intended for local development.
