@@ -110,7 +110,7 @@ You can find the generated connection string in the Aspire dashboard under the r
 
 - **TLS is enabled by default.** The DocumentDB container uses a self-signed certificate. The extension automatically adds `tls=true&tlsInsecure=true` to the connection string so the .NET MongoDB driver accepts the self-signed certificate.
 - **Credentials are auto-generated.** Unless you provide explicit parameters, the extension generates a random password and uses `admin` as the default username.
-- **Data is ephemeral.** By default, DocumentDB stores data inside the container. When the container stops, you lose that data. Use `WithDataVolume()` or `WithDataBindMount()` to persist data across restarts. See [Configuration](configuration.md) for details.
+- **Data is ephemeral.** By default, DocumentDB stores data in a container-runtime-managed anonymous volume that is not reused between runs and that container removal can strand. When the container is replaced, you lose that data. Use `WithDataVolume()` or `WithDataBindMount()` to persist data across restarts — they also suppress the anonymous volume. A data directory must be writable, backs only one running container at a time, and is initialized only once. See [Storage requirements](configuration.md#storage-requirements) for details.
 
 ## Next steps
 

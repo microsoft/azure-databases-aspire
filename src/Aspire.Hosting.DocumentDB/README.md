@@ -72,8 +72,8 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `AddDocumentDB(name, port?, userName?, password?)` | Add a DocumentDB server container |
 | `.AddDatabase(name, databaseName?)` | Add a named database |
 | `.WithHostPort(port)` | Bind to a fixed host port (default: random) |
-| `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume |
-| `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
+| `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume (`isReadOnly: true` is rejected) |
+| `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount (`isReadOnly: true` is rejected) |
 | `.WithLogLevel(level)` | Set gateway `DOCUMENTDB_LOG_LEVEL` and entrypoint-contract `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
 | `.WithInitData(source)` | Bind-mount initialization scripts to `/init_doc_db.d` and disable built-in sample data |
 | `.WithoutSampleData()` | Disable the built-in sample data initialization |
@@ -154,9 +154,18 @@ builder.AddDocumentDB("documentdb")
        .AddDatabase("mydb");
 ```
 
-DocumentDB `0.116.0` declares `/data` as an image volume, so Docker may create an anonymous
-volume even without this helper. Anonymous-volume lifetime is controlled by the container
-runtime; use a named volume and stable credentials for intentional persistence.
+DocumentDB `0.116.0` declares `/data` as an image volume, so a run that mounts nothing there
+gets an anonymous volume whose lifetime the container runtime controls and which container
+removal can strand. `WithDataVolume()` and `WithDataBindMount(...)` mount on that same path,
+which both makes persistence intentional and suppresses the anonymous volume. Pair either with
+stable credential parameters.
+
+The data directory must be writable and is exclusive: `isReadOnly: true` is rejected, and only
+one running container at a time may use a given volume or host directory. Initialization
+(sample data or `WithInitData(...)`) runs once per data directory and is not retried after a
+failed attempt. See the
+[configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#storage-requirements)
+for the full rules.
 
 ## More information
 

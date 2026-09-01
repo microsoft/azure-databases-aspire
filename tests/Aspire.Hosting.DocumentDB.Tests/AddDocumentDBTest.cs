@@ -473,25 +473,339 @@ public class AddDocumentDBTests
         Assert.Equal("/custom/data/path", dataPath.Value);
     }
 
+    // ---------------------------------------------------------------------
+    // Data-directory storage safeguards (DocumentDB 0.116.0)
+    //
+    // 0.116.0 declares /data as an image VOLUME, claims the data directory
+    // with an exclusive flock, and lets initdb take ownership of it. Each of
+    // those makes a previously "accepted but broken" configuration fail late
+    // and confusingly, so the package rejects them up front.
+    // ---------------------------------------------------------------------
+
     [Fact]
-    public async Task WithDataVolumeSupportsReadOnlyVolumes()
+    public async Task WithDataVolumeNormalizesTrailingSlashInTargetPath()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder
             .AddDocumentDB("DocumentDB")
-            .WithDataVolume(isReadOnly: true);
+            .WithDataVolume(targetPath: "/custom/data/");
 
         using var app = appBuilder.Build();
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
 
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.Volume));
-        Assert.Equal("/data", volumeAnnotation.Target);
-        Assert.True(volumeAnnotation.IsReadOnly);
+        var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+        Assert.Equal("/custom/data", volumeAnnotation.Target);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
-        var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/data", dataPath.Value);
+        Assert.Equal("/custom/data", Assert.Single(env.Where(entry => entry.Key == "DATA_PATH")).Value);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("data")]
+    [InlineData("./data")]
+    [InlineData("C:\\data")]
+    [InlineData("/")]
+    [InlineData("///")]
+    public void WithDataVolumeRejectsInvalidTargetPaths(string targetPath)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(() => documentDB.WithDataVolume(targetPath: targetPath));
+
+        Assert.Equal("targetPath", exception.ParamName);
+        Assert.Contains("/data", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WithDataVolumeRejectsReadOnlyVolumes()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(() => documentDB.WithDataVolume(isReadOnly: true));
+
+        Assert.Equal("isReadOnly", exception.ParamName);
+        Assert.Contains("WithDataVolume(isReadOnly: true) is not supported", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("writable data directory", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("PostgreSQL failed to start within 60 seconds", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithInitData", exception.Message, StringComparison.Ordinal);
+
+        // The rejected call must not leave a half-configured resource behind.
+        using var app = appBuilder.Build();
+        var containerResource = Assert.Single(
+            app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+        Assert.Empty(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+    }
+
+    [Fact]
+    public void WithDataBindMountRejectsReadOnlyBindMounts()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(() => documentDB.WithDataBindMount("/host/data", isReadOnly: true));
+
+        Assert.Equal("isReadOnly", exception.ParamName);
+        Assert.Contains("WithDataBindMount(isReadOnly: true) is not supported", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Read-only file system", exception.Message, StringComparison.Ordinal);
+
+        using var app = appBuilder.Build();
+        var containerResource = Assert.Single(
+            app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+        Assert.Empty(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+    }
+
+    [Fact]
+    public async Task ReadOnlyVolumeOnDefaultDataPathThrowsAtStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'raw-data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Read-only file system", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadOnlyBindMountOnCustomDataPathThrowsAtStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "writable", targetPath: "/pgdata")
+            .WithBindMount("/host/data", "/pgdata", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WritableDataMountStartsWithoutStorageWarnings()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedWithModelAsync(app, resource);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task DuplicateDataMountsThrowAtStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "first")
+            .WithDataVolume(name: "second");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("2 mounts on its data directory ('/data')", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("duplicate mount targets", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DataVolumeSharedWithAnotherDocumentDBResourceThrowsAtStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("'primary' and DocumentDB resource 'secondary'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("exclusive lock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("another DocumentDB container is already using the data directory", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DataBindMountSharedWithAnotherDocumentDBResourceThrowsAtStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("primary").WithDataBindMount("./shared");
+        appBuilder.AddDocumentDB("secondary").WithDataBindMount("./shared/");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("host directory", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("give each resource its own storage", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task DataBindMountSharedWithANonDocumentDBResourceStartsWithoutWarnings()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB").WithDataBindMount("./shared");
+        appBuilder.AddContainer("backup", "alpine").WithBindMount("./shared", "/backup", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedWithModelAsync(app, resource);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task DistinctDataVolumesStartWithoutStorageWarnings()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "primary-data");
+        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "secondary-data");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        await PublishBeforeResourceStartedWithModelAsync(app, resource);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SharedDataVolumeWithExplicitlyStartedResourceWarnsInsteadOfThrowing()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby").WithDataVolume(name: "shared-data").WithExplicitStart();
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        await PublishBeforeResourceStartedWithModelAsync(app, resource);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("'primary' and DocumentDB resource 'standby'", message, StringComparison.Ordinal);
+        Assert.Contains("volume 'shared-data'", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathWarnsAboutTheDeclaredImageVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("/pgdata", message, StringComparison.Ordinal);
+        Assert.Contains("anonymous volume", message, StringComparison.Ordinal);
+        Assert.Contains("/data", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathDoesNotWarnWhenTheImageVolumeIsAlsoMounted()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "pgdata", targetPath: "/pgdata")
+            .WithVolume("declared-image-volume", "/data");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task WithInitDataReadOnlyMountIsNotTreatedAsADataMount()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithInitData("./seed");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var initDataMount = Assert.Single(resource.Annotations.OfType<ContainerMountAnnotation>().Where(m => m.Target == "/init_doc_db.d"));
+        Assert.True(initDataMount.IsReadOnly);
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Fact]
+    public async Task WithDataVolumeIsRepresentedInTheManifest()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(name: "documentdb-data");
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("documentdb-data", manifest["volumes"]?[0]?["name"]?.ToString());
+        Assert.Equal("/data", manifest["volumes"]?[0]?["target"]?.ToString());
+        Assert.Equal("false", manifest["volumes"]?[0]?["readOnly"]?.ToString().ToLowerInvariant());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
+    }
+
+    [Fact]
+    public async Task WithDataBindMountIsRepresentedInTheManifest()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataBindMount("./documentdb-data");
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("/data", manifest["bindMounts"]?[0]?["target"]?.ToString());
+        Assert.Equal("false", manifest["bindMounts"]?[0]?["readOnly"]?.ToString().ToLowerInvariant());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
     }
 
     [Fact]
@@ -517,25 +831,12 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithDataBindMountSupportsReadOnlyBindMounts()
+    public void WithDataBindMountRejectsReadOnlyBindMountsAtTheApiBoundary()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder
-            .AddDocumentDB("DocumentDB")
-            .WithDataBindMount("/host/data", isReadOnly: true);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
 
-        using var app = appBuilder.Build();
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var bindMountAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.BindMount));
-        Assert.Equal("/host/data", bindMountAnnotation.Source);
-        Assert.Equal("/data", bindMountAnnotation.Target);
-        Assert.True(bindMountAnnotation.IsReadOnly);
-
-        var env = await BuildEnvironmentVariablesAsync(containerResource);
-        var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/data", dataPath.Value);
+        Assert.Throws<ArgumentException>(() => documentDB.WithDataBindMount("/host/data", isReadOnly: true));
     }
 
     [Fact]
@@ -1839,6 +2140,22 @@ public class AddDocumentDBTests
         var services = useEmptyServices
             ? new ServiceCollection().AddSingleton(app.Services.GetRequiredService<ILoggerFactory>()).BuildServiceProvider()
             : app.Services;
+        var evt = new BeforeResourceStartedEvent(resource, services);
+        return eventing.PublishAsync(evt, EventDispatchBehavior.BlockingSequential, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Publishes <see cref="BeforeResourceStartedEvent"/> with services that expose both the
+    /// capturable <see cref="ILoggerFactory"/> fallback and the application model, which the
+    /// storage guard needs to see sibling resources.
+    /// </summary>
+    private static Task PublishBeforeResourceStartedWithModelAsync(DistributedApplication app, IResource resource)
+    {
+        var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
+        var services = new ServiceCollection()
+            .AddSingleton(app.Services.GetRequiredService<ILoggerFactory>())
+            .AddSingleton(app.Services.GetRequiredService<DistributedApplicationModel>())
+            .BuildServiceProvider();
         var evt = new BeforeResourceStartedEvent(resource, services);
         return eventing.PublishAsync(evt, EventDispatchBehavior.BlockingSequential, CancellationToken.None);
     }
