@@ -211,12 +211,11 @@ mode `0700`. Consequences:
   `WithDataBindMount(...)`); the container runtime rejects duplicate mount targets, so the
   integration fails the start with a clear message instead.
 
-### Initialization is one-shot per data directory
+### Initialization is one-shot per data directory (`0.116.0` and later)
 
 Sample data (`INIT_DATA`) and custom scripts mounted with `WithInitData(...)` run **once per data
-directory**, not once per container start. `0.116.0` records markers under
-`<data-path>/.documentdb-local/` (earlier images track initialization differently and do not write
-these files):
+directory**, not once per container start. `0.116.0` introduced that guarantee and records it with
+markers under `<data-path>/.documentdb-local/`:
 
 | Marker | Meaning |
 |---|---|
@@ -240,6 +239,15 @@ up`, host reboots, and volume backups.
 
 Without persistent storage, every run starts from an empty data directory, so initialization runs
 on every run.
+
+**On `0.114.0` and earlier there are no markers and no one-shot behavior.** The entrypoint runs
+whatever initialization you requested on **every container start**: custom scripts whenever the
+mounted `INIT_DATA_PATH` directory contains `.js` files, and sample data whenever `INIT_DATA=true`.
+With a persisted data directory that means the same scripts are replayed against data they have
+already seeded, so on these images seed scripts must be **idempotent** — guard inserts on a lookup,
+prefer upserts over blind inserts, and do not assume an empty collection. `WithoutSampleData()`
+stops the built-in sample import from being replayed. There is no failed-attempt marker either: a
+script that failed part way is simply run again on the next start.
 
 ## WithLogLevel
 
@@ -268,6 +276,9 @@ var server = builder.AddDocumentDB("documentdb")
 | `source` | `string` | (required) | Host directory containing initialization scripts. Mounted read-only at `/init_doc_db.d` and exposed via `INIT_DATA_PATH`. |
 
 This helper also sets `SKIP_INIT_DATA=true` so the container does not also import its built-in sample collections.
+
+> [!NOTE]
+> From `0.116.0` these scripts run **once per data directory** and are not retried after a failed attempt. On `0.114.0` and earlier they run on **every container start**, so with persisted storage they must be idempotent. See [Initialization is one-shot per data directory](#initialization-is-one-shot-per-data-directory-01160-and-later).
 
 ## WithoutSampleData
 
@@ -670,7 +681,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Insecure TLS | Enabled (allows self-signed certificates) |
 | Container default data path | `/data` (declared as an image `VOLUME` from `0.116.0`) |
 | Persistence helper default path | `/data` |
-| Data directory access | Writable, empty or an existing cluster, initialized once; exclusive to one running container from `0.116.0` |
+| Data directory access | Writable, empty or an existing cluster; from `0.116.0` also initialized once and exclusive to one running container |
 | Auth mechanism | `SCRAM-SHA-256` |
 | Auth database | `admin` |
 
