@@ -986,9 +986,9 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// The bundled PostgreSQL instance creates the default <c>documentdb</c> role. A custom value
     /// must name a role that already exists, such as the owner of an externally managed
-    /// PostgreSQL instance. DocumentDB <c>0.116.0</c> fails startup explicitly when the configured
-    /// role does not exist; earlier images may instead start without a usable DocumentDB admin
-    /// user.
+    /// PostgreSQL instance. DocumentDB <c>0.116.0</c> aborts explicitly while creating the
+    /// DocumentDB admin user when the configured role does not exist. Earlier images also fail
+    /// startup, but only later while waiting for the gateway to start.
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="owner">The existing PostgreSQL role used for DocumentDB database operations.</param>

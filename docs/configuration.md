@@ -309,8 +309,8 @@ var server = builder.AddDocumentDB("documentdb")
 
 The bundled PostgreSQL instance creates the default `documentdb` role. A custom owner must already
 exist, which is primarily useful with an externally managed PostgreSQL instance. DocumentDB
-`0.116.0` fails startup explicitly when the configured role is absent; earlier images may
-continue startup without successfully creating the configured DocumentDB admin user.
+`0.116.0` aborts explicitly while creating the DocumentDB admin user when the configured role is
+absent. Earlier images also fail startup, but only later while waiting for the gateway to start.
 
 ## UseTls
 
