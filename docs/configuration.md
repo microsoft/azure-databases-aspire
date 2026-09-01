@@ -177,17 +177,26 @@ This sets `DISABLE_EXTENDED_RUM=true` on the container. On container images olde
 ## WithoutUserCreation
 
 Disables the automatic user creation performed by the DocumentDB Local
-container on startup. A fresh v0.116 container can remain running with
-`CREATE_USER=false` when no initialization requiring those credentials is
-requested. The generated connection strings will not authenticate unless that
-user already exists, typically in persisted storage from an earlier run.
+container on startup.
+
+For curated images 0.112.0 and older, built-in sample initialization is enabled
+by default. On a fresh container, `WithoutUserCreation()` must be paired with
+`WithoutSampleData()` so the default initialization does not require the
+skipped credentials.
+
+For curated images 0.113.0 and later, including 0.116.0, built-in sample
+initialization does not run unless requested. A fresh container can therefore
+remain running with `CREATE_USER=false` when no initialization requiring those
+credentials is requested. The generated connection strings still will not
+authenticate unless that user already exists, typically in persisted storage
+from an earlier run.
 
 > [!WARNING]
-> Built-in sample initialization and custom scripts mounted through
-> `WithInitData(...)` authenticate using the configured credentials. If either
-> initialization path is requested and the skipped user does not already
-> exist, initialization fails and the container exits. `WithoutSampleData()`
-> disables only built-in sample data; it does not disable custom initialization.
+> On every version, requested built-in sample initialization and custom scripts
+> mounted through `WithInitData(...)` authenticate using the configured
+> credentials. If the skipped user does not already exist, that initialization
+> can fail and cause the container to exit. `WithoutSampleData()` disables only
+> built-in sample data; it does not disable custom initialization.
 
 ```csharp
 // Reuse a previously created user while skipping built-in sample data

@@ -111,10 +111,16 @@ initialization source. Use `WithoutSampleData()` when you want to disable the
 built-in sample collections. It does not disable custom initialization scripts
 configured through `WithInitData(...)`.
 
-`WithoutUserCreation()` allows a fresh v0.116 container to start without
-provisioning the configured user when no initialization requiring those
-credentials is requested. Built-in or custom initialization will fail if it
-needs a user that was skipped and does not already exist in persisted storage.
+For curated images 0.112.0 and older, built-in sample initialization is enabled
+by default, so `WithoutUserCreation()` must be paired with
+`WithoutSampleData()` on a fresh container. From 0.113.0 onward, including
+0.116.0, built-in sample initialization is opt-in and a fresh container can
+remain running without creating the user when no initialization requiring those
+credentials is requested. Generated connection strings still will not
+authenticate unless that user already exists, typically in persisted storage
+from an earlier run. On every version, requested built-in or custom
+initialization can fail if the skipped user does not already exist.
+`WithoutSampleData()` does not disable custom initialization.
 
 `WithTlsCertificate(...)` mounts the certificate and key files at distinct
 container paths, so they can be supplied even when their host file names are
