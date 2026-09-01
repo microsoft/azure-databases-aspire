@@ -31,6 +31,8 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Trait("Category", "Integration")]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
+    private const string CandidateVersion = "0.116.0";
+
     // ------------------------------------------------------------------
     // Credentials, multiple databases, database naming
     // ------------------------------------------------------------------
@@ -196,6 +198,155 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
+    [Fact]
+    public async Task PersistedPg17DataUpgradesFrom0114To0116()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var volumeName = $"aspire-documentdb-upgrade-{Guid.NewGuid():N}";
+
+        try
+        {
+            using (var scenario = new EnvironmentScope(
+                       (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
+                       (AppHost.VolumeNameEnvironmentVariable, volumeName),
+                       (AppHost.ImageTagEnvironmentVariable, "pg17-0.114.0")))
+            {
+                await using var app = await BuildAndStartAsync(cts.Token);
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+
+                await database.GetCollection<BsonDocument>("upgrade").InsertOneAsync(
+                    new BsonDocument { ["_id"] = "pre-upgrade", ["version"] = "0.114.0" },
+                    cancellationToken: cts.Token);
+
+                await app.StopAsync(cts.Token);
+            }
+
+            using (var scenario = new EnvironmentScope(
+                       (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
+                       (AppHost.VolumeNameEnvironmentVariable, volumeName),
+                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+            {
+                await using var app = await BuildAndStartAsync(cts.Token);
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+                var collection = database.GetCollection<BsonDocument>("upgrade");
+
+                var existing = await collection
+                    .Find(Builders<BsonDocument>.Filter.Eq("_id", "pre-upgrade"))
+                    .SingleOrDefaultAsync(cts.Token);
+                Assert.NotNull(existing);
+
+                await collection.InsertOneAsync(
+                    new BsonDocument { ["_id"] = "post-upgrade", ["version"] = CandidateVersion },
+                    cancellationToken: cts.Token);
+                Assert.Equal(
+                    2,
+                    await collection.CountDocumentsAsync(FilterDefinition<BsonDocument>.Empty, cancellationToken: cts.Token));
+
+                await app.StopAsync(cts.Token);
+            }
+        }
+        finally
+        {
+            await RemoveVolumeAsync(volumeName);
+        }
+    }
+
+    [Fact]
+    public async Task CustomInitializationRunsOnlyOnceForAPersisted0116Volume()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var volumeName = $"aspire-documentdb-init-{Guid.NewGuid():N}";
+        var initDataPath = Path.Combine(Path.GetTempPath(), "aspire-documentdb-init", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(initDataPath);
+        var scriptPath = Path.Combine(initDataPath, "01-seed.js");
+
+        try
+        {
+            await File.WriteAllTextAsync(scriptPath, """
+                db = db.getSiblingDB("appdb");
+                db.seed.insertOne({ _id: "first-run" });
+                """, cts.Token);
+
+            using (var scenario = new EnvironmentScope(
+                       (AppHost.ScenarioEnvironmentVariable, AppHost.InitDataVolumeScenario),
+                       (AppHost.VolumeNameEnvironmentVariable, volumeName),
+                       (AppHost.InitDataPathEnvironmentVariable, initDataPath),
+                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+            {
+                await using var app = await BuildAndStartAsync(cts.Token);
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+                await WaitForDocumentAsync(database, "seed", "first-run", cts.Token);
+
+                var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+                var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+                var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+                var logs = await WaitForContainerLogAsync(
+                    containerId,
+                    "=== DocumentDB is ready ===",
+                    cts.Token);
+                Assert.Contains("Custom data initialization completed.", logs, StringComparison.Ordinal);
+                Assert.Contains("=== DocumentDB is ready ===", logs, StringComparison.Ordinal);
+
+                await app.StopAsync(cts.Token);
+            }
+
+            await File.WriteAllTextAsync(scriptPath, """
+                db = db.getSiblingDB("appdb");
+                db.seed.insertOne({ _id: "second-run" });
+                """, cts.Token);
+
+            using (var scenario = new EnvironmentScope(
+                       (AppHost.ScenarioEnvironmentVariable, AppHost.InitDataVolumeScenario),
+                       (AppHost.VolumeNameEnvironmentVariable, volumeName),
+                       (AppHost.InitDataPathEnvironmentVariable, initDataPath),
+                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+            {
+                await using var app = await BuildAndStartAsync(cts.Token);
+                var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+                var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+                var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+                var logs = await WaitForContainerLogAsync(
+                    containerId,
+                    "Custom data already initialized",
+                    cts.Token);
+                Assert.Contains(
+                    "Custom data already initialized",
+                    logs,
+                    StringComparison.Ordinal);
+                logs = await WaitForContainerLogAsync(
+                    containerId,
+                    "=== DocumentDB is ready ===",
+                    cts.Token);
+                Assert.Contains("=== DocumentDB is ready ===", logs, StringComparison.Ordinal);
+
+                var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+                var collection = database.GetCollection<BsonDocument>("seed");
+
+                Assert.NotNull(await collection
+                    .Find(Builders<BsonDocument>.Filter.Eq("_id", "first-run"))
+                    .SingleOrDefaultAsync(cts.Token));
+                Assert.Null(await collection
+                    .Find(Builders<BsonDocument>.Filter.Eq("_id", "second-run"))
+                    .SingleOrDefaultAsync(cts.Token));
+
+                await app.StopAsync(cts.Token);
+            }
+        }
+        finally
+        {
+            await RemoveVolumeAsync(volumeName);
+            TryDeleteDirectory(initDataPath);
+        }
+    }
+
     // ------------------------------------------------------------------
     // PostgreSQL backend variants
     // ------------------------------------------------------------------
@@ -203,7 +354,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [Theory]
     [InlineData(AppHost.Pg15Scenario, "pg15-")]
     [InlineData(AppHost.Pg16Scenario, "pg16-")]
-    public async Task EveryPostgresVariantResolvesToARealImageAndServesTraffic(string scenarioName, string expectedTagPrefix)
+    public async Task EveryCurrentPostgresVariantResolvesToARealImageAndServesTraffic(
+        string scenarioName,
+        string expectedTagPrefix)
     {
         // Pg17 (the default) and Pg18 are covered elsewhere; together these four mean every
         // member of DocumentDBPostgresVersion is proven to name an image that exists and runs,
@@ -220,6 +373,38 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
         var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
         Assert.StartsWith(expectedTagPrefix, image.Tag, StringComparison.Ordinal);
+
+        await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "widgets", $"{scenarioName}-widget", cts.Token);
+    }
+
+    [Theory]
+    [InlineData(AppHost.Pg15Scenario, 15)]
+    [InlineData(AppHost.Pg16Scenario, 16)]
+    [InlineData(AppHost.Pg17Scenario, 17)]
+    [InlineData(AppHost.Pg18Scenario, 18)]
+    public async Task Every0116PostgresVariantResolvesToARealImageAndServesTraffic(string scenarioName, int postgresVersion)
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var candidateTag = CandidateTag(postgresVersion);
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, scenarioName),
+            (AppHost.ImageTagEnvironmentVariable, candidateTag));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
+        Assert.Equal(candidateTag, image.Tag);
 
         await app.StartAsync(cts.Token);
 
@@ -262,7 +447,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachTheContainer()
+    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachTheCurrentContainer()
     {
         RequireDocker();
 
@@ -280,31 +465,72 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
         var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
-
-        // Deliberately not gated on the health check. The claim under test is "this configuration
-        // reaches the container", and the OTLP endpoint points at a collector that is not running
-        // — which is realistic for this assertion but can slow the gateway's startup. Waiting for
-        // the container to exist is sufficient and keeps the test honest about what it proves.
         var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
         var environment = await GetContainerEnvironmentAsync(containerId);
 
-        // WithOpenTelemetryMetrics: every argument must land as its documented variable.
         Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]);
         Assert.Equal(otelEndpoint, environment["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
         Assert.Equal("15000", environment["OTEL_METRIC_EXPORT_INTERVAL"]);
         Assert.Equal("7000", environment["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
         Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
         Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
-
-        // WithLogLevel and WithOwner.
         Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
         Assert.Equal("aspireowner", environment["OWNER"]);
 
-        // WithOwner is not just an environment variable: the entrypoint acts on it and says so.
-        // Polled, because the container id is available as soon as the container is created,
-        // which can be marginally before the entrypoint has written its banner.
         var logs = await WaitForContainerLogAsync(containerId, "Using owner: aspireowner", cts.Token);
         Assert.Contains("Using owner: aspireowner", logs, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task OpenTelemetryMetricsAreExportedFrom0116()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var otelOutputPath = Path.Combine(Path.GetTempPath(), "aspire-documentdb-otel", Guid.NewGuid().ToString("N"));
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.ObservableConfigScenario),
+            (AppHost.OtelOutputPathEnvironmentVariable, otelOutputPath),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            await using var app = await appHost.BuildAsync(cts.Token);
+
+            await app.StartAsync(cts.Token);
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+            var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+            await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+            var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+            await AssertRoundTripAsync(connectionString!, "appdb", "otel", "metric-source", cts.Token);
+
+            var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+            var environment = await GetContainerEnvironmentAsync(containerId);
+
+            Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]);
+            Assert.Equal("http://otel-collector:4317", environment["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
+            Assert.Equal("1000", environment["OTEL_METRIC_EXPORT_INTERVAL"]);
+            Assert.Equal("7000", environment["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
+            Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
+            Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
+            Assert.False(environment.ContainsKey("CONFIG_DIR"));
+            Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+
+            var metrics = await WaitForFileContainingAsync(
+                Path.Combine(otelOutputPath, "metrics.json"),
+                "aspire-documentdb-e2e",
+                cts.Token);
+            Assert.Contains("gateway", metrics, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            TryDeleteDirectory(otelOutputPath);
+        }
     }
 
     [Fact]
@@ -388,16 +614,32 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task PostgresEndpointHonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
+    public async Task CurrentPostgresEndpointHonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
+    {
+        await AssertPostgresExtrasAsync(imageTag: null, assertLz4: false);
+    }
+
+    [Fact]
+    public async Task PostgresEndpointOn0116UsesLz4ToastCompression()
+    {
+        await AssertPostgresExtrasAsync(CandidateTag(17), assertLz4: true);
+    }
+
+    private static async Task AssertPostgresExtrasAsync(string? imageTag, bool assertLz4)
     {
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
         var postgresPort = GetAvailableTcpPort();
 
-        using var scenario = new EnvironmentScope(
-            (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresExtrasScenario),
-            (AppHost.PostgresPortEnvironmentVariable, postgresPort.ToString()));
+        using var scenario = imageTag is null
+            ? new EnvironmentScope(
+                (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresExtrasScenario),
+                (AppHost.PostgresPortEnvironmentVariable, postgresPort.ToString()))
+            : new EnvironmentScope(
+                (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresExtrasScenario),
+                (AppHost.PostgresPortEnvironmentVariable, postgresPort.ToString()),
+                (AppHost.ImageTagEnvironmentVariable, imageTag));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -431,6 +673,44 @@ public class DocumentDBFeatureMatrixEndToEndTests
             cts.Token);
 
         Assert.Equal(0L, Convert.ToInt64(accessMethods));
+
+        if (assertLz4)
+        {
+            var toastCompression = await QueryPostgresAsync(
+                postgresConnectionString!,
+                "SHOW default_toast_compression",
+                cts.Token);
+            Assert.Equal("lz4", Convert.ToString(toastCompression));
+        }
+    }
+
+    [Fact]
+    public async Task ReservedUserNameFailsBefore0116Starts()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.ReservedUserNameScenario),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var logs = await WaitForContainerLogAsync(
+            containerId,
+            $"username '{AppHost.ReservedUserName}' uses reserved prefix 'pg'",
+            cts.Token);
+
+        Assert.Contains(
+            $"username '{AppHost.ReservedUserName}' uses reserved prefix 'pg'",
+            logs,
+            StringComparison.Ordinal);
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
     }
 
     [Fact]
@@ -494,7 +774,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
         }
 
-        return logs;
+        throw new InvalidOperationException(
+            $"Container '{containerId}' did not log '{expectedSubstring}' before the timeout. " +
+            $"Last logs:{Environment.NewLine}{logs}");
     }
 
     private static async Task<DistributedApplication> BuildAndStartAsync(CancellationToken cancellationToken)
@@ -503,6 +785,56 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var app = await appHost.BuildAsync(cancellationToken);
         await app.StartAsync(cancellationToken);
         return app;
+    }
+
+    private static string CandidateTag(int postgresVersion) => $"pg{postgresVersion}-{CandidateVersion}";
+
+    private static async Task WaitForDocumentAsync(
+        IMongoDatabase database,
+        string collectionName,
+        string id,
+        CancellationToken cancellationToken)
+    {
+        var collection = database.GetCollection<BsonDocument>(collectionName);
+
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            var document = await collection
+                .Find(Builders<BsonDocument>.Filter.Eq("_id", id))
+                .SingleOrDefaultAsync(cancellationToken);
+            if (document is not null)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        throw new InvalidOperationException(
+            $"Document '{id}' was not created in collection '{collectionName}' before the timeout.");
+    }
+
+    private static async Task<string> WaitForFileContainingAsync(
+        string path,
+        string expectedSubstring,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            if (File.Exists(path))
+            {
+                var content = await File.ReadAllTextAsync(path, cancellationToken);
+                if (content.Contains(expectedSubstring, StringComparison.Ordinal))
+                {
+                    return content;
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        throw new InvalidOperationException(
+            $"File '{path}' did not contain '{expectedSubstring}' before the timeout.");
     }
 
     private static async Task WaitForResourceFailureAsync(
@@ -524,13 +856,19 @@ public class DocumentDBFeatureMatrixEndToEndTests
                     continue;
                 }
 
-                if (resourceEvent.Snapshot.State?.Text is { } stateText &&
-                    (stateText.Contains("Fail", StringComparison.OrdinalIgnoreCase) ||
-                     stateText.Contains("Error", StringComparison.OrdinalIgnoreCase)))
+                var stateText = resourceEvent.Snapshot.State?.Text;
+                if (string.Equals(stateText, KnownResourceStates.FailedToStart, StringComparison.Ordinal) ||
+                    ((string.Equals(stateText, KnownResourceStates.Exited, StringComparison.Ordinal) ||
+                      string.Equals(stateText, KnownResourceStates.Finished, StringComparison.Ordinal)) &&
+                     resourceEvent.Snapshot.ExitCode is { } exitCode &&
+                     exitCode != 0))
                 {
                     return;
                 }
             }
+
+            throw new InvalidOperationException(
+                $"Resource '{resourceName}' stopped reporting state before a failure was observed.");
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {

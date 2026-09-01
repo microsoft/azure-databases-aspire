@@ -270,6 +270,13 @@ internal static class DocumentDBEndToEndSupport
     /// </summary>
     public static async Task<(int ExitCode, string StandardOutput)> RunDockerAsync(params string[] arguments)
     {
+        var (exitCode, standardOutput, _) = await RunDockerCoreAsync(arguments);
+        return (exitCode, standardOutput);
+    }
+
+    private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunDockerCoreAsync(
+        params string[] arguments)
+    {
         var startInfo = new ProcessStartInfo("docker")
         {
             RedirectStandardOutput = true,
@@ -309,7 +316,7 @@ internal static class DocumentDBEndToEndSupport
                 $"'docker {string.Join(' ', arguments)}' did not complete within 30s; the Docker daemon appears unresponsive.");
         }
 
-        return (process.ExitCode, await stdout);
+        return (process.ExitCode, await stdout, await stderr);
     }
 
     /// <summary>
@@ -384,8 +391,23 @@ internal static class DocumentDBEndToEndSupport
 
     public static async Task<string> GetContainerLogsAsync(string containerId)
     {
-        var (_, output) = await RunDockerAsync("logs", containerId);
-        return output;
+        var (_, output, error) = await RunDockerCoreAsync("logs", containerId);
+        return CombineStandardOutputAndError(output, error);
+    }
+
+    internal static string CombineStandardOutputAndError(string standardOutput, string standardError)
+    {
+        if (string.IsNullOrEmpty(standardOutput))
+        {
+            return standardError;
+        }
+
+        if (string.IsNullOrEmpty(standardError) || standardOutput.EndsWith('\n'))
+        {
+            return standardOutput + standardError;
+        }
+
+        return standardOutput + Environment.NewLine + standardError;
     }
 
     /// <summary>

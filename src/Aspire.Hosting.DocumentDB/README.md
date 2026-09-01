@@ -82,7 +82,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithTlsCertificate(certPath, keyPath)` | Mount a custom TLS certificate and key into the container |
 | `.WithTelemetry(enabled?)` | **Obsolete.** No-op against gateway v0.112-0+; use `.WithOpenTelemetryMetrics(...)` instead. Kept for binary compatibility (`ASPIREDOCDB0001`). |
 | `.WithOpenTelemetryMetrics(endpoint?, enabled?, exportInterval?, timeout?, serviceName?, serviceVersion?)` | Enable OpenTelemetry metrics export from the gateway via OTLP/gRPC (container v0.112-0+) |
-| `.WithOwner(owner)` | Set the container `OWNER` value |
+| `.WithOwner(owner)` | Set the existing PostgreSQL owner role used for DocumentDB operations |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |
 | `.WithDocumentDBVersion(version)` | Pin a curated DocumentDB version (default: latest known to this build) |
@@ -126,13 +126,17 @@ TLS and insecure TLS are enabled by default so the .NET MongoDB driver can conne
 
 ### Data persistence
 
-By default, DocumentDB stores data inside the container, and restarting the container removes it. Use `WithDataVolume()` to persist it:
+Use `WithDataVolume()` when data must persist predictably across container replacement:
 
 ```csharp
 builder.AddDocumentDB("documentdb")
        .WithDataVolume()
        .AddDatabase("mydb");
 ```
+
+DocumentDB `0.116.0` declares `/data` as an image volume, so Docker may create an anonymous
+volume even without this helper. Anonymous-volume lifetime is controlled by the container
+runtime; use a named volume and stable credentials for intentional persistence.
 
 ## More information
 

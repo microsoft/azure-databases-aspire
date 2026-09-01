@@ -57,7 +57,7 @@ This tells Aspire to:
 3. Pass the connection string to your service as a named connection
 
 > [!NOTE]
-> `WaitFor` sequences container startup but does not perform a readiness health check. Your service should handle transient connection failures with retry logic during the first few seconds while DocumentDB initializes.
+> `WaitFor` waits for DocumentDB's authenticated MongoDB `ping` health check, which confirms that the gateway is reachable. On DocumentDB `0.116.0`, custom one-shot initialization can continue after the gateway becomes healthy, so services that depend on seeded data should still retry until that data is available.
 
 ## Install the MongoDB client package
 
