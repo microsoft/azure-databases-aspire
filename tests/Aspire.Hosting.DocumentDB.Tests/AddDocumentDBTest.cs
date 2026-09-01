@@ -618,12 +618,13 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithInitDataAddsReadOnlyBindMountAndDisablesSampleData()
+    public async Task WithInitDataOverridesPreExistingInitDataAndAddsReadOnlyBindMount()
     {
         var source = Path.GetFullPath(Path.Combine("TestData", "init"));
 
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder.AddDocumentDB("DocumentDB")
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("INIT_DATA", "true")
             .WithInitData(source);
 
         using var app = appBuilder.Build();
@@ -639,15 +640,21 @@ public class AddDocumentDBTests
         Assert.True(mount.IsReadOnly);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["INIT_DATA"]);
         Assert.Equal("/init_doc_db.d", env["INIT_DATA_PATH"]);
         Assert.Equal("true", env["SKIP_INIT_DATA"]);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        Assert.Equal("false", manifest["env"]?["INIT_DATA"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
     }
 
     [Fact]
-    public async Task WithoutSampleDataAddsEnvironmentVariable()
+    public async Task WithoutSampleDataOverridesPreExistingInitData()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder.AddDocumentDB("DocumentDB")
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("INIT_DATA", "true")
             .WithoutSampleData();
 
         using var app = appBuilder.Build();
@@ -656,7 +663,12 @@ public class AddDocumentDBTests
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["INIT_DATA"]);
         Assert.Equal("true", env["SKIP_INIT_DATA"]);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        Assert.Equal("false", manifest["env"]?["INIT_DATA"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
     }
 
     [Fact]
@@ -1211,6 +1223,7 @@ public class AddDocumentDBTests
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
             .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithEnvironment("INIT_DATA", "true")
             .WithInitData(initDataPath)
             .WithTlsCertificate(certPath, keyPath)
             .WithTelemetry(enabled: false)
@@ -1222,6 +1235,7 @@ public class AddDocumentDBTests
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
         Assert.Equal("debug", manifest["env"]?["LOG_LEVEL"]?.GetValue<string>());
+        Assert.Equal("false", manifest["env"]?["INIT_DATA"]?.GetValue<string>());
         Assert.Equal("/init_doc_db.d", manifest["env"]?["INIT_DATA_PATH"]?.GetValue<string>());
         Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
         Assert.Equal(expectedCertTarget, manifest["env"]?["CERT_PATH"]?.GetValue<string>());
