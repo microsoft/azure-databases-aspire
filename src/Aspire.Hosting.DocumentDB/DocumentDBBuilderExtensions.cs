@@ -606,13 +606,15 @@ public static class DocumentDBBuilderExtensions
     /// ownership changes to the mounted host path immediately. PostgreSQL refuses to start unless
     /// the data directory is already owned by the user starting the postmaster, and the container
     /// entrypoint establishes that by running <c>chown</c> on <c>DATA_PATH</c> milliseconds before
-    /// starting it. Docker Desktop can apply that <c>chown</c> asynchronously, so the postmaster
-    /// reads the previous owner and aborts with
+    /// starting it. Docker Desktop applies that <c>chown</c> asynchronously — measured on macOS
+    /// with VirtioFS, and expected on its Windows and Linux hosts, which share the same
+    /// file-sharing design — so the postmaster reads the previous owner and aborts with
     /// <c>data directory "/data" has wrong ownership</c>. A first run hides this behind the seconds
     /// <c>initdb</c> spends between the two steps, so the container comes up once and then fails
     /// every restart, with the data intact on the host but unreadable. Nothing in the application
     /// model can order that runtime's <c>chown</c>; use <see cref="WithDataVolume"/> there, whose
-    /// storage lives inside the runtime's own filesystem and is unaffected.
+    /// storage lives inside the runtime's own filesystem and is unaffected. A bind mount on a
+    /// native container engine is an ordinary mount and restarts normally.
     /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder.</param>
