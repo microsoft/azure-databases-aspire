@@ -104,6 +104,31 @@ Common causes:
 2. **Auth mechanism mismatch.** DocumentDB uses `SCRAM-SHA-256`. The connection string includes `authMechanism=SCRAM-SHA-256` automatically. If you construct your own connection string, include this parameter.
 3. **Auth database.** Credentials are created in the `admin` database. The connection string includes `authSource=admin` automatically.
 
+## OpenTelemetry metrics
+
+### The container command looks wrapped in `/bin/bash -c ...`
+
+Expected on DocumentDB `0.116.0` and later when `WithOpenTelemetryMetrics(...)` enables metrics.
+Those images resolve telemetry as *JSON > environment > default* and ship a
+`SetupConfiguration.json` that pins metrics off, so the integration wraps the entrypoint to
+remove the metrics-shadowing keys before the image's own entrypoint runs. The wrapper is carried
+in the container `entrypoint`/`args`, so it survives `aspire publish` and `azd`. See
+[WithOpenTelemetryMetrics](configuration.md#withopentelemetrymetrics).
+
+### No metrics arrive at the collector
+
+1. Confirm the collector is reachable from *inside* the container network and that you passed an
+   explicit `endpoint:`. The gateway default (`http://localhost:4317`) resolves to the DocumentDB
+   container itself.
+2. Check the gateway startup line in the container logs. It prints the resolved configuration; on
+   `0.116.0` and later a working setup shows `metrics: None` inside `telemetry_options`, meaning
+   the JSON no longer overrides the environment.
+3. `aspire-documentdb -- ...` on the first lines of the container log means the wrapper could not
+   read the gateway configuration or could not find `jq`. The wrapper only ever applies to the
+   official `documentdb/documentdb-local` image path, so this means a mirror or re-tag reuses that
+   path with contents that are not the official image. Publish it under your own image name so the
+   wrapper is skipped, then configure telemetry inside that image.
+
 ## Port conflicts
 
 **Symptom:** `Bind for 0.0.0.0:10260 failed: port is already allocated`.

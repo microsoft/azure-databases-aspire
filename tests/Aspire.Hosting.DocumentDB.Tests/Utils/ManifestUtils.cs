@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
 using System.Text.Json;
 using Xunit;
@@ -12,6 +13,46 @@ namespace Aspire.Hosting.Utils;
 
 public sealed class ManifestUtils
 {
+    /// <summary>
+    /// Runs the real Aspire publishing pipeline in manifest mode and returns the manifest the
+    /// publisher wrote to disk.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="GetManifestOrNull"/> serializes a single resource directly and therefore skips
+    /// everything the pipeline does first — most importantly <c>BeforeStartEvent</c>, which
+    /// integrations use to finish shaping a resource before it is published. Assertions about
+    /// what actually ships to <c>azd</c> need the full pipeline.
+    /// </remarks>
+    public static async Task<JsonNode> PublishManifestAsync(
+        Action<IDistributedApplicationBuilder> configure,
+        [CallerMemberName] string? testName = null)
+    {
+        var outputPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "published-manifests",
+            $"{testName ?? "manifest"}-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outputPath);
+
+        var appBuilder = DistributedApplication.CreateBuilder(
+            ["--operation", "publish", "--publisher", "manifest", "--output-path", outputPath]);
+        configure(appBuilder);
+
+        using (var app = appBuilder.Build())
+        {
+            await app.RunAsync();
+        }
+
+        var manifestPath = Path.Combine(outputPath, "aspire-manifest.json");
+        Assert.True(File.Exists(manifestPath), $"The manifest publisher did not write '{manifestPath}'.");
+
+        var manifest = JsonNode.Parse(await File.ReadAllTextAsync(manifestPath));
+        Assert.NotNull(manifest);
+
+        Directory.Delete(outputPath, recursive: true);
+
+        return manifest;
+    }
+
     public static async Task<JsonNode> GetManifest(IResource resource, string? manifestDirectory = null)
     {
         var node = await GetManifestOrNull(resource, manifestDirectory);

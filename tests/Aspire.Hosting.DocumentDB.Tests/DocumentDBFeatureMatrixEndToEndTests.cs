@@ -3,8 +3,10 @@
 
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json.Nodes;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Testing;
+using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
@@ -521,6 +523,26 @@ public class DocumentDBFeatureMatrixEndToEndTests
             Assert.False(environment.ContainsKey("CONFIG_DIR"));
             Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
 
+            // The AppHost applies WithImageTag after WithOpenTelemetryMetrics, so this also proves
+            // the compatibility wrapper is resolved against the resource's final image.
+            Assert.Equal(["/bin/bash"], await GetContainerConfigListAsync(containerId, "Entrypoint"));
+            var command = await GetContainerConfigListAsync(containerId, "Cmd");
+            Assert.Equal(3, command.Length);
+            Assert.Equal("-c", command[0]);
+            Assert.Equal("--", command[2]);
+            Assert.Contains("del(.TelemetryOptions.Metrics", command[1], StringComparison.Ordinal);
+
+            // Without the wrapper the shipped SetupConfiguration.json would still pin metrics off,
+            // and the gateway would report telemetry_options carrying a Metrics section.
+            var gatewayLogs = await WaitForContainerLogAsync(
+                containerId,
+                "Starting server with configuration",
+                cts.Token);
+            Assert.Contains(
+                "service_name: None, service_version: None, metrics: None",
+                gatewayLogs,
+                StringComparison.Ordinal);
+
             var metrics = await WaitForFileContainingAsync(
                 Path.Combine(otelOutputPath, "metrics.json"),
                 "aspire-documentdb-e2e",
@@ -530,6 +552,93 @@ public class DocumentDBFeatureMatrixEndToEndTests
         finally
         {
             TryDeleteDirectory(otelOutputPath);
+        }
+    }
+
+    [Fact]
+    public async Task ThePublishedManifestForOpenTelemetryMetricsRunsTheCandidateImage()
+    {
+        // The manifest is what azd deploys. Running exactly what it names - image, entrypoint,
+        // args and environment - is the only assertion that proves the published artifact is
+        // deployable rather than merely well-formed.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("documentdb")
+                .WithOpenTelemetryMetrics(
+                    endpoint: "http://127.0.0.1:4317",
+                    exportInterval: TimeSpan.FromSeconds(1),
+                    serviceName: "aspire-documentdb-publish")
+                .WithImageTag(CandidateTag(17)));
+
+        var resource = manifest["resources"]?["documentdb"];
+        Assert.NotNull(resource);
+
+        var image = resource!["image"]?.GetValue<string>();
+        Assert.Equal($"ghcr.io/documentdb/documentdb/documentdb-local:{CandidateTag(17)}", image);
+
+        var entrypoint = resource["entrypoint"]?.GetValue<string>();
+        Assert.False(string.IsNullOrEmpty(entrypoint));
+
+        var containerName = $"aspire-documentdb-publish-{Guid.NewGuid():N}";
+        var password = "Aspire-Publish-Pass1";
+
+        var dockerArguments = new List<string>
+        {
+            "run", "--detach", "--name", containerName, "--entrypoint", entrypoint!,
+        };
+
+        foreach (var (name, value) in Assert.IsType<JsonObject>(resource["env"]))
+        {
+            var text = value?.GetValue<string>() ?? string.Empty;
+
+            if (string.Equals(name, "PASSWORD", StringComparison.Ordinal))
+            {
+                text = password;
+            }
+
+            Assert.DoesNotContain('{', text);
+            dockerArguments.Add("--env");
+            dockerArguments.Add($"{name}={text}");
+        }
+
+        dockerArguments.Add(image!);
+
+        foreach (var argument in Assert.IsType<JsonArray>(resource["args"]))
+        {
+            dockerArguments.Add(argument!.GetValue<string>());
+        }
+
+        // Pull explicitly: 'docker run' would pull implicitly, but this image is multiple
+        // gigabytes and the default per-command budget is sized for fast control-plane calls.
+        var (pullExitCode, pullOutput) = await RunDockerAsync(TimeSpan.FromMinutes(10), "pull", image!);
+        Assert.True(pullExitCode == 0, $"docker pull failed with exit code {pullExitCode}: {pullOutput}");
+
+        try
+        {
+            var (exitCode, output) = await RunDockerAsync([.. dockerArguments]);
+            Assert.True(exitCode == 0, $"docker run failed with exit code {exitCode}: {output}");
+
+            var logs = await WaitForContainerLogAsync(containerName, "Starting server with configuration", cts.Token);
+
+            // The published entrypoint has to leave the gateway with no JSON telemetry pin, so the
+            // OTEL_* environment variables the manifest carries are the ones that take effect.
+            Assert.Contains(
+                "service_name: None, service_version: None, metrics: None",
+                logs,
+                StringComparison.Ordinal);
+
+            // Tracing is not managed by this package and must keep its shipped default.
+            Assert.Contains("tracing: Some(TracingOptions { enabled: Some(false)", logs, StringComparison.Ordinal);
+
+            var running = await WaitForContainerLogAsync(containerName, "Gateway is ready", cts.Token);
+            Assert.Contains("Gateway is ready", running, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await RunDockerAsync("rm", "--force", containerName);
         }
     }
 
@@ -754,6 +863,20 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    private static async Task<string[]> GetContainerConfigListAsync(string containerId, string field)
+    {
+        var (exitCode, output) = await RunDockerAsync(
+            "inspect", containerId, "--format", $"{{{{json .Config.{field}}}}}");
+
+        Assert.Equal(0, exitCode);
+
+        var parsed = JsonNode.Parse(output.Trim());
+
+        return parsed is JsonArray array
+            ? [.. array.Select(item => item!.GetValue<string>())]
+            : [];
+    }
 
     private static async Task<string> WaitForContainerLogAsync(
         string containerId,

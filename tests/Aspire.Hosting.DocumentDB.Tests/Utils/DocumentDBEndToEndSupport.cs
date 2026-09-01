@@ -24,6 +24,7 @@ internal static class DocumentDBEndToEndSupport
 {
     private const string EndToEndTimeoutEnvironmentVariable = "DOCUMENTDB_E2E_TIMEOUT_SECONDS";
     private static readonly TimeSpan DefaultEndToEndTimeout = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DefaultDockerTimeout = TimeSpan.FromSeconds(30);
 
     public static void RequireDocker()
     {
@@ -270,11 +271,28 @@ internal static class DocumentDBEndToEndSupport
     /// </summary>
     public static async Task<(int ExitCode, string StandardOutput)> RunDockerAsync(params string[] arguments)
     {
-        var (exitCode, standardOutput, _) = await RunDockerCoreAsync(arguments);
+        var (exitCode, standardOutput, _) = await RunDockerCoreAsync(DefaultDockerTimeout, arguments);
+        return (exitCode, standardOutput);
+    }
+
+    /// <summary>
+    /// Runs a docker command with an explicit budget, for the few commands that legitimately take
+    /// longer than <see cref="DefaultDockerTimeout"/> - notably pulling a multi-gigabyte image on a
+    /// cold runner, where the default budget would report a healthy daemon as unresponsive.
+    /// </summary>
+    public static async Task<(int ExitCode, string StandardOutput)> RunDockerAsync(
+        TimeSpan timeout,
+        params string[] arguments)
+    {
+        var (exitCode, standardOutput, _) = await RunDockerCoreAsync(timeout, arguments);
         return (exitCode, standardOutput);
     }
 
     private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunDockerCoreAsync(
+        params string[] arguments) => await RunDockerCoreAsync(DefaultDockerTimeout, arguments);
+
+    private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunDockerCoreAsync(
+        TimeSpan commandTimeout,
         params string[] arguments)
     {
         var startInfo = new ProcessStartInfo("docker")
@@ -292,7 +310,7 @@ internal static class DocumentDBEndToEndSupport
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException($"Failed to start 'docker {string.Join(' ', arguments)}'.");
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeout = new CancellationTokenSource(commandTimeout);
 
         var stdout = process.StandardOutput.ReadToEndAsync(timeout.Token);
         var stderr = process.StandardError.ReadToEndAsync(timeout.Token);
@@ -313,7 +331,8 @@ internal static class DocumentDBEndToEndSupport
             }
 
             throw new InvalidOperationException(
-                $"'docker {string.Join(' ', arguments)}' did not complete within 30s; the Docker daemon appears unresponsive.");
+                $"'docker {string.Join(' ', arguments)}' did not complete within " +
+                $"{commandTimeout.TotalSeconds:0}s; the Docker daemon appears unresponsive.");
         }
 
         return (process.ExitCode, await stdout, await stderr);

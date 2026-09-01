@@ -265,22 +265,42 @@ Merge semantics across multiple calls on the same builder:
 `WithOpenTelemetryMetrics` and the obsolete `WithTelemetry` set disjoint environment variables
 and do not interact.
 
-DocumentDB `0.116.0` ships telemetry values in its stock `SetupConfiguration.json`, and those
-JSON values take precedence over the standard environment variables. To preserve the documented
-environment-variable behavior, this method injects a compatibility `SetupConfiguration.json`
-into the stock Local image configuration directory. It retains the stable ports, certificate
-defaults, and reserved username prefixes but omits `TelemetryOptions`, so the gateway resolves
-metrics settings from the environment on both older images and `0.116.0`. If the caller sets a
-custom `CONFIG_DIR`, that custom configuration remains authoritative.
+### Gateway configuration compatibility from `0.116.0`
 
-The compatibility file is injected when the AppHost runs the official `0.116.0` Local image.
-Aspire publish mode is rejected for that exact image when metrics are enabled, because not every
-publisher carries the required runtime file override. Failing explicitly avoids publishing a
-deployment where metrics are silently disabled. Explicitly disabling metrics does not require the
-override and remains publishable. Direct AppHost run mode is supported. A custom image with
-corrected upstream telemetry configuration is not subject to this guard. A private registry mirror
-that keeps the official `documentdb/documentdb-local:pgNN-0.116.0` image path and tag receives the
-same compatibility override and publish guard.
+Starting with DocumentDB `0.116.0`, the gateway resolves telemetry settings as
+*JSON > environment variable > default*, and the stock `SetupConfiguration.json` shipped in the
+image pins `TelemetryOptions.Metrics.Enabled` to `false` and `TelemetryOptions.ServiceName` to
+`documentdb_gateway`. Those JSON values would win over `OTEL_METRICS_ENABLED` and the other
+variables documented above, so setting the environment alone can no longer turn metrics on.
+
+When metrics are enabled on an official `documentdb-local` image of `0.116.0` or later, this
+method therefore wraps the container entrypoint. The wrapper reads the configuration the
+container would otherwise have used (honouring a caller-supplied `CONFIG_DIR`), deletes only the
+`TelemetryOptions.Metrics`, `TelemetryOptions.ServiceName` and `TelemetryOptions.ServiceVersion`
+keys with `jq`, points `CONFIG_DIR` at that copy, and then execs the image's own entrypoint.
+`TelemetryOptions.Tracing` is left exactly as upstream ships it, because this package does not
+configure tracing.
+
+The wrapper is expressed entirely as the container `entrypoint` and `args`, which are the only
+file-shaped mechanisms that round-trip through the Aspire manifest. Consequently:
+
+- `aspire publish` and `azd` emit a manifest that still names the official image and carries the
+  wrapper in `entrypoint`/`args`, so published apps deploy and export metrics.
+- Direct AppHost runs execute exactly the same command.
+- The decision is made against the resource's *final* image, so
+  `.WithOpenTelemetryMetrics().WithDocumentDBVersion(...)` and
+  `.WithOpenTelemetryMetrics().WithImageTag(...)` behave the same as the reverse order.
+
+Nothing is wrapped when metrics are explicitly disabled, when the image is not the official
+`documentdb/documentdb-local` image, or when the tag is outside the `pgNN-X.Y.Z` grammar. A
+private registry mirror that keeps the official image path and tag is wrapped, because only the
+registry differs.
+
+The wrapper needs `bash` and `jq`, both of which the official image provides. If either is
+missing, or the configuration file cannot be read, the container fails to start with a diagnostic
+rather than starting silently without metrics. Supplying your own `entrypoint` on the same
+resource is rejected with an `InvalidOperationException`, because the two cannot both own the
+container command.
 
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
