@@ -601,6 +601,19 @@ public static class DocumentDBBuilderExtensions
     /// read-only data directory, and the container would otherwise spend a minute failing with a
     /// misleading "PostgreSQL failed to start within 60 seconds" banner.
     /// </para>
+    /// <para>
+    /// A bind mount only carries a PostgreSQL data directory on a container runtime that applies
+    /// ownership changes to the mounted host path immediately. PostgreSQL refuses to start unless
+    /// the data directory is already owned by the user starting the postmaster, and the container
+    /// entrypoint establishes that by running <c>chown</c> on <c>DATA_PATH</c> milliseconds before
+    /// starting it. Docker Desktop can apply that <c>chown</c> asynchronously, so the postmaster
+    /// reads the previous owner and aborts with
+    /// <c>data directory "/data" has wrong ownership</c>. A first run hides this behind the seconds
+    /// <c>initdb</c> spends between the two steps, so the container comes up once and then fails
+    /// every restart, with the data intact on the host but unreadable. Nothing in the application
+    /// model can order that runtime's <c>chown</c>; use <see cref="WithDataVolume"/> there, whose
+    /// storage lives inside the runtime's own filesystem and is unaffected.
+    /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder.</param>
     /// <param name="source">The source directory on the host to mount into the container.</param>
