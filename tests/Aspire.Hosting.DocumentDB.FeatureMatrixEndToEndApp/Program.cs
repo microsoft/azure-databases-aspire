@@ -41,7 +41,7 @@ public class Program
     /// <summary>WithDataVolume + WithInitData: custom initialization is scoped to the volume.</summary>
     public const string InitDataVolumeScenario = "init-data-volume";
 
-    /// <summary>WithoutUserCreation: the container must not provision the admin user.</summary>
+    /// <summary>WithoutUserCreation + WithoutSampleData: start without provisioning the admin user.</summary>
     public const string WithoutUserCreationScenario = "without-user-creation";
 
     /// <summary>WithLogLevel + WithOwner + WithOpenTelemetryMetrics, all observable on the container.</summary>
@@ -150,7 +150,10 @@ public class Program
                 break;
 
             case WithoutUserCreationScenario:
-                documentDB.WithoutUserCreation();
+                documentDB
+                    .WithEnvironment("INIT_DATA", "true")
+                    .WithoutSampleData()
+                    .WithoutUserCreation();
                 break;
 
             case ObservableConfigScenario:

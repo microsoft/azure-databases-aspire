@@ -108,7 +108,13 @@ var db = documentdb.AddDatabase("mydb");
 `WithInitData(...)` mounts a host directory into `/init_doc_db.d` and also
 disables the built-in sample data so your custom scripts are the only
 initialization source. Use `WithoutSampleData()` when you want to disable the
-built-in sample collections without mounting custom initialization scripts.
+built-in sample collections. It does not disable custom initialization scripts
+configured through `WithInitData(...)`.
+
+`WithoutUserCreation()` allows a fresh v0.116 container to start without
+provisioning the configured user when no initialization requiring those
+credentials is requested. Built-in or custom initialization will fail if it
+needs a user that was skipped and does not already exist in persisted storage.
 
 `WithTlsCertificate(...)` mounts the certificate and key files at distinct
 container paths, so they can be supplied even when their host file names are

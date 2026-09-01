@@ -146,18 +146,22 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `source` | `string` | (required) | Host directory containing initialization scripts. Mounted read-only at `/init_doc_db.d` and exposed via `INIT_DATA_PATH`. |
 
-This helper also sets `SKIP_INIT_DATA=true` so the container does not also import its built-in sample collections.
+This helper sets both `INIT_DATA=false` and `SKIP_INIT_DATA=true`, matching the
+container's canonical `--skip-init-data` behavior so an earlier
+`INIT_DATA=true` setting cannot re-enable the built-in sample collections.
 
 ## WithoutSampleData
 
-Disables the built-in sample data initialization without mounting custom scripts. Use this when you want a clean DocumentDB instance.
+Disables the built-in sample data initialization. Custom scripts configured
+through `WithInitData(...)` are unaffected and still run for a new data volume.
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
                     .WithoutSampleData();
 ```
 
-This sets `SKIP_INIT_DATA=true` on the container.
+This sets `INIT_DATA=false` and `SKIP_INIT_DATA=true` on the container, matching
+the canonical `--skip-init-data` option.
 
 ## WithoutExtendedRum
 
@@ -172,13 +176,21 @@ This sets `DISABLE_EXTENDED_RUM=true` on the container. On container images olde
 
 ## WithoutUserCreation
 
-Disables the automatic user creation performed by the DocumentDB Local container on startup. Use only after a previous run has already created the user in persisted storage (`WithDataVolume` or `WithDataBindMount`). To avoid spurious init-data runs on subsequent starts, also call `WithoutSampleData()`.
+Disables the automatic user creation performed by the DocumentDB Local
+container on startup. A fresh v0.116 container can remain running with
+`CREATE_USER=false` when no initialization requiring those credentials is
+requested. The generated connection strings will not authenticate unless that
+user already exists, typically in persisted storage from an earlier run.
 
 > [!WARNING]
-> Setting `CREATE_USER=false` on a fresh container (without a persisted user) will cause the container entrypoint to exit non-zero. The container's init-data scripts (both built-in sample data and custom scripts mounted via `WithInitData`) authenticate using the configured credentials, and will fail if the user does not exist. Always pair this method with `WithoutSampleData()` and ensure the user already exists in the persisted data.
+> Built-in sample initialization and custom scripts mounted through
+> `WithInitData(...)` authenticate using the configured credentials. If either
+> initialization path is requested and the skipped user does not already
+> exist, initialization fails and the container exits. `WithoutSampleData()`
+> disables only built-in sample data; it does not disable custom initialization.
 
 ```csharp
-// Typical pattern: persist data and skip user creation + sample data on subsequent runs
+// Reuse a previously created user while skipping built-in sample data
 var server = builder.AddDocumentDB("documentdb")
                     .WithDataVolume()
                     .WithoutUserCreation()
@@ -471,7 +483,7 @@ postgresql://<username>:<password>@<host>:<port>/postgres
 
 Calling this method also sets `ALLOW_EXTERNAL_CONNECTIONS=true` on the container so the upstream entrypoint configures PostgreSQL to listen on all interfaces with a permissive `pg_hba.conf`. Publishing the host port alone is not enough to guarantee external reachability across upstream container revisions.
 
-The supplied `userName`/`password` (default `admin` + auto-generated) are usable as PostgreSQL credentials because the upstream entrypoint creates a real PostgreSQL role via `documentdb_api.create_user(...)` with a SCRAM-SHA-256-hashed password. The same caveat as the gateway side applies: combining this with `WithoutUserCreation()` only works against a persisted data volume that already contains the role.
+The supplied `userName`/`password` (default `admin` + auto-generated) are usable as PostgreSQL credentials because the upstream entrypoint creates a real PostgreSQL role via `documentdb_api.create_user(...)` with a SCRAM-SHA-256-hashed password. When `WithoutUserCreation()` is used, those credentials authenticate only if the role already exists, typically in a persisted data volume from an earlier run.
 
 ## Supported versions
 
@@ -562,6 +574,7 @@ The extension passes these environment variables to the DocumentDB container:
 | `PASSWORD` | The configured password | Password for the created user |
 | `DATA_PATH` | Path inside the container for the mounted data directory | Only set when using `WithDataVolume` or `WithDataBindMount`; otherwise the container uses its default `/data` |
 | `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Set by `WithLogLevel(...)` |
+| `INIT_DATA` | `false` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `CERT_PATH` | Container path of the mounted certificate file | Set by `WithTlsCertificate(...)` |

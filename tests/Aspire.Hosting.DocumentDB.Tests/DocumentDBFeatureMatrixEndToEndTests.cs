@@ -534,16 +534,14 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
-    public async Task WithoutUserCreationLeavesTheContainerWithoutTheConfiguredUser()
+    public async Task WithoutUserCreationKeepsFreshCandidateContainerRunningWhenInitializationIsDisabled()
     {
-        // The container is told not to provision the user, while the connection string still
-        // carries those credentials - so the documented effect is an authentication failure, and
-        // the health check never goes healthy.
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
         using var scenario = new EnvironmentScope(
-            (AppHost.ScenarioEnvironmentVariable, AppHost.WithoutUserCreationScenario));
+            (AppHost.ScenarioEnvironmentVariable, AppHost.WithoutUserCreationScenario),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -556,11 +554,20 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
         var environment = await GetContainerEnvironmentAsync(containerId);
         Assert.Equal("false", environment["CREATE_USER"]);
+        Assert.Equal("false", environment["INIT_DATA"]);
+        Assert.Equal("true", environment["SKIP_INIT_DATA"]);
+
+        var logs = await WaitForContainerLogAsync(containerId, "No initialization data loaded.", cts.Token);
+        Assert.Contains("Gateway is ready on localhost:", logs, StringComparison.Ordinal);
+        Assert.Contains("Skipping user creation and starting the gateway...", logs, StringComparison.Ordinal);
+
+        var (inspectExitCode, running) = await RunDockerAsync(
+            "inspect", containerId, "--format", "{{.State.Running}}");
+        Assert.Equal(0, inspectExitCode);
+        Assert.Equal("true", running.Trim(), ignoreCase: true);
 
         var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
 
-        // Not the end-to-end token: a cancelled run would throw OperationCanceledException and
-        // make this assertion pass without the container having refused anything.
         var failure = await Record.ExceptionAsync(
             () => PingOnceAsync(connectionString!, "appdb", CancellationToken.None));
 

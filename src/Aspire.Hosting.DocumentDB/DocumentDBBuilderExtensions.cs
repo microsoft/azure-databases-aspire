@@ -30,6 +30,7 @@ public static class DocumentDBBuilderExtensions
     private const string UserEnvVarName = "USERNAME";
     private const string PasswordEnvVarName = "PASSWORD";
     private const string LogLevelEnvVarName = "LOG_LEVEL";
+    private const string InitDataEnvVarName = "INIT_DATA";
     private const string InitDataPathEnvVarName = "INIT_DATA_PATH";
     private const string SkipInitDataEnvVarName = "SKIP_INIT_DATA";
     private const string CertPathEnvVarName = "CERT_PATH";
@@ -598,6 +599,7 @@ public static class DocumentDBBuilderExtensions
             .WithBindMount(source, InitDataMountPath, isReadOnly: true)
             .WithEnvironment(context =>
             {
+                context.EnvironmentVariables[InitDataEnvVarName] = "false";
                 context.EnvironmentVariables[InitDataPathEnvVarName] = InitDataMountPath;
                 context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
             });
@@ -606,6 +608,10 @@ public static class DocumentDBBuilderExtensions
     /// <summary>
     /// Disables the built-in sample data initialization performed by the DocumentDB Local container.
     /// </summary>
+    /// <remarks>
+    /// Custom scripts configured through <see cref="WithInitData"/> are unaffected and still run
+    /// for a new data volume.
+    /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
     public static IResourceBuilder<DocumentDBServerResource> WithoutSampleData(this IResourceBuilder<DocumentDBServerResource> builder)
@@ -614,6 +620,7 @@ public static class DocumentDBBuilderExtensions
 
         return builder.WithEnvironment(context =>
         {
+            context.EnvironmentVariables[InitDataEnvVarName] = "false";
             context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
         });
     }
@@ -643,17 +650,16 @@ public static class DocumentDBBuilderExtensions
     /// upstream <c>CREATE_USER=false</c> environment variable.
     /// </summary>
     /// <remarks>
-    /// Use only after a previous run has already created the user in persisted storage
-    /// (<see cref="WithDataVolume"/> / <see cref="WithDataBindMount"/>). Setting
-    /// <c>CREATE_USER=false</c> on a fresh container will cause init-data steps to fail
-    /// authentication and the container entrypoint to exit non-zero. To avoid spurious
-    /// init-data runs on subsequent starts, also call <see cref="WithoutSampleData"/>.
+    /// A fresh container can start without creating the configured user when no initialization
+    /// requiring those credentials is requested, but the generated connection strings will not
+    /// authenticate unless the user already exists in persisted storage
+    /// (<see cref="WithDataVolume"/> / <see cref="WithDataBindMount"/>).
     /// <para>
-    /// <strong>Important:</strong> The container's init-data scripts (both built-in sample data
-    /// and custom scripts mounted via <see cref="WithInitData"/>) authenticate using the
-    /// configured credentials. If the user does not exist because creation was skipped,
-    /// these scripts will fail and the container will exit. Always pair this method with
-    /// <see cref="WithoutSampleData"/> and ensure the user already exists in the persisted data.
+    /// The container's built-in sample initialization and custom scripts mounted through
+    /// <see cref="WithInitData"/> authenticate using the configured credentials. If initialization
+    /// is requested and the user does not already exist, initialization fails and the container
+    /// exits. <see cref="WithoutSampleData"/> disables only the built-in sample data; it does not
+    /// disable custom initialization scripts.
     /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
