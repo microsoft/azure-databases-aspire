@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 
 namespace Aspire.Hosting.DocumentDB.Tests;
@@ -55,6 +56,20 @@ internal static class DocumentDBContainerRuntime
     /// </summary>
     public static bool FallbackIsDockerDesktop(bool hostIsLinux) => !hostIsLinux;
 
+    /// <summary>
+    /// Whether an exception from asking the daemon means "the daemon could not be asked", as
+    /// opposed to something that must not be swallowed.
+    /// </summary>
+    /// <remarks>
+    /// Two ways the question goes unanswered: the helper reports a wedged or unresponsive daemon as
+    /// an <see cref="InvalidOperationException"/>, and a missing <c>docker</c> executable surfaces
+    /// from <see cref="System.Diagnostics.Process.Start(System.Diagnostics.ProcessStartInfo)"/> as
+    /// a <see cref="Win32Exception"/>. Both take the documented strict fallback. Everything else —
+    /// cancellation, and any failure that is not about reaching the daemon — propagates.
+    /// </remarks>
+    public static bool IsDaemonUnavailable(Exception exception) =>
+        exception is InvalidOperationException or Win32Exception;
+
     public static async Task<ContainerRuntimeDescription> DescribeAsync()
     {
         string? operatingSystem = null;
@@ -69,9 +84,9 @@ internal static class DocumentDBContainerRuntime
                 operatingSystem = output.Trim();
             }
         }
-        catch (InvalidOperationException)
+        catch (Exception exception) when (IsDaemonUnavailable(exception))
         {
-            // The daemon is unavailable or wedged; fall through to the stricter fallback.
+            // No daemon to ask: fall through to the stricter fallback below.
         }
 
         return string.IsNullOrWhiteSpace(operatingSystem)
