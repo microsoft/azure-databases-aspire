@@ -29,16 +29,6 @@ public static class DocumentDBBuilderExtensions
         Required,
     }
 
-    /// <summary>
-    /// Records the container path a data-persistence helper mounted storage at, so the
-    /// start-time storage guard can validate the mount that actually backs <c>DATA_PATH</c>
-    /// instead of assuming the image default.
-    /// </summary>
-    private sealed class DataMountAnnotation : IResourceAnnotation
-    {
-        public required string TargetPath { get; init; }
-    }
-
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
     // default PostgreSQL coordinator port inside the documentdb-local container.
@@ -613,9 +603,9 @@ public static class DocumentDBBuilderExtensions
     /// <param name="builder">The resource builder.</param>
     /// <param name="name">The name of the volume. Defaults to an auto-generated name based on the application and resource names.</param>
     /// <param name="isReadOnly">Unsupported. DocumentDB requires a writable data directory; passing <see langword="true"/> throws.</param>
-    /// <param name="targetPath">The target path inside the container. Defaults to /data to match the container default (and the path the image declares as a volume) when this helper is used.</param>
+    /// <param name="targetPath">The target path inside the container. Defaults to /data to match the container default (and the path the image declares as a volume) when this helper is used. Canonicalized the way the container runtime resolves a path, so repeated separators and <c>.</c>/<c>..</c> segments are collapsed before the mount is created.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
-    /// <exception cref="ArgumentException"><paramref name="isReadOnly"/> is <see langword="true"/>, or <paramref name="targetPath"/> is not an absolute container path below the root.</exception>
+    /// <exception cref="ArgumentException"><paramref name="isReadOnly"/> is <see langword="true"/>, or <paramref name="targetPath"/> is not an absolute container path below the root — including one that only resolves to the root, such as <c>/data/..</c>.</exception>
     /// <example>
     /// <code>
     /// var server = builder.AddDocumentDB("documentdb")
@@ -641,7 +631,6 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly: false)
-            .WithAnnotation(new DataMountAnnotation { TargetPath = targetPath }, ResourceAnnotationMutationBehavior.Replace)
             .WithEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
@@ -719,7 +708,6 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithBindMount(source, targetPath, isReadOnly: false)
-            .WithAnnotation(new DataMountAnnotation { TargetPath = targetPath }, ResourceAnnotationMutationBehavior.Replace)
             .WithEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
@@ -738,7 +726,7 @@ public static class DocumentDBBuilderExtensions
         $"'{InitDataMountPath}'.";
 
     /// <summary>
-    /// Validates and normalizes the container path a data mount targets. Container paths are
+    /// Validates and canonicalizes the container path a data mount targets. Container paths are
     /// always Linux-style absolute paths; a relative or empty path would be rejected by the
     /// container runtime with an opaque mount error, and the container root cannot be a mount
     /// target at all.
@@ -758,27 +746,122 @@ public static class DocumentDBBuilderExtensions
                 parameterName);
         }
 
-        if (!targetPath.StartsWith('/'))
+        return TryCanonicalizeContainerPath(targetPath, out var canonical) switch
         {
-            throw new ArgumentException(
+            ContainerPathProblem.None => canonical,
+
+            ContainerPathProblem.NotAbsolute => throw new ArgumentException(
                 $"The DocumentDB data target path '{targetPath}' must be an absolute path inside the " +
                 $"container (starting with '/'), because it is used both as the mount target and as the " +
                 $"container's DATA_PATH. Omit the argument to use the container default " +
                 $"'{DefaultMountedDataPath}'.",
-                parameterName);
-        }
+                parameterName),
 
-        var normalized = targetPath.TrimEnd('/');
-        if (normalized.Length == 0)
-        {
-            throw new ArgumentException(
-                "The DocumentDB data target path cannot be the container root '/'. Omit the argument to " +
-                $"use the container default '{DefaultMountedDataPath}'.",
-                parameterName);
-        }
+            ContainerPathProblem.EscapesRoot => throw new ArgumentException(
+                $"The DocumentDB data target path '{targetPath}' escapes above the container root: the " +
+                $"container runtime resolves '..' segments before mounting, and there is nothing above " +
+                $"'/'. Omit the argument to use the container default '{DefaultMountedDataPath}'.",
+                parameterName),
 
-        return normalized;
+            _ => throw new ArgumentException(
+                $"The DocumentDB data target path '{targetPath}' resolves to the container root '/', " +
+                $"which cannot be a mount target. The container runtime collapses '.' and '..' segments " +
+                $"before mounting, so an alias such as '/data/..' is the root itself. Omit the argument " +
+                $"to use the container default '{DefaultMountedDataPath}'.",
+                parameterName),
+        };
     }
+
+    /// <summary>
+    /// Why an absolute container path could not be canonicalized into a usable mount target.
+    /// </summary>
+    private enum ContainerPathProblem
+    {
+        /// <summary>The path canonicalized successfully.</summary>
+        None,
+
+        /// <summary>The path is empty or does not start with '/'.</summary>
+        NotAbsolute,
+
+        /// <summary>The path's '..' segments reach above the container root.</summary>
+        EscapesRoot,
+
+        /// <summary>The path canonicalizes to the container root '/'.</summary>
+        IsRoot,
+    }
+
+    /// <summary>
+    /// Canonicalizes an absolute Linux container path the way the container runtime resolves one
+    /// before mounting: repeated separators collapse, <c>.</c> segments drop out, and <c>..</c>
+    /// segments remove the preceding one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every storage comparison runs on canonical paths, because Docker compares the resolved
+    /// path and not the string the caller wrote: <c>/data</c>, <c>//data/</c> and
+    /// <c>/foo/../data</c> are one and the same mount target, and comparing them as written would
+    /// let an alias slip past the duplicate, read-only and shared-storage rules.
+    /// </para>
+    /// <para>
+    /// A path whose <c>..</c> segments reach above the root and a path that collapses to the root
+    /// are both rejected rather than clamped: neither can be a DocumentDB data directory, and
+    /// silently treating either as <c>/</c> would put the guard's model at odds with what the
+    /// runtime does.
+    /// </para>
+    /// <para>
+    /// Only <c>/</c> separates segments. A backslash is an ordinary character in a Linux file
+    /// name, so a Windows-style path is not absolute here and is reported as such.
+    /// </para>
+    /// </remarks>
+    private static ContainerPathProblem TryCanonicalizeContainerPath(string? path, out string canonical)
+    {
+        canonical = string.Empty;
+
+        if (string.IsNullOrEmpty(path) || path[0] != '/')
+        {
+            return ContainerPathProblem.NotAbsolute;
+        }
+
+        var segments = new List<string>();
+
+        foreach (var segment in path.Split('/'))
+        {
+            if (segment.Length == 0 || string.Equals(segment, ".", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (string.Equals(segment, "..", StringComparison.Ordinal))
+            {
+                if (segments.Count == 0)
+                {
+                    return ContainerPathProblem.EscapesRoot;
+                }
+
+                segments.RemoveAt(segments.Count - 1);
+                continue;
+            }
+
+            segments.Add(segment);
+        }
+
+        if (segments.Count == 0)
+        {
+            return ContainerPathProblem.IsRoot;
+        }
+
+        canonical = "/" + string.Join('/', segments);
+        return ContainerPathProblem.None;
+    }
+
+    /// <summary>
+    /// Whether a mount lands on <paramref name="canonicalPath"/> once the container runtime has
+    /// resolved the raw target. A target that cannot be canonicalized — relative, or collapsing to
+    /// the root — cannot be a DocumentDB data directory, so it matches nothing.
+    /// </summary>
+    private static bool TargetsContainerPath(ContainerMountAnnotation mount, string canonicalPath) =>
+        TryCanonicalizeContainerPath(mount.Target, out var canonical) == ContainerPathProblem.None &&
+        string.Equals(canonical, canonicalPath, StringComparison.Ordinal);
 
     // Host paths are compared case-sensitively only where the platform's filesystem is,
     // so a bind mount reused as "C:\Data" and "c:\data" is still recognised as shared.
@@ -824,6 +907,14 @@ public static class DocumentDBBuilderExtensions
     /// because for them an unmounted <c>/data</c> is just a directory in the container layer.
     /// </para>
     /// <para>
+    /// The data directory the rules are applied to is the one the container will really use: the
+    /// effective <c>DATA_PATH</c> the environment pipeline produces at start, canonicalized the
+    /// way the container runtime resolves a path. A raw
+    /// <c>WithEnvironment("DATA_PATH", ...)</c> therefore participates with the documented "last
+    /// call wins" precedence, and an alias such as <c>/foo/../data</c> cannot slip past a rule by
+    /// spelling <c>/data</c> differently.
+    /// </para>
+    /// <para>
     /// Like the image guards, this is run-mode only: <see cref="BeforeResourceStartedEvent"/> is
     /// not published during manifest generation, where no container is started.
     /// </para>
@@ -836,16 +927,21 @@ public static class DocumentDBBuilderExtensions
         var sharedStorageWarningLogged = 0;
         var declaredVolumeWarningLogged = 0;
 
+        // Captured from the builder rather than resolved from the event's services: the execution
+        // context is what the environment callbacks branch on, and it is the same instance Aspire
+        // hands them when it builds the container.
+        var executionContext = builder.ApplicationBuilder.ExecutionContext;
+
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(
             builder.Resource,
-            (evt, ct) =>
+            async (evt, ct) =>
             {
                 var resource = evt.Resource;
-                var dataPath = ResolveDataPath(resource);
+                var dataPath = await ResolveEffectiveDataPathAsync(resource, executionContext, ct).ConfigureAwait(false);
 
                 var mounts = resource.Annotations.OfType<ContainerMountAnnotation>().ToList();
                 var dataMounts = mounts
-                    .Where(mount => string.Equals(mount.Target.TrimEnd('/'), dataPath, StringComparison.Ordinal))
+                    .Where(mount => TargetsContainerPath(mount, dataPath))
                     .ToList();
 
                 if (dataMounts.FirstOrDefault(mount => mount.IsReadOnly) is { } readOnlyMount)
@@ -903,10 +999,18 @@ public static class DocumentDBBuilderExtensions
                             continue;
                         }
 
-                        var otherDataPath = ResolveDataPath(otherServer);
-                        var conflict = otherMounts.FirstOrDefault(mount =>
-                            string.Equals(mount.Target.TrimEnd('/'), otherDataPath, StringComparison.Ordinal) &&
-                            IsSameStorage(dataMount, mount));
+                        // Sharing the storage is the cheap half of the test and the necessary
+                        // condition, so it is applied first: a peer that mounts none of this
+                        // resource's storage cannot contend for its data directory, and its
+                        // environment is left alone.
+                        var sharedMounts = otherMounts.Where(mount => IsSameStorage(dataMount, mount)).ToList();
+                        if (sharedMounts.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        var otherDataPath = await ResolveEffectiveDataPathAsync(otherServer, executionContext, ct).ConfigureAwait(false);
+                        var conflict = sharedMounts.FirstOrDefault(mount => TargetsContainerPath(mount, otherDataPath));
 
                         if (conflict is null)
                         {
@@ -949,7 +1053,7 @@ public static class DocumentDBBuilderExtensions
 
                 if (!string.Equals(dataPath, DefaultMountedDataPath, StringComparison.Ordinal) &&
                     ResolvesToDataVolumeAwareImage(resource) &&
-                    !mounts.Any(mount => string.Equals(mount.Target.TrimEnd('/'), DefaultMountedDataPath, StringComparison.Ordinal)) &&
+                    !mounts.Any(mount => TargetsContainerPath(mount, DefaultMountedDataPath)) &&
                     Interlocked.CompareExchange(ref declaredVolumeWarningLogged, 1, 0) == 0)
                 {
                     TryGetResourceLogger(evt, StorageLoggerCategory)?.LogWarning(
@@ -964,8 +1068,6 @@ public static class DocumentDBBuilderExtensions
                         DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion,
                         DefaultMountedDataPath);
                 }
-
-                return Task.CompletedTask;
             });
 
         return builder;
@@ -1002,12 +1104,105 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
-    /// The container path a resource's data lives on: the last data mount added through the
-    /// storage helpers, or the container's own <c>/data</c> default.
+    /// The container path DocumentDB will really write to on this run: the effective
+    /// <c>DATA_PATH</c> the resource's environment pipeline produces, canonicalized the way the
+    /// container runtime resolves a path.
     /// </summary>
-    private static string ResolveDataPath(IResource resource) =>
-        resource.Annotations.OfType<DataMountAnnotation>().LastOrDefault()?.TargetPath
-            ?? DefaultMountedDataPath;
+    /// <remarks>
+    /// <para>
+    /// <c>DATA_PATH</c> is an ordinary environment variable, so the value that reaches the
+    /// container is whatever the environment callbacks leave behind — the storage helpers'
+    /// writes, a raw <c>WithEnvironment("DATA_PATH", ...)</c>, or a callback that computes one —
+    /// with the last writer winning. Running that pipeline here is what makes the guard validate
+    /// the directory the container actually uses instead of the one the helpers intended.
+    /// </para>
+    /// <para>
+    /// Only the <c>DATA_PATH</c> entry is resolved. Every other value the callbacks produced —
+    /// the password parameter among them — is left as the unresolved object it was gathered as,
+    /// so answering a question about a filesystem path never materialises a secret.
+    /// </para>
+    /// <para>
+    /// A <c>DATA_PATH</c> that resolves to <see langword="null"/> is dropped by Aspire rather than
+    /// passed to the container, which leaves the image's own default in place.
+    /// </para>
+    /// </remarks>
+    private static async ValueTask<string> ResolveEffectiveDataPathAsync(
+        IResource resource,
+        DistributedApplicationExecutionContext executionContext,
+        CancellationToken cancellationToken)
+    {
+        if (!resource.TryGetEnvironmentVariables(out var callbacks))
+        {
+            return DefaultMountedDataPath;
+        }
+
+        var environment = new Dictionary<string, object>(StringComparer.Ordinal);
+        var context = new EnvironmentCallbackContext(executionContext, resource, environment, cancellationToken);
+
+        foreach (var callback in callbacks)
+        {
+            await callback.Callback(context).ConfigureAwait(false);
+        }
+
+        if (!environment.TryGetValue(DataPathEnvVarName, out var value) || value is null)
+        {
+            return DefaultMountedDataPath;
+        }
+
+        string? dataPath;
+        if (value is string literal)
+        {
+            dataPath = literal;
+        }
+        else if (value is IValueProvider provider)
+        {
+            dataPath = await provider.GetValueAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // Matches how Aspire renders a value that is neither a string nor a value provider.
+            dataPath = value.ToString();
+        }
+
+        if (dataPath is null)
+        {
+            return DefaultMountedDataPath;
+        }
+
+        return TryCanonicalizeContainerPath(dataPath, out var canonical) switch
+        {
+            ContainerPathProblem.None => canonical,
+
+            ContainerPathProblem.NotAbsolute => throw new InvalidOperationException(
+                InvalidDataPathMessage(
+                    resource,
+                    dataPath,
+                    "is not an absolute path inside the container (it does not start with '/')")),
+
+            ContainerPathProblem.EscapesRoot => throw new InvalidOperationException(
+                InvalidDataPathMessage(
+                    resource,
+                    dataPath,
+                    "escapes above the container root: the runtime resolves '..' segments before " +
+                    "mounting, and there is nothing above '/'")),
+
+            _ => throw new InvalidOperationException(
+                InvalidDataPathMessage(
+                    resource,
+                    dataPath,
+                    "resolves to the container root '/': the runtime collapses '.' and '..' " +
+                    "segments before mounting, so an alias such as '/data/..' is the root itself, " +
+                    "which cannot hold a PostgreSQL cluster")),
+        };
+    }
+
+    private static string InvalidDataPathMessage(IResource resource, string dataPath, string reason) =>
+        $"DocumentDB resource '{resource.Name}' sets {DataPathEnvVarName} to '{dataPath}', which " +
+        $"{reason}. The container writes its PostgreSQL cluster to that path, so the value is " +
+        $"rejected before the container is created rather than left to fail as an opaque mount or " +
+        $"permission error. Recovery: set {DataPathEnvVarName} to an absolute path below the " +
+        $"container root, or leave it to WithDataVolume()/WithDataBindMount(...), which mount the " +
+        $"container default '{DefaultMountedDataPath}'.";
 
     /// <summary>
     /// Whether the resource resolves to a curated <c>documentdb-local</c> image new enough to

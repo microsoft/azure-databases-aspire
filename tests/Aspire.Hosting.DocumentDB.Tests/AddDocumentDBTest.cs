@@ -525,6 +525,13 @@ public class AddDocumentDBTests
     [InlineData("C:\\data")]
     [InlineData("/")]
     [InlineData("///")]
+    // The container runtime resolves dot segments before mounting, so these are the container
+    // root spelled differently, or a path that reaches above it. Neither can hold a cluster.
+    [InlineData("/data/..")]
+    [InlineData("/data/./..")]
+    [InlineData("/..")]
+    [InlineData("/../data")]
+    [InlineData("/data/../..")]
     public void WithDataVolumeRejectsInvalidTargetPaths(string targetPath)
     {
         var appBuilder = DistributedApplication.CreateBuilder();
@@ -534,6 +541,33 @@ public class AddDocumentDBTests
 
         Assert.Equal("targetPath", exception.ParamName);
         Assert.Contains("/data", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A target path is canonicalized the way the container runtime resolves one, so the mount and
+    /// <c>DATA_PATH</c> agree with each other and with what Docker will really do.
+    /// </summary>
+    [Theory]
+    [InlineData("//custom///data", "/custom/data")]
+    [InlineData("/custom/./data/", "/custom/data")]
+    [InlineData("/custom/tmp/../data", "/custom/data")]
+    [InlineData("/foo/../data", "/data")]
+    public async Task WithDataVolumeCanonicalizesDotSegmentsInTargetPath(string targetPath, string expected)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder
+            .AddDocumentDB("DocumentDB")
+            .WithDataVolume(targetPath: targetPath);
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+        Assert.Equal(expected, volumeAnnotation.Target);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expected, Assert.Single(env.Where(entry => entry.Key == "DATA_PATH")).Value);
     }
 
     [Fact]
@@ -1030,6 +1064,322 @@ public class AddDocumentDBTests
             () => documentDB.WithDataVolume(isReadOnly: true, targetPath: "relative/path"));
 
         Assert.Equal("targetPath", exception.ParamName);
+    }
+
+    // ---------------------------------------------------------------------
+    // Effective DATA_PATH and container-path canonicalization
+    //
+    // Docker resolves '.', '..' and repeated separators before it mounts, and
+    // DATA_PATH is an ordinary environment variable whose last writer wins.
+    // The guard has to model both, or an alias of the data directory — or an
+    // override that moves it — slips past every rule below.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ReadOnlyRawMountOnADotSegmentAliasOfTheDataPathThrowsAtStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/tmp/../data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'raw-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DuplicateDataMountsAreDetectedThroughDotSegmentAliases()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "first")
+            .WithVolume("second", "//data/./");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("2 mounts on its data directory ('/data')", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The case the aliasing bug made reachable: two resources on images with no data-directory
+    /// interlock, mounting one volume at two spellings of the same container path. Nothing in the
+    /// container would refuse the second start, so the model has to.
+    /// </summary>
+    [Fact]
+    public async Task SharedStorageIsDetectedThroughDotSegmentAliasesOnUninterlockedImages()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag("pg17-0.114.0")
+            .WithVolume("shared-data", "/foo/../data")
+            .WithEnvironment("DATA_PATH", "/foo/../data");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RawDataPathEnvironmentOverrideParticipatesInTheReadOnlyCheck()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RawDataPathEnvironmentOverrideParticipatesInTheDuplicateCheck()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("first", "/pgdata")
+            .WithVolume("second", "/pgdata/")
+            .WithEnvironment("DATA_PATH", "/var/../pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("2 mounts on its data directory ('/pgdata')", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RawDataPathEnvironmentOverrideParticipatesInTheSharedStorageCheck()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithVolume("shared-data", "/pgdata")
+            .WithEnvironment("DATA_PATH", "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Ordering matters and is the container's, not the package's: the environment callback that
+    /// runs last decides where DocumentDB writes.
+    /// </summary>
+    [Fact]
+    public async Task DataPathEnvironmentOverrideAfterTheStorageHelperWins()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithBindMount("/host/read-only", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        Assert.Equal("/pgdata", (await BuildEnvironmentVariablesAsync(resource))["DATA_PATH"]);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DataPathEnvironmentOverrideBeforeTheStorageHelperLoses()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("DATA_PATH", "/pgdata")
+            .WithDataVolume()
+            .WithBindMount("/host/read-only", "/pgdata", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        Assert.Equal("/data", (await BuildEnvironmentVariablesAsync(resource))["DATA_PATH"]);
+
+        // The read-only mount is not on the effective data directory, so it is somebody else's
+        // read-only input and no concern of this guard.
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Fact]
+    public async Task CallbackSuppliedDataPathParticipatesInStorageChecks()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment(context => context.EnvironmentVariables["DATA_PATH"] = "/var/../pgdata/");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A <c>DATA_PATH</c> supplied as a parameter is a value provider, not a string, so it has to
+    /// be resolved before it can be compared with a mount target.
+    /// </summary>
+    [Fact]
+    public async Task ParameterSuppliedDataPathParticipatesInStorageChecks()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var dataPath = appBuilder.AddParameter("datapath", "/pgdata");
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", dataPath);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Running the environment pipeline must not turn a question about a filesystem path into a
+    /// secret lookup: every value other than <c>DATA_PATH</c> stays unresolved.
+    /// </summary>
+    [Fact]
+    public async Task StorageGuardResolvesOnlyTheDataPathValue()
+    {
+        var recordingProvider = new RecordingValueProvider("unused");
+
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithEnvironment(context => context.EnvironmentVariables["SOME_SECRET"] = recordingProvider);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+
+        Assert.Equal(0, recordingProvider.ResolutionCount);
+    }
+
+    [Theory]
+    [InlineData("/data/..", "resolves to the container root")]
+    [InlineData("//", "resolves to the container root")]
+    [InlineData("/data/../..", "escapes above the container root")]
+    [InlineData("/../data", "escapes above the container root")]
+    [InlineData("pgdata", "is not an absolute path inside the container")]
+    public async Task UnusableDataPathIsRejectedAtStart(string dataPath, string expected)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("DATA_PATH", dataPath);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains($"sets DATA_PATH to '{dataPath}'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expected, exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The declared image volume is covered by any mount the runtime resolves onto <c>/data</c>,
+    /// however it was spelled, so an alias suppresses the anonymous-volume warning.
+    /// </summary>
+    [Fact]
+    public async Task ADotSegmentAliasOfTheDeclaredImageVolumeSuppressesTheWarning()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "pgdata", targetPath: "/pgdata")
+            .WithVolume("declared-image-volume", "/tmp/../data/");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// The read-only input mounts the package adds itself sit on their own container paths and
+    /// must stay unaffected by the data-directory rules, including when the data directory is
+    /// reached through an alias.
+    /// </summary>
+    [Fact]
+    public async Task ReadOnlyInitDataAndTlsMountsAreNotTreatedAsDataMounts()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(targetPath: "/var/lib/../lib/documentdb")
+            .WithInitData("./seed")
+            .WithTlsCertificate("./certs/server.crt", "./certs/server.key");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        Assert.Equal("/var/lib/documentdb", (await BuildEnvironmentVariablesAsync(resource))["DATA_PATH"]);
+        Assert.All(
+            resource.Annotations.OfType<ContainerMountAnnotation>().Where(mount => mount.IsReadOnly),
+            mount => Assert.NotEqual("/var/lib/documentdb", mount.Target));
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    /// <summary>
+    /// An <see cref="IValueProvider"/> that records whether anything asked it for its value, so a
+    /// test can assert that the storage guard left it alone.
+    /// </summary>
+    private sealed class RecordingValueProvider(string value) : IValueProvider
+    {
+        private int _resolutionCount;
+
+        public int ResolutionCount => Volatile.Read(ref _resolutionCount);
+
+        public ValueTask<string?> GetValueAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _resolutionCount);
+            return ValueTask.FromResult<string?>(value);
+        }
     }
 
     [Fact]

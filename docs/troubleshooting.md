@@ -281,6 +281,14 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 **Solution:** Mount the data directory writable. Read-only mounts are correct for *input* only — `WithInitData(...)` mounts seed scripts read-only at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and key read-only.
 
+### `DATA_PATH` is rejected at start
+
+**Symptom:** starting the resource throws an `InvalidOperationException` saying the resource `sets DATA_PATH to '...'`, which resolves to the container root, escapes above it, or is not absolute.
+
+**Cause:** the container runtime resolves `.`, `..` and repeated separators before it mounts, so `/data/..` is the container root and `/../data` reaches above it. Docker refuses both (`invalid mount config for type "volume": invalid specification: destination can't be '/'`), and neither is a directory that can hold a PostgreSQL cluster. The value checked is the effective one at start: `WithDataVolume()`/`WithDataBindMount(...)` and any `WithEnvironment("DATA_PATH", ...)` contribute in call order, and the last caller wins.
+
+**Solution:** set `DATA_PATH` to an absolute path below the container root, or leave it to `WithDataVolume()`/`WithDataBindMount(...)`, which mount the container default `/data`. The same rule is applied at the API boundary: `WithDataVolume(targetPath: "/data/..")` throws an `ArgumentException` while the model is being built.
+
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 
 **Symptom:** A container using a bind-mounted data directory logs
