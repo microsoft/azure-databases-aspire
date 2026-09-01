@@ -1,3 +1,5 @@
+# Licensed to the .NET Foundation under one or more agreements.
+# The .NET Foundation licenses this file to you under the MIT license.
 from __future__ import annotations
 
 import contextlib
@@ -121,6 +123,12 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         cls.workflow = (REPO_ROOT / ".github" / "workflows" / "nuget-publish.yml").read_text(
             encoding="utf-8"
         )
+        cls.step_names = []
+        cls.steps = {}
+        for step in cls.workflow.split("      - name: ")[1:]:
+            name, body = step.split("\n", 1)
+            cls.step_names.append(name)
+            cls.steps[name] = body
 
     def test_tag_trigger_only_matches_package_style_tags(self):
         self.assertIn("- 'v[0-9]+.[0-9]+.[0-9]+'", self.workflow)
@@ -136,8 +144,17 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
 
     def test_manual_dispatch_cannot_publish_or_create_a_release(self):
         publish_guard = "if: github.event_name == 'push' && github.ref_type == 'tag'"
+        guard_line = f"        {publish_guard}"
 
-        self.assertEqual(2, self.workflow.count(publish_guard))
+        for step_name in ("Push to NuGet", "Create GitHub Release"):
+            with self.subTest(step=step_name):
+                self.assertIn(step_name, self.steps)
+                self.assertEqual(1, self.steps[step_name].splitlines().count(guard_line))
+
+        upload_index = self.step_names.index("Upload artifact")
+        for step_name in self.step_names[upload_index + 1 :]:
+            with self.subTest(release_step=step_name):
+                self.assertEqual(1, self.steps[step_name].splitlines().count(guard_line))
 
 
 if __name__ == "__main__":
