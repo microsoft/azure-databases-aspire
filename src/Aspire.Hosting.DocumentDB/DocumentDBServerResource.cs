@@ -143,9 +143,14 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// Gets the connection string for the DocumentDB server.
     /// </summary>
     /// <remarks>
-    /// The user name and password are percent-encoded, so arbitrary credential values stay valid
-    /// inside the URI; MongoDB clients decode the userinfo component back to the original values.
-    /// See <see cref="AppendUserInfo"/>.
+    /// The user name and password are percent-encoded into the URI userinfo component. Aspire
+    /// applies RFC 3986 escaping (<see cref="Uri.EscapeDataString(string)"/>) when it resolves this
+    /// reference, so MongoDB clients decode the original values back. In a published manifest the
+    /// escaping is instead performed by the downstream publisher, which does not necessarily match
+    /// RFC 3986; see
+    /// <see href="https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#credential-encoding">Credential
+    /// encoding</see> for publisher-specific behavior, including the <c>azd</c> limitation for
+    /// credentials containing spaces.
     /// </remarks>
     public ReferenceExpression ConnectionStringExpression => BuildConnectionString();
 
@@ -166,7 +171,9 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// Credentials come from the same <see cref="UserNameParameter"/> /
     /// <see cref="PasswordParameter"/> used by the MongoDB gateway because the
     /// container creates a single admin user shared by both surfaces, and they are
-    /// percent-encoded exactly as they are there. See <see cref="AppendUserInfo"/>.
+    /// percent-encoded exactly as they are in
+    /// <see cref="ConnectionStringExpression"/>, with the same publisher-specific
+    /// behavior when the model is published.
     /// </para>
     /// <para>
     /// No <c>sslmode</c> query parameter is added, because the bundled
