@@ -17,6 +17,23 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 public class AddDocumentDBTests
 {
     [Fact]
+    public void CombineStandardOutputAndErrorPreservesStreamBoundary()
+    {
+        Assert.Equal(
+            $"stdout{Environment.NewLine}stderr",
+            DocumentDBEndToEndSupport.CombineStandardOutputAndError("stdout", "stderr"));
+        Assert.Equal(
+            $"stdout{Environment.NewLine}stderr",
+            DocumentDBEndToEndSupport.CombineStandardOutputAndError($"stdout{Environment.NewLine}", "stderr"));
+        Assert.Equal(
+            "stdout",
+            DocumentDBEndToEndSupport.CombineStandardOutputAndError("stdout", string.Empty));
+        Assert.Equal(
+            "stderr",
+            DocumentDBEndToEndSupport.CombineStandardOutputAndError(string.Empty, "stderr"));
+    }
+
+    [Fact]
     public void AddDocumentDBAddsHealthCheckAnnotationToResource()
     {
         var appBuilder = DistributedApplication.CreateBuilder();

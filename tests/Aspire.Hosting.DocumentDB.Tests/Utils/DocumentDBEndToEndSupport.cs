@@ -392,7 +392,22 @@ internal static class DocumentDBEndToEndSupport
     public static async Task<string> GetContainerLogsAsync(string containerId)
     {
         var (_, output, error) = await RunDockerCoreAsync("logs", containerId);
-        return output + error;
+        return CombineStandardOutputAndError(output, error);
+    }
+
+    internal static string CombineStandardOutputAndError(string standardOutput, string standardError)
+    {
+        if (string.IsNullOrEmpty(standardOutput))
+        {
+            return standardError;
+        }
+
+        if (string.IsNullOrEmpty(standardError) || standardOutput.EndsWith('\n'))
+        {
+            return standardOutput + standardError;
+        }
+
+        return standardOutput + Environment.NewLine + standardError;
     }
 
     /// <summary>
