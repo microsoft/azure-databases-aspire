@@ -32,6 +32,13 @@ public class DocumentDBStorageBehaviorTests
     private static readonly string s_baselineImage =
         $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-{BaselineVersion}";
 
+    /// <summary>
+    /// The image <see cref="RunInBindMountAsync"/> uses to read a bind mount back as root. Pulled
+    /// explicitly so the probe never depends on another test having warmed the cache.
+    /// </summary>
+    private static readonly string s_probeImage =
+        $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{DocumentDBContainerImageTags.Tag}";
+
     private static readonly string[] s_credentialEnvironment =
     [
         "-e", "USERNAME=storageprobe",
@@ -172,8 +179,9 @@ public class DocumentDBStorageBehaviorTests
                 logs,
                 StringComparison.Ordinal);
 
-            var (_, exitCodeOutput) = await RunDockerAsync("inspect", containerName, "--format", "{{.State.ExitCode}}");
-            Assert.Equal("1", exitCodeOutput.Trim());
+            // The banner is logged before the entrypoint unwinds, so the exit code is only stable
+            // once the container has actually stopped.
+            Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
         }
         finally
         {
@@ -212,11 +220,11 @@ public class DocumentDBStorageBehaviorTests
     {
         RequireDocker();
         await EnsureImageAsync(s_candidateImage);
+        await EnsureImageAsync(s_probeImage);
 
         var hostDirectory = Path.Combine(AppContext.BaseDirectory, UniqueName("stray"));
         Directory.CreateDirectory(hostDirectory);
-        var strayFile = Path.Combine(hostDirectory, ".gitkeep");
-        await File.WriteAllTextAsync(strayFile, "keep");
+        await File.WriteAllTextAsync(Path.Combine(hostDirectory, StrayFileName), StrayFileContents);
 
         var containerName = UniqueName("stray");
         try
@@ -232,32 +240,62 @@ public class DocumentDBStorageBehaviorTests
                 logs,
                 StringComparison.Ordinal);
 
-            var (_, exitCodeOutput) = await RunDockerAsync("inspect", containerName, "--format", "{{.State.ExitCode}}");
-            Assert.Equal("1", exitCodeOutput.Trim());
+            Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
 
-            // The refusal is not destructive: the stray file is still there, and nothing was
-            // initialized over it.
-            Assert.True(File.Exists(strayFile), "The container removed the stray file it refused to initialize over.");
-            Assert.Equal("keep", await File.ReadAllTextAsync(strayFile));
-            Assert.False(File.Exists(Path.Combine(hostDirectory, "PG_VERSION")));
+            // The refusal is not destructive. The directory is read back through a container
+            // running as root rather than with System.IO: the entrypoint chowns the bind mount to
+            // the container's uid and chmods it 0750, and on Linux — where the host and the
+            // container really do share the inode — the test process can then no longer even
+            // enumerate it. A host-side File.Exists would report a file that is merely
+            // inaccessible as deleted, which is the opposite of what this test is asserting.
+            var entries = await ListBindMountEntriesAsync(hostDirectory);
+
+            Assert.Contains(StrayFileName, entries);
+            Assert.DoesNotContain("PG_VERSION", entries);
+
+            // Presence in the listing proves the name survived; reading it proves the contents did
+            // too, and that the entrypoint did not truncate the file it refused to initialize over.
+            var (readExit, contents) = await RunInBindMountAsync(hostDirectory, $"cat /probe/{StrayFileName}");
+            Assert.Equal(0, readExit);
+            Assert.Equal(StrayFileContents, contents.Trim());
+
+            // Root inside the container is subject to no permission the entrypoint could have set,
+            // so a failing existence check here is proof of absence rather than of a mode change:
+            // nothing was initialized over the refused directory.
+            var (clusterProbeExit, _) = await RunInBindMountAsync(hostDirectory, "test -e /probe/PG_VERSION");
+            Assert.NotEqual(0, clusterProbeExit);
         }
         finally
         {
             await RunDockerAsync("rm", "-f", "-v", containerName);
+
+            // The contents now belong to the container's uid; widen the modes from inside a
+            // container so the host-side delete can succeed under a different uid on CI.
+            await TryRelaxBindMountPermissionsAsync(hostDirectory);
             TryDeleteDirectory(hostDirectory);
         }
     }
 
+    private const string StrayFileName = ".gitkeep";
+    private const string StrayFileContents = "keep";
+
     private static void TryDeleteDirectory(string path)
     {
+        if (!Directory.Exists(path))
+        {
+            return;
+        }
+
         try
         {
             Directory.Delete(path, recursive: true);
         }
         catch (IOException)
         {
-            // The container took ownership of the contents; leaving the scratch directory behind
-            // in the test output folder is preferable to failing a passing test on cleanup.
+            // The container took ownership of the contents and relaxing the modes did not help
+            // (Docker unavailable, or a mode the probe could not widen). Leaving the scratch
+            // directory behind in the test output folder — which is git-ignored — is preferable to
+            // failing an otherwise passing test on cleanup.
         }
         catch (UnauthorizedAccessException)
         {
@@ -348,7 +386,7 @@ public class DocumentDBStorageBehaviorTests
 
     private static async Task<string> WaitForLogAsync(string containerName, string expected)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(3);
+        var deadline = DateTime.UtcNow + LogWaitTimeout;
         var logs = string.Empty;
 
         while (DateTime.UtcNow < deadline)
@@ -365,4 +403,33 @@ public class DocumentDBStorageBehaviorTests
         Assert.Fail($"Container '{containerName}' never logged '{expected}'. Logs:{Environment.NewLine}{logs}");
         return logs;
     }
+
+    /// <summary>
+    /// Blocks until the container stops and returns the exit code it stopped with.
+    /// </summary>
+    /// <remarks>
+    /// The failure banners these tests wait for are written while the entrypoint is still
+    /// unwinding, so <c>{{.State.ExitCode}}</c> read immediately afterwards can still be the
+    /// running container's placeholder <c>0</c>. <c>docker wait</c> is the synchronization point:
+    /// it returns as soon as the container has stopped, and prints the code it stopped with. The
+    /// deadline is explicit so a container that never exits fails with that fact rather than
+    /// hanging the run.
+    /// </remarks>
+    private static async Task<int> WaitForContainerExitCodeAsync(string containerName)
+    {
+        var (exitCode, output, error) = await RunDockerWithTimeoutAsync(ContainerExitTimeout, "wait", containerName);
+
+        Assert.True(
+            exitCode == 0,
+            $"'docker wait {containerName}' failed: {output}{Environment.NewLine}{error}");
+
+        Assert.True(
+            int.TryParse(output.Trim(), out var containerExitCode),
+            $"'docker wait {containerName}' returned '{output.Trim()}' instead of an exit code.");
+
+        return containerExitCode;
+    }
+
+    private static readonly TimeSpan LogWaitTimeout = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan ContainerExitTimeout = TimeSpan.FromMinutes(2);
 }

@@ -237,6 +237,9 @@ then never becomes healthy and exits `1` about a minute later with `PostgreSQL f
 
 **Solution:** Fix the scripts, then start against a **fresh** data directory — a new volume name, or `docker volume rm <name>` / an emptied bind-mount directory. Editing script contents alone never re-triggers initialization. Writing idempotent scripts avoids the problem in the first place.
 
+> [!NOTE]
+> On `0.114.0` and earlier the opposite is true: there are no markers, and the requested initialization runs on **every** container start. Against a persisted data directory the same scripts are replayed over data they already seeded, so duplicated documents — not missing ones — are the symptom to expect there. Idempotent scripts (and `WithoutSampleData()` for the built-in import) are the fix.
+
 ### Orphaned anonymous volumes accumulate
 
 **Symptom:** `docker system df` shows a growing number of unused local volumes with random 64-character hexadecimal names, roughly the size of a PostgreSQL data directory each.

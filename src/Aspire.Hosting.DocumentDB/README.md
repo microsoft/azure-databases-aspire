@@ -164,8 +164,10 @@ on those images, suppresses the anonymous volume. Pair either with stable creden
 The data directory must be writable, and must be empty or hold an existing DocumentDB cluster:
 `isReadOnly: true` is rejected, and a directory holding anything else is refused (not cleaned)
 by the container. From `0.116.0` it is also exclusive — only one running container at a time may
-use a given volume or host directory. Initialization (sample data or `WithInitData(...)`) runs
-once per data directory and is not retried after a failed attempt. See the
+use a given volume or host directory — and initialization (sample data or `WithInitData(...)`)
+runs once per data directory and is not retried after a failed attempt. On `0.114.0` and earlier
+there is no such marker: the requested initialization runs on every container start, so seed
+scripts used with persisted storage must be idempotent. See the
 [configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#storage-requirements)
 for the full rules.
 
