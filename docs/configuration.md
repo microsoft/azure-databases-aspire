@@ -125,7 +125,7 @@ By default, this helper mounts data at `/data` inside the container (matching th
 Sets both the gateway's canonical `DOCUMENTDB_LOG_LEVEL` environment variable and the legacy
 container `LOG_LEVEL` variable. Starting with DocumentDB `0.114.0`, the gateway reads
 `DOCUMENTDB_LOG_LEVEL` as a tracing filter, so this API changes observable verbosity on the current
-default `0.114.0` image. Gateways through `0.113.0` consume neither variable for verbosity, so
+default image. Gateways through `0.113.0` consume neither variable for verbosity, so
 `WithLogLevel(...)` remains a verbosity no-op on those images.
 
 `LOG_LEVEL` is retained to preserve the Local entrypoint contract: the entrypoint validates its six

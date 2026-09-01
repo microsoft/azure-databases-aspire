@@ -567,7 +567,7 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// Starting with DocumentDB <c>0.114.0</c>, the gateway reads
     /// <c>DOCUMENTDB_LOG_LEVEL</c> as a tracing filter. This makes the API observably effective on
-    /// the current default <c>0.114.0</c> image. The legacy <c>LOG_LEVEL</c> variable is also set
+    /// the current default image. The legacy <c>LOG_LEVEL</c> variable is also set
     /// because the Local image entrypoint validates that contract, although no Local image uses it
     /// to select gateway verbosity. Images through <c>0.113.0</c> therefore treat this API as a
     /// verbosity no-op.
