@@ -463,6 +463,7 @@ postgresql://<username>:<password>@<host>:<port>/postgres
 ```
 
 - The same `userName` / `password` parameters as the MongoDB gateway are used, because the upstream container provisions a single admin user shared by both surfaces.
+- The credentials are percent-encoded exactly as in the `mongodb://` string; see [Credential encoding](#credential-encoding).
 - The default database is `postgres`, matching the upstream entrypoint's `-d postgres` convention.
 - No `sslmode` query parameter is added, because the bundled PostgreSQL server is started with `ssl = off`; the `UseTls` / `AllowInsecureTls` flags only affect the MongoDB connection string. If you have configured TLS on the PostgreSQL side, append `?sslmode=...` yourself.
 
@@ -532,6 +533,23 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | `authMechanism` | `SCRAM-SHA-256` | DocumentDB authentication |
 | `tls` | `true` | Controlled by `UseTls()` |
 | `tlsInsecure` | `true` | Controlled by `AllowInsecureTls()` |
+
+### Credential encoding
+
+The user name and password are percent-encoded (RFC 3986) before they are placed in the URI, so
+arbitrary parameter values are safe to use. Characters such as `:`, `@`, `/`, `?`, `#`, `%`, spaces
+and non-ASCII text are escaped, which prevents them from being read as URI delimiters or as extra
+connection options. MongoDB and PostgreSQL clients decode the userinfo component, so they still
+receive the original value.
+
+- Credentials made only of unreserved characters (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`) are
+  emitted verbatim. That includes the default `admin` user name and the auto-generated password, so
+  simple setups see no change.
+- Encoding applies only to the connection strings. The container's `USERNAME` and `PASSWORD`
+  environment variables keep the raw values, because that is what the entrypoint expects.
+- Encoding is resolved late, so no secret is read while the model is built. In a published manifest
+  the connection string references an `annotated.string` companion resource
+  (`<parameter>-uri-encoded`, `"filter": "uri"`) instead of inlining a value.
 
 ## Defaults summary
 
