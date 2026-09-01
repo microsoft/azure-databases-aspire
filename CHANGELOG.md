@@ -17,6 +17,7 @@ _No upstream DocumentDB versions detected since the last release. This block is 
 
 ### Changed
 - `DocumentDBVersions.Latest` and the default `documentdb-local` image now resolve to `0.116.0` and `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0`. Upstream user-visible changes include `$jsonSchema` support for `enum` and `oneOf`, wire-compatible `$sample` size validation, indexed streaming and planning improvements for grouped and composite queries, and reuse of warm gateway PostgreSQL connection pools.
+- Because `0.116.0` is now the default image, Aspire publish/manifest generation fails fast when `WithOpenTelemetryMetrics(...)` leaves metrics enabled: the required runtime configuration override is not portable across all publishers. Pin `.WithDocumentDBVersion(DocumentDBVersion.V0_114_0)` to publish with metrics using the earlier image behavior, or pass `enabled: false` to publish without metrics. Direct AppHost run mode remains supported with the default image.
 - Adopted the DocumentDB `0.116.0` Local image runtime contract across PG15-PG18, including its `/data` image volume, single-container data-directory lock, one-shot initialization state, reserved username prefixes, and `lz4` TOAST default. Persistence, initialization-readiness, external PostgreSQL, and OTLP metrics behavior are documented and covered by Docker-backed tests, including a PG17 `0.114.0` to `0.116.0` data upgrade.
 
 ### Fixed

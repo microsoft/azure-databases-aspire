@@ -352,19 +352,21 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Theory]
-    [InlineData(AppHost.Pg15Scenario, "pg15-")]
-    [InlineData(AppHost.Pg16Scenario, "pg16-")]
-    public async Task EveryCurrentPostgresVariantResolvesToARealImageAndServesTraffic(
+    [InlineData(AppHost.Pg15Scenario, "pg15-0.114.0")]
+    [InlineData(AppHost.Pg16Scenario, "pg16-0.114.0")]
+    public async Task Pg15AndPg16On0114RemainRunnableAsLegacyControls(
         string scenarioName,
-        string expectedTagPrefix)
+        string expectedTag)
     {
-        // Pg17 (the default) and Pg18 are covered elsewhere; together these four mean every
-        // member of DocumentDBPostgresVersion is proven to name an image that exists and runs,
-        // not merely a well-formed tag.
+        // The pinned 0.116 theory below covers the released PG15-PG18 matrix. These explicit
+        // 0.114 pins preserve the legacy controls that existed before 0.116 became the default,
+        // proving the older PG15/PG16 images still exist and serve traffic.
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
-        using var scenario = new EnvironmentScope((AppHost.ScenarioEnvironmentVariable, scenarioName));
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, scenarioName),
+            (AppHost.ImageTagEnvironmentVariable, expectedTag));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -372,7 +374,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
         var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
         var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
-        Assert.StartsWith(expectedTagPrefix, image.Tag, StringComparison.Ordinal);
+        Assert.Equal(expectedTag, image.Tag);
 
         await app.StartAsync(cts.Token);
 
