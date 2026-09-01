@@ -33,10 +33,14 @@ internal static partial class DocumentDBBindMountRestart
     /// Written by the entrypoint's own <c>pg_ctl</c> invocation in the current run.
     /// </summary>
     /// <remarks>
-    /// Unlike the PostgreSQL log lines, this cannot be replayed from a previous run: it is
-    /// produced by this container's <c>start_oss_server.sh</c> and reaches the container's stdout
-    /// (and the container-local <c>oss_server.log</c>), neither of which lives in the mounted data
-    /// directory.
+    /// <c>pg_ctl</c> writes this to standard error, which the entrypoint leaves attached to the
+    /// container's own stderr — so it is captured by <c>docker logs</c> and is never written into
+    /// <c>DATA_PATH</c>. That is what makes it a current-run anchor: unlike the PostgreSQL log
+    /// lines the entrypoint streams out of <c>DATA_PATH/pglog.log</c>, it cannot be replayed into a
+    /// later container, because the file it would have to be replayed from does not contain it.
+    /// Verified against a refusing <c>pg17-0.116.0</c> container: the line appears on stderr only,
+    /// and is absent from both <c>/data/pglog.log</c> and the container-local
+    /// <c>/var/log/documentdb/oss_server.log</c>.
     /// </remarks>
     internal const string PostmasterStartFailureMarker = "pg_ctl: could not start server";
 
@@ -148,11 +152,14 @@ internal static partial class DocumentDBBindMountRestart
     /// Throws unless the observed restart outcome is one this runtime is allowed to produce.
     /// </summary>
     /// <remarks>
-    /// Reachable is always allowed. A refusal is allowed only on Docker Desktop, whose host file
-    /// sharing applies <c>chown(2)</c> asynchronously — measured on macOS/VirtioFS, and expected on
-    /// its Windows and Linux hosts, which share the same shared-filesystem design. Everywhere else
-    /// a refusal is a persistence regression in this package or its image, not a platform
-    /// limitation, and is reported as such with the container's own log.
+    /// Reachable is always allowed. A refusal is allowed only on Docker Desktop, which is the one
+    /// runtime whose behaviour here has been characterised: its host file sharing applies
+    /// <c>chown(2)</c> asynchronously, measured on macOS/VirtioFS. Every other runtime is held to
+    /// the strict rule. On a native engine that is a statement about the platform — the mount is an
+    /// ordinary one and must hand the directory back — while other VM-backed runtimes are treated
+    /// strictly because they have not been characterised, not because they are known to be
+    /// unaffected. Either way the refusal is reported with the container's own log so it can be
+    /// investigated rather than absorbed.
     /// </remarks>
     public static void AssertOutcomeIsAllowed(
         BindMountRestartOutcome outcome,
@@ -168,10 +175,15 @@ internal static partial class DocumentDBBindMountRestart
 
         throw new InvalidOperationException(
             "The restarted DocumentDB container refused the bind-mounted data directory over its " +
-            "ownership on a runtime that is expected to hand it over. Only Docker Desktop may fail " +
-            "this: its host file sharing applies chown(2) asynchronously, so the postmaster reads " +
-            "the previous owner. On a native engine the mount is an ordinary one and this is a " +
-            "persistence regression, not a platform limitation. " +
+            "ownership, on a runtime where that refusal is not tolerated. Docker Desktop is the only " +
+            "characterised exception: its host file sharing applies chown(2) asynchronously " +
+            "(measured on macOS/VirtioFS), so the postmaster reads the previous owner. Every other " +
+            "runtime is held to the strict rule — on a native engine the mount is an ordinary one " +
+            "and must hand the directory back, and other VM-backed runtimes are treated strictly " +
+            "because they have not been characterised here, not because they are known to be " +
+            "unaffected. Investigate this as a persistence regression first; if this runtime turns " +
+            "out to defer bind-mount ownership in the same way, characterise it and add it to the " +
+            "tolerated set rather than widening the rule on suspicion. " +
             $"Runtime: {runtime}." +
             $"{Environment.NewLine}Container log:{Environment.NewLine}{containerLog}");
     }

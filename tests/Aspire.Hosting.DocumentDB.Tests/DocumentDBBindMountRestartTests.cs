@@ -15,6 +15,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// satisfies even when the run recovered; and the refusal was originally tolerated on every
 /// runtime, which would have let a real persistence regression pass on Linux CI.
 /// </remarks>
+[Trait("Category", "Unit")]
 public class DocumentDBBindMountRestartTests
 {
     private const string DataPath = "/data";
@@ -171,6 +172,47 @@ public class DocumentDBBindMountRestartTests
     }
 
     // ------------------------------------------------------------------
+    // The zero start time of a created-but-not-started container
+    // ------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("0001-01-01T00:00:00Z")]
+    [InlineData("0001-01-01T00:00:00.000000000Z")]
+    [InlineData("0001-01-01T00:00:00+00:00")]
+    public void TheZeroStartTimeOfAnUnstartedContainerIsRejectedAsAnAnchor(string value)
+    {
+        Assert.True(DocumentDBEndToEndSupport.TryParseContainerStartedAt(value, out var startedAt));
+        Assert.True(DocumentDBEndToEndSupport.IsUnstartedContainerStartTime(startedAt));
+    }
+
+    [Fact]
+    public void ARealStartTimeIsNotMistakenForTheZeroValue()
+    {
+        Assert.True(DocumentDBEndToEndSupport.TryParseContainerStartedAt(ContainerStartedAtText, out var startedAt));
+        Assert.False(DocumentDBEndToEndSupport.IsUnstartedContainerStartTime(startedAt));
+        Assert.False(DocumentDBEndToEndSupport.IsUnstartedContainerStartTime(DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void TheZeroStartTimeWouldOtherwiseAcceptEveryReplayedFatal()
+    {
+        // Why the zero value has to be rejected rather than used: DateTimeOffset.MinValue is at or
+        // before every timestamp in the log, so the "at or after the container started" gate
+        // disappears and the previous run's failure classifies the current one.
+        Assert.True(DocumentDBEndToEndSupport.IsUnstartedContainerStartTime(DateTimeOffset.MinValue));
+
+        var log = """
+            pg_ctl: could not start server
+            [POSTGRES] 2026-09-01 19:12:19.586 UTC [78] FATAL:  data directory "/data" has wrong ownership
+            """;
+
+        Assert.True(DocumentDBBindMountRestart.IndicatesStaleOwnershipRefusal(
+            log, DataPath, DateTimeOffset.MinValue));
+        Assert.False(DocumentDBBindMountRestart.IndicatesStaleOwnershipRefusal(
+            log, DataPath, ContainerStartedAt));
+    }
+
+    // ------------------------------------------------------------------
     // Which runtimes may refuse
     // ------------------------------------------------------------------
 
@@ -194,6 +236,26 @@ public class DocumentDBBindMountRestartTests
     public void TheFallbackNeverGrantsToleranceToALinuxHost(bool hostIsLinux, bool expected)
     {
         Assert.Equal(expected, DocumentDBContainerRuntime.FallbackIsDockerDesktop(hostIsLinux));
+    }
+
+    [Fact]
+    public void AMissingDockerExecutableCountsAsAnUnansweredDaemon()
+    {
+        // Process.Start throws Win32Exception when the executable is not on PATH; a wedged daemon
+        // surfaces as InvalidOperationException. Both must take the strict fallback rather than
+        // escaping as an unexplained test failure.
+        Assert.True(DocumentDBContainerRuntime.IsDaemonUnavailable(
+            new System.ComponentModel.Win32Exception(2, "No such file or directory")));
+        Assert.True(DocumentDBContainerRuntime.IsDaemonUnavailable(
+            new InvalidOperationException("the Docker daemon appears unresponsive")));
+    }
+
+    [Fact]
+    public void OtherFailuresAreNotSwallowedAsAnUnansweredDaemon()
+    {
+        Assert.False(DocumentDBContainerRuntime.IsDaemonUnavailable(new OperationCanceledException()));
+        Assert.False(DocumentDBContainerRuntime.IsDaemonUnavailable(new OutOfMemoryException()));
+        Assert.False(DocumentDBContainerRuntime.IsDaemonUnavailable(new FormatException()));
     }
 
     [Fact]
@@ -221,8 +283,27 @@ public class DocumentDBBindMountRestartTests
                 BindMountRestartOutcome.RefusedForStaleOwnership, NativeEngine(), RefusedRunLog));
 
         Assert.Contains("Ubuntu 24.04.3 LTS", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("persistence regression", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("not tolerated", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("have not been characterised", exception.Message, StringComparison.Ordinal);
         Assert.Contains(RefusedRunLog, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnUncharacterisedVmBackedRuntimeIsHeldStrictlyRatherThanCalledARegression()
+    {
+        // Rancher Desktop, Colima, Podman machine and friends may or may not share Docker
+        // Desktop's deferred chown. Until one is measured it is held to the strict rule, and the
+        // message says that rather than declaring the refusal a proven package defect.
+        var uncharacterised = new ContainerRuntimeDescription(
+            "Rancher Desktop", IsDockerDesktop: false, DaemonAnswered: true);
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            DocumentDBBindMountRestart.AssertOutcomeIsAllowed(
+                BindMountRestartOutcome.RefusedForStaleOwnership, uncharacterised, RefusedRunLog));
+
+        Assert.Contains("Rancher Desktop", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("characterise it and add it to the tolerated set", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("this is a persistence regression, not a platform limitation", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]

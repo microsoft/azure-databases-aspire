@@ -201,7 +201,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
                 var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
                 var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
-                var containerStartedAt = await GetContainerStartedAtAsync(containerId);
+                var containerStartedAt = await GetContainerStartedAtAsync(containerId, cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
 
                 var (outcome, containerLog) = await WaitForRestartOutcomeAsync(

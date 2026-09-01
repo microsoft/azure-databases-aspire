@@ -424,23 +424,62 @@ internal static class DocumentDBEndToEndSupport
     /// When the container runtime started this container, used to tell the current run's
     /// PostgreSQL log lines from the ones replayed out of a persisted data directory.
     /// </summary>
-    public static async Task<DateTimeOffset> GetContainerStartedAtAsync(string containerId)
+    /// <remarks>
+    /// Polled rather than read once: a container that has been created but not yet started reports
+    /// the zero timestamp, and accepting that as the anchor would make every replayed line from
+    /// every previous run look current. The resource snapshot publishes a container id as soon as
+    /// the runtime has one, so this window is real. If the container never reports a start time the
+    /// caller is told exactly that instead of silently losing the anchor.
+    /// </remarks>
+    public static async Task<DateTimeOffset> GetContainerStartedAtAsync(
+        string containerId,
+        CancellationToken cancellationToken = default)
     {
-        var (exitCode, output) = await RunDockerAsync("inspect", containerId, "--format", "{{.State.StartedAt}}");
+        var lastValue = string.Empty;
 
-        if (exitCode != 0)
+        for (var attempt = 0; attempt < 60; attempt++)
         {
-            throw new InvalidOperationException(
-                $"Could not read the start time of container '{containerId}' (exit code {exitCode}).");
+            var (exitCode, output) = await RunDockerAsync("inspect", containerId, "--format", "{{.State.StartedAt}}");
+
+            if (exitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Could not read the start time of container '{containerId}' (exit code {exitCode}).");
+            }
+
+            lastValue = output.Trim();
+
+            if (!TryParseContainerStartedAt(lastValue, out var startedAt))
+            {
+                throw new InvalidOperationException(
+                    $"Container '{containerId}' reported an unparseable start time '{lastValue}'.");
+            }
+
+            if (!IsUnstartedContainerStartTime(startedAt))
+            {
+                return startedAt;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
         }
 
-        var value = output.Trim();
-
-        return TryParseContainerStartedAt(value, out var startedAt)
-            ? startedAt
-            : throw new InvalidOperationException(
-                $"Container '{containerId}' reported an unparseable start time '{value}'.");
+        throw new InvalidOperationException(
+            $"Container '{containerId}' never reported a start time: the runtime still reports the " +
+            $"zero timestamp '{lastValue}', so there is no anchor to separate this run's PostgreSQL " +
+            "log lines from ones replayed out of the persisted data directory.");
     }
+
+    /// <summary>
+    /// Whether a start time is the zero value the container runtime reports for a container it has
+    /// created but not started.
+    /// </summary>
+    /// <remarks>
+    /// Docker reports <c>0001-01-01T00:00:00Z</c>. Matched on the year rather than by equality with
+    /// <see cref="DateTimeOffset.MinValue"/> so a differently-normalised zero cannot slip through;
+    /// no container can genuinely have started in year one.
+    /// </remarks>
+    internal static bool IsUnstartedContainerStartTime(DateTimeOffset startedAt) =>
+        startedAt.UtcDateTime.Year <= 1;
 
     /// <summary>
     /// Parses a container runtime start timestamp, which carries more fractional digits than a
