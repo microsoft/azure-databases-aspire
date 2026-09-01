@@ -33,8 +33,9 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 public class DocumentDBFeatureMatrixEndToEndTests
 {
     private const string CandidateVersion = "0.116.0";
-    private static readonly Regex AnsiEscapeSequenceRegex = new(
-        "\u001B\\[[0-?]*[ -/]*[@-~]",
+    private const string QuietWindowControlMarker = "[ASPIRE-TEST] quiet-window-control";
+    private static readonly Regex GatewayDebugInsertRegex = new(
+        @"DEBUG[^\r\n]*documentdb_api\.insert",
         RegexOptions.CultureInvariant);
     private static readonly Regex GatewaySeverityLineRegex = new(
         @"(?m)^(?:\[GATEWAY-FILE\]\s+)?\d{4}-\d{2}-\d{2}T[^\r\n]*\s(?:INFO|WARN|ERROR|DEBUG)\s",
@@ -534,9 +535,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
         // instead of to a dependency's startup or telemetry-internal event.
         var logs = await WaitForContainerLogAsync(
             containerId,
-            "documentdb_api.insert",
+            GatewayDebugInsertRegex,
             cts.Token);
-        Assert.Matches(@"DEBUG[^\r\n]*documentdb_api\.insert", logs);
+        Assert.Matches(GatewayDebugInsertRegex, logs);
     }
 
     [Fact]
@@ -566,6 +567,14 @@ public class DocumentDBFeatureMatrixEndToEndTests
         Assert.Equal("quiet", environment["LOG_LEVEL"], ignoreCase: true);
 
         var windowStart = DateTimeOffset.UtcNow;
+        var (markerExitCode, _) = await RunDockerAsync(
+            "exec",
+            containerId,
+            "/bin/sh",
+            "-c",
+            $"printf '%s\\n' '{QuietWindowControlMarker}' > /proc/1/fd/1");
+        Assert.Equal(0, markerExitCode);
+
         var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
         await AssertRoundTripAsync(connectionString!, "appdb", "log-level", "quiet-source", cts.Token);
         await Task.Delay(TimeSpan.FromSeconds(3), cts.Token);
@@ -575,6 +584,8 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         // Scope the absence check to tracing-formatted gateway lines. Entrypoint and PostgreSQL
         // messages use different prefixes/formats and remain visible even when the gateway is quiet.
+        Assert.False(string.IsNullOrWhiteSpace(operationWindowLogs));
+        Assert.Contains(QuietWindowControlMarker, operationWindowLogs, StringComparison.Ordinal);
         Assert.DoesNotMatch(GatewaySeverityLineRegex, operationWindowLogs);
     }
 
@@ -856,6 +867,27 @@ public class DocumentDBFeatureMatrixEndToEndTests
     private static async Task<string> WaitForContainerLogAsync(
         string containerId,
         string expectedSubstring,
+        CancellationToken cancellationToken) =>
+        await WaitForContainerLogAsync(
+            containerId,
+            logs => logs.Contains(expectedSubstring, StringComparison.Ordinal),
+            $"'{expectedSubstring}'",
+            cancellationToken);
+
+    private static async Task<string> WaitForContainerLogAsync(
+        string containerId,
+        Regex expectedPattern,
+        CancellationToken cancellationToken) =>
+        await WaitForContainerLogAsync(
+            containerId,
+            expectedPattern.IsMatch,
+            $"pattern '{expectedPattern}'",
+            cancellationToken);
+
+    private static async Task<string> WaitForContainerLogAsync(
+        string containerId,
+        Func<string, bool> predicate,
+        string expectation,
         CancellationToken cancellationToken)
     {
         var logs = string.Empty;
@@ -864,7 +896,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         {
             logs = NormalizeContainerLogs(await GetContainerLogsAsync(containerId));
 
-            if (logs.Contains(expectedSubstring, StringComparison.Ordinal))
+            if (predicate(logs))
             {
                 return logs;
             }
@@ -873,12 +905,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
 
         throw new InvalidOperationException(
-            $"Container '{containerId}' did not log '{expectedSubstring}' before the timeout. " +
+            $"Container '{containerId}' did not log {expectation} before the timeout. " +
             $"Last logs:{Environment.NewLine}{logs}");
     }
-
-    private static string NormalizeContainerLogs(string logs) =>
-        AnsiEscapeSequenceRegex.Replace(logs, string.Empty);
 
     private static async Task<DistributedApplication> BuildAndStartAsync(CancellationToken cancellationToken)
     {

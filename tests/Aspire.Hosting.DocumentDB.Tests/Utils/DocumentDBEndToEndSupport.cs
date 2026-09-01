@@ -4,6 +4,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.TestUtilities;
 using Microsoft.Extensions.DependencyInjection;
@@ -25,6 +26,9 @@ internal static class DocumentDBEndToEndSupport
 {
     private const string EndToEndTimeoutEnvironmentVariable = "DOCUMENTDB_E2E_TIMEOUT_SECONDS";
     private static readonly TimeSpan DefaultEndToEndTimeout = TimeSpan.FromMinutes(5);
+    private static readonly Regex AnsiEscapeSequenceRegex = new(
+        "\u001B\\[[0-?]*[ -/]*[@-~]",
+        RegexOptions.CultureInvariant);
 
     public static void RequireDocker()
     {
@@ -398,13 +402,23 @@ internal static class DocumentDBEndToEndSupport
 
     public static async Task<string> GetContainerLogsSinceAsync(string containerId, DateTimeOffset since)
     {
-        var (_, output, error) = await RunDockerCoreAsync(
+        var (exitCode, output, error) = await RunDockerCoreAsync(
             "logs",
             "--since",
             since.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
             containerId);
+
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"'docker logs --since' failed for container '{containerId}' with exit code {exitCode}: {error}");
+        }
+
         return CombineStandardOutputAndError(output, error);
     }
+
+    internal static string NormalizeContainerLogs(string logs) =>
+        AnsiEscapeSequenceRegex.Replace(logs, string.Empty);
 
     internal static string CombineStandardOutputAndError(string standardOutput, string standardError)
     {
