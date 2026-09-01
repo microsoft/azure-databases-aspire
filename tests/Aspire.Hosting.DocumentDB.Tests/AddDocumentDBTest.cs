@@ -745,10 +745,11 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsSetsEnabledEnvironmentVariable()
+    public async Task WithOpenTelemetryMetricsSetsEnabledEnvironmentVariableFor0114ControlImage()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
             .WithOpenTelemetryMetrics();
 
         using var app = appBuilder.Build();
@@ -770,7 +771,6 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics(endpoint: "http://first:4317")
             .WithOpenTelemetryMetrics(serviceName: "documentdb-local");
 
@@ -804,7 +804,6 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithEnvironment("CONFIG_DIR", "/custom/documentdb/config")
             .WithOpenTelemetryMetrics();
 
@@ -823,7 +822,6 @@ public class AddDocumentDBTests
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithImageRegistry("registry.example.com")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
         using var app = appBuilder.Build();
@@ -844,7 +842,7 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.114.0")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
             .WithOpenTelemetryMetrics();
 
         using var app = appBuilder.Build();
@@ -853,8 +851,10 @@ public class AddDocumentDBTests
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
         var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
         var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
 
         Assert.Empty(entries);
+        Assert.False(env.ContainsKey("OTEL_SERVICE_NAME"));
     }
 
     [Fact]
@@ -876,11 +876,10 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsPreserves0116DefaultServiceName()
+    public async Task WithOpenTelemetryMetricsPreserves0116DefaultServiceNameForDefaultImage()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
         using var app = appBuilder.Build();
@@ -893,11 +892,10 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsPreservesCallerProvided0116ServiceName()
+    public async Task WithOpenTelemetryMetricsPreservesCallerProvided0116ServiceNameForDefaultImage()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithEnvironment("OTEL_SERVICE_NAME", "caller-service")
             .WithOpenTelemetryMetrics();
 
@@ -1111,10 +1109,11 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsAddsAllEnvironmentVariablesInManifest()
+    public async Task WithOpenTelemetryMetricsAddsAllEnvironmentVariablesIn0114Manifest()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
             .WithOpenTelemetryMetrics(
                 endpoint: "http://otel-collector:4317",
                 enabled: true,
@@ -1138,7 +1137,6 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -1153,7 +1151,6 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics()
             .WithOpenTelemetryMetrics(enabled: false);
 
@@ -1175,7 +1172,6 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics(enabled: false)
             .WithOpenTelemetryMetrics();
 

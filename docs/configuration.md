@@ -288,8 +288,8 @@ larger granularities.
 
 The gateway also reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TIMEOUT` when the
 signal-specific variants above are unset. Starting in `0.116.0`, it also applies
-`OTEL_RESOURCE_ATTRIBUTES`; the current default `0.114.0` image parses that variable but does not
-apply it during startup. These are not exposed by the typed API — set them via
+`OTEL_RESOURCE_ATTRIBUTES`; the `0.114.0` control image parses that variable but does not apply it
+during startup. These are not exposed by the typed API — set them via
 `WithEnvironment(...)` if you need them.
 
 
@@ -538,7 +538,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.114.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.116.0`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |

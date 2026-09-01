@@ -10,14 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
-### Fixed
-- Preserved `WithOpenTelemetryMetrics(...)` behavior for the DocumentDB `0.116.0` candidate image in direct AppHost run mode. Upstream `0.116.0` added explicit disabled telemetry values to `SetupConfiguration.json`, and the gateway gives those JSON values precedence over the standard OpenTelemetry environment variables. The integration now injects a version-scoped compatibility configuration without `TelemetryOptions` into the stock Local image configuration directory, allowing the documented environment variables to remain authoritative without replacing a caller-supplied `CONFIG_DIR`. Private registry mirrors retaining the official image path and tag receive the same override. Aspire publish mode rejects this affected combination because publisher support for the required runtime file override is not universal.
-- Corrected troubleshooting guidance that claimed health checks were not registered. The integration uses an authenticated MongoDB `ping`; documentation now distinguishes gateway availability from completion of the one-shot initialization phase introduced in DocumentDB `0.116.0`.
-- Corrected `WithOwner(...)` documentation: `OWNER` names an existing PostgreSQL role used for database operations, not an arbitrary resource label. The bundled image creates the default `documentdb` role. A missing custom role causes startup to fail: DocumentDB `0.116.0` aborts explicitly during admin-user creation, while earlier images fail later while waiting for the gateway.
+## [0.116.0] - 2026-09-01
+
+### Added
+- `DocumentDBVersion.V0_116_0` curated enum member and `DocumentDBVersions.V0_116_0 = "0.116.0"` constant. Upstream skipped the `v0.115-0` release and rolled its prepared changes into `v0.116-0`, so there is intentionally no `V0_115_0` member.
 
 ### Changed
-- Added candidate-only container coverage for DocumentDB `0.116.0`: PG15-PG18 runtime smoke tests, persisted PG17 `0.114.0` to `0.116.0` migration, one-shot initialization, reserved username rejection, external PostgreSQL access, the new `lz4` TOAST default, and real OTLP metrics export. `DocumentDBVersions.Latest` remains `0.114.0` until this compatibility matrix passes in Docker-backed CI.
-- Documented the `0.116.0` `/data` image volume, data-directory lock, credential lifetime, and initialization-readiness semantics.
+- `DocumentDBVersions.Latest` and the default `documentdb-local` image now resolve to `0.116.0` and `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0`. Upstream user-visible changes include `$jsonSchema` support for `enum` and `oneOf`, wire-compatible `$sample` size validation, indexed streaming and planning improvements for grouped and composite queries, and reuse of warm gateway PostgreSQL connection pools.
+- Adopted the DocumentDB `0.116.0` Local image runtime contract across PG15-PG18, including its `/data` image volume, single-container data-directory lock, one-shot initialization state, reserved username prefixes, and `lz4` TOAST default. Persistence, initialization-readiness, external PostgreSQL, and OTLP metrics behavior are documented and covered by Docker-backed tests, including a PG17 `0.114.0` to `0.116.0` data upgrade.
+
+### Fixed
+- Preserved `WithOpenTelemetryMetrics(...)` behavior for the DocumentDB `0.116.0` default image in direct AppHost run mode. Upstream `0.116.0` added explicit disabled telemetry values to `SetupConfiguration.json`, and the gateway gives those JSON values precedence over the standard OpenTelemetry environment variables. The integration injects a version-scoped compatibility configuration without `TelemetryOptions` into the stock Local image configuration directory, allowing the documented environment variables to remain authoritative without replacing a caller-supplied `CONFIG_DIR`. Private registry mirrors retaining the official image path and tag receive the same override. Aspire publish mode rejects this affected combination because publisher support for the required runtime file override is not universal.
+- Corrected troubleshooting guidance that claimed health checks were not registered. The integration uses an authenticated MongoDB `ping`; documentation now distinguishes gateway availability from completion of the one-shot initialization phase introduced in DocumentDB `0.116.0`.
+- Corrected `WithOwner(...)` documentation: `OWNER` names an existing PostgreSQL role used for database operations, not an arbitrary resource label. The bundled image creates the default `documentdb` role. A missing custom role causes startup to fail: DocumentDB `0.116.0` aborts explicitly during admin-user creation, while earlier images fail later while waiting for the gateway.
 
 ## [0.114.1] - 2026-07-29
 
@@ -147,7 +152,8 @@ _No upstream DocumentDB versions detected since the last release. This block is 
 - SCRAM-SHA-256 authentication support
 - Container image: `ghcr.io/documentdb/documentdb/documentdb-local`
 
-[Unreleased]: https://github.com/microsoft/azure-databases-aspire/compare/v0.114.1...HEAD
+[Unreleased]: https://github.com/microsoft/azure-databases-aspire/compare/v0.116.0...HEAD
+[0.116.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.114.1...v0.116.0
 [0.114.1]: https://github.com/microsoft/azure-databases-aspire/compare/v0.114.0...v0.114.1
 [0.114.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.113.0...v0.114.0
 [0.113.0]: https://github.com/microsoft/azure-databases-aspire/compare/v0.112.0...v0.113.0
