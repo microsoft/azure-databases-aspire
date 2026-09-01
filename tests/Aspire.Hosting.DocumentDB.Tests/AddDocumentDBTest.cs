@@ -1213,6 +1213,77 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsArgumentsResolvedWithoutTheWrapperEntrypoint()
+    {
+        // The arguments only mean anything to the wrapper's own entrypoint. If they are resolved
+        // while something else owns the container command, they would be spliced into it.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(documentDB.Resource));
+
+        Assert.Contains("<image default>", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsArgumentsWhenTheEntrypointIsReplacedLaterInTheSameStartup()
+    {
+        // A BeforeStartEvent subscriber registered after ours runs after ours, so the entrypoint
+        // check in the event handler cannot see the replacement. The argument callback runs after
+        // every subscriber, which is why it re-checks.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        Assert.Equal("/late/entrypoint.sh", SingleServerResource(app).Entrypoint);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("/late/entrypoint.sh", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenTheEntrypointIsReplacedLaterInTheSameStartup()
+    {
+        // End to end through the real publishing pipeline: no manifest may be written with the
+        // wrapper's arguments attached to somebody else's entrypoint. The publisher reports the
+        // failed step rather than letting the exception escape RunAsync, which is what makes
+        // 'aspire publish' exit non-zero.
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+            {
+                documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+                return Task.CompletedTask;
+            });
+        });
+
+        Assert.Contains("publish-manifest' failed", log, StringComparison.Ordinal);
+        Assert.Contains("/late/entrypoint.sh", log, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task WithOpenTelemetryMetricsRejectsAnEntrypointReplacedAfterTheWrapperTookOwnership()
     {
         var appBuilder = CreateLifecycleTestBuilder();

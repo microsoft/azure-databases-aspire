@@ -125,9 +125,11 @@ configure telemetry inside the image the digest names.
 ### `WithOpenTelemetryMetrics()` throws about the entrypoint
 
 The wrapper has to own the container command, so any entrypoint you set on the same resource —
-`/bin/bash` included, because its arguments would be yours — is rejected. Drop the custom
-entrypoint, or drop `WithOpenTelemetryMetrics(...)` and configure telemetry from your own
-entrypoint.
+`/bin/bash` included, because its arguments would be yours — is rejected. The same applies when a
+`BeforeStartEvent` subscriber or lifecycle hook replaces the entrypoint later in the same startup:
+that is caught when the wrapper's arguments are resolved, and `aspire publish` reports the
+`publish-manifest` step as failed. Drop the custom entrypoint, or drop
+`WithOpenTelemetryMetrics(...)` and configure telemetry from your own entrypoint.
 
 ### No metrics arrive at the collector
 

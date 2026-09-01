@@ -342,7 +342,11 @@ wrapped, because only the registry differs. Four situations throw instead of gue
   configure telemetry inside the image the digest names.
 - Supplying your own container entrypoint on the same resource, including `/bin/bash`: the two
   cannot both own the container command.
-- Replacing the wrapper's entrypoint after it has been installed.
+- Replacing the wrapper's entrypoint after it has been installed — including from a
+  `BeforeStartEvent` subscriber or lifecycle hook that runs after the wrapper's own, later in the
+  same startup. The wrapper re-checks that it still owns the entrypoint when its arguments are
+  resolved, which is after every subscriber has run, so this is caught rather than splicing those
+  arguments into somebody else's command line.
 - Selecting an image that does not need the wrapper *after* the wrapper has taken over the
   entrypoint. The wrapper cannot be uninstalled at that point, and dropping its arguments would
   leave `/bin/bash` with nothing to run. Select the image before configuring metrics.

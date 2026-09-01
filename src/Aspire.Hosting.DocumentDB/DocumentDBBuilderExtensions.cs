@@ -1031,7 +1031,10 @@ public static class DocumentDBBuilderExtensions
     /// the image tag is routinely selected after this method runs (for example
     /// <c>WithOpenTelemetryMetrics().WithDocumentDBVersion(...)</c>). The entrypoint is applied
     /// from <see cref="BeforeStartEvent"/>, which the manifest publisher raises before it
-    /// serializes the resource, and the arguments from a command-line-arguments callback.
+    /// serializes the resource, and the arguments from a command-line-arguments callback. That
+    /// callback re-checks that the wrapper still owns the entrypoint, because it runs after every
+    /// event subscriber and is therefore the last chance to catch one that replaced the entrypoint
+    /// later in the same startup.
     /// </para>
     /// </remarks>
     private static void EnsureOpenTelemetryGatewayConfiguration(
@@ -1108,6 +1111,28 @@ public static class DocumentDBBuilderExtensions
                 GatewayConfigurationRequirement.Required)
             {
                 return;
+            }
+
+            // The arguments are only meaningful to the entrypoint this wrapper installs. Resolving
+            // them happens after every BeforeStartEvent subscriber has run, so this is the last
+            // point at which a subscriber or lifecycle hook that replaced the entrypoint later in
+            // the same startup can still be caught - after which these arguments would be spliced
+            // into someone else's command line.
+            if (!configuration.EntrypointOwned ||
+                !string.Equals(builder.Resource.Entrypoint, GatewayConfigurationShell, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{builder.Resource.Name}' resolved container arguments " +
+                    $"with the container entrypoint set to " +
+                    $"'{builder.Resource.Entrypoint ?? "<image default>"}' instead of the " +
+                    $"'{GatewayConfigurationShell}' wrapper WithOpenTelemetryMetrics() installs. " +
+                    $"On DocumentDB v{FirstGatewayTelemetryConfigurationVersion} and later that " +
+                    $"wrapper is what makes the OTEL_* environment variables authoritative over " +
+                    $"SetupConfiguration.json, and its arguments mean nothing to any other " +
+                    $"entrypoint. Recovery: stop overriding the entrypoint of this resource - " +
+                    $"including from a BeforeStartEvent subscriber or lifecycle hook - or drop " +
+                    $"WithOpenTelemetryMetrics() and configure telemetry from your own " +
+                    $"entrypoint.");
             }
 
             context.Args.Insert(0, GatewayConfigurationShellArgumentZero);

@@ -3,8 +3,11 @@
 
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Xunit;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Publishing;
@@ -51,6 +54,95 @@ public sealed class ManifestUtils
         Directory.Delete(outputPath, recursive: true);
 
         return manifest;
+    }
+
+    /// <summary>
+    /// Runs the manifest publishing pipeline expecting it to fail, and returns everything the
+    /// pipeline logged.
+    /// </summary>
+    /// <remarks>
+    /// A failure raised while the publisher is serializing a resource does not propagate out of
+    /// <see cref="DistributedApplication.RunAsync"/>: the pipeline reports the failed step, which
+    /// is what makes <c>aspire publish</c> exit non-zero. Asserting on the reported failure is
+    /// therefore the accurate way to prove a publish is rejected. This also asserts that no usable
+    /// manifest survives.
+    /// </remarks>
+    public static async Task<string> PublishManifestExpectingFailureAsync(
+        Action<IDistributedApplicationBuilder> configure,
+        [CallerMemberName] string? testName = null)
+    {
+        var outputPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "published-manifests",
+            $"{testName ?? "manifest"}-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outputPath);
+
+        var log = new CapturingLoggerProvider();
+
+        var appBuilder = DistributedApplication.CreateBuilder(
+            ["--operation", "publish", "--publisher", "manifest", "--output-path", outputPath]);
+        appBuilder.Services.AddLogging(logging => logging.AddProvider(log));
+        configure(appBuilder);
+
+        using (var app = appBuilder.Build())
+        {
+            await app.RunAsync();
+        }
+
+        var manifestPath = Path.Combine(outputPath, "aspire-manifest.json");
+        if (File.Exists(manifestPath))
+        {
+            var text = await File.ReadAllTextAsync(manifestPath);
+            Assert.ThrowsAny<JsonException>(() => JsonNode.Parse(text));
+        }
+
+        Directory.Delete(outputPath, recursive: true);
+
+        return log.ToString();
+    }
+
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        private readonly StringBuilder _messages = new();
+
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(_messages);
+
+        public void Dispose()
+        {
+        }
+
+        public override string ToString()
+        {
+            lock (_messages)
+            {
+                return _messages.ToString();
+            }
+        }
+
+        private sealed class CapturingLogger(StringBuilder messages) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                lock (messages)
+                {
+                    messages.AppendLine(formatter(state, exception));
+
+                    if (exception is not null)
+                    {
+                        messages.AppendLine(exception.ToString());
+                    }
+                }
+            }
+        }
     }
 
     public static async Task<JsonNode> GetManifest(IResource resource, string? manifestDirectory = null)
