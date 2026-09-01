@@ -195,12 +195,13 @@ Error: another DocumentDB container is already using the data directory /data. R
 
 Or the application fails to start with an `InvalidOperationException` saying two DocumentDB resources mount the same volume or host directory.
 
-**Cause:** DocumentDB `0.116.0` claims its data directory with an exclusive lock. Two PostgreSQL instances on one data directory would corrupt it, so the second container refuses to start rather than taking over. The container that already holds the directory keeps serving and is unaffected.
+**Cause:** Two PostgreSQL instances on one data directory would corrupt it. From `0.116.0` the container claims the directory with an exclusive lock, so the second container refuses to start rather than taking over, and the container that already holds it keeps serving, unaffected. Images at or below `0.114.0` have no such lock — nothing refuses the second start, and the corruption happens silently — which is why the application-model check is stricter for them.
 
 **Solutions:**
 1. **Stop whatever already holds the directory.** A leftover `docker run` session, a second AppHost instance, or a container from a previous debug session that was not removed — `docker ps --filter volume=<volume-name>` finds it.
-2. **Give each resource its own storage.** Two DocumentDB resources in one application model cannot share a volume name or a bind-mount source; use `WithDataVolume(name: "<resource>-data")` per resource.
+2. **Give each resource its own storage.** Two DocumentDB resources in one application model cannot use the same volume name or bind-mount source as their *data directory*; use `WithDataVolume(name: "<resource>-data")` per resource. Sharing a directory as read-only *input* (`WithInitData(...)`, `WithTlsCertificate(...)`) is fine.
 3. **Do not run the AppHost twice against the same volume.** Only one instance can hold the data directory at a time.
+4. **`WithExplicitStart()` is not an escape hatch on older images.** The pair is downgraded to a warning only when both resources resolve to a recognised `0.116.0`-or-later tag, where the container itself refuses the overlap. Otherwise it remains a hard failure.
 
 ### Read-only data volume or bind mount is rejected
 
@@ -209,6 +210,24 @@ Or the application fails to start with an `InvalidOperationException` saying two
 **Cause:** DocumentDB cannot run against a read-only data directory. The entrypoint takes ownership of it, and `initdb` must change its permissions before PostgreSQL can create the cluster or write WAL. Allowed through, the container logs `chown: changing ownership of '/data': Read-only file system` and `initdb: error: could not change permissions of directory "/data": Read-only file system` inside interleaved log streams, then waits a full minute before exiting with the misleading `PostgreSQL failed to start within 60 seconds` banner.
 
 **Solution:** Mount the data directory writable. Read-only mounts are correct for *input* only — `WithInitData(...)` mounts seed scripts read-only at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and key read-only.
+
+### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
+
+**Symptom:** A container using a bind-mounted data directory logs
+
+```text
+Warning: Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory.
+Use -c flag to force cleanup and re-initialization, or specify a different directory with -d.
+```
+
+then never becomes healthy and exits `1` about a minute later with `PostgreSQL failed to start within 60 seconds`.
+
+**Cause:** The data directory is not empty but does not hold a PostgreSQL cluster (no `PG_VERSION` file). The container refuses to initialise over unrecognised contents rather than deleting them, and PostgreSQL never starts — so the only failure you see is the generic 60-second timeout banner. One stray file is enough. Common culprits are a `.gitkeep` committed so the empty directory survives in source control, a `.DS_Store` written by macOS Finder, or leftovers from an unrelated tool.
+
+**Solutions:**
+1. **Empty the host directory** (or point `WithDataBindMount(...)` at a genuinely empty one) and start again. Nothing was deleted, so anything you need is still there.
+2. **Keep the directory out of source control** rather than seeding it with a placeholder file — add it to `.gitignore` and let the first run create it.
+3. **Prefer `WithDataVolume()`** when you do not need host access to the files: a fresh Docker volume is always empty.
 
 ### Initialization scripts do not re-run after being fixed
 
@@ -222,10 +241,10 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 **Symptom:** `docker system df` shows a growing number of unused local volumes with random 64-character hexadecimal names, roughly the size of a PostgreSQL data directory each.
 
-**Cause:** DocumentDB `0.116.0` declares `/data` as an image `VOLUME`. Any run that does not mount storage there gets a fresh anonymous volume, and removing the container without `-v` strands it. Neither Docker nor Aspire can un-declare an image volume.
+**Cause:** DocumentDB `0.116.0` and later declare `/data` as an image `VOLUME`. Any run that does not mount storage there gets a fresh anonymous volume, and removing the container without `-v` strands it. Neither Docker nor Aspire can un-declare an image volume. Images at or below `0.114.0` declare no volume and do not produce these.
 
 **Solutions:**
-1. **Mount your own storage on `/data`.** `WithDataVolume()` and `WithDataBindMount(...)` do this by default, which suppresses the anonymous volume. A non-default `targetPath` cannot: the declared `/data` volume is still created, and the resource logs a warning saying so.
+1. **Mount your own storage on `/data`.** `WithDataVolume()` and `WithDataBindMount(...)` do this by default, which suppresses the anonymous volume. A non-default `targetPath` cannot: the declared `/data` volume is still created, and the resource logs a warning saying so (only on images known to declare it — recognised `0.116.0`-or-later tags).
 2. **Reclaim what has accumulated:** `docker volume prune` (removes *all* unused local volumes — check `docker volume ls -f dangling=true` first).
 
 ## Debugging with mongosh

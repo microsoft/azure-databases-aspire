@@ -154,16 +154,18 @@ builder.AddDocumentDB("documentdb")
        .AddDatabase("mydb");
 ```
 
-DocumentDB `0.116.0` declares `/data` as an image volume, so a run that mounts nothing there
-gets an anonymous volume whose lifetime the container runtime controls and which container
-removal can strand. `WithDataVolume()` and `WithDataBindMount(...)` mount on that same path,
-which both makes persistence intentional and suppresses the anonymous volume. Pair either with
-stable credential parameters.
+Up to and including `0.114.0` an unmounted `/data` is a directory in the container's writable
+layer, discarded with the container. From `0.116.0` the image declares `/data` as a container
+volume, so a run that mounts nothing there instead gets an anonymous volume whose lifetime the
+container runtime controls and which container removal can strand. `WithDataVolume()` and
+`WithDataBindMount(...)` mount on that same path, which both makes persistence intentional and,
+on those images, suppresses the anonymous volume. Pair either with stable credential parameters.
 
-The data directory must be writable and is exclusive: `isReadOnly: true` is rejected, and only
-one running container at a time may use a given volume or host directory. Initialization
-(sample data or `WithInitData(...)`) runs once per data directory and is not retried after a
-failed attempt. See the
+The data directory must be writable, and must be empty or hold an existing DocumentDB cluster:
+`isReadOnly: true` is rejected, and a directory holding anything else is refused (not cleaned)
+by the container. From `0.116.0` it is also exclusive — only one running container at a time may
+use a given volume or host directory. Initialization (sample data or `WithInitData(...)`) runs
+once per data directory and is not retried after a failed attempt. See the
 [configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#storage-requirements)
 for the full rules.
 

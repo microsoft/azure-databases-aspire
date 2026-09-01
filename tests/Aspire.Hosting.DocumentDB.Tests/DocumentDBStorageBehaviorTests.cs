@@ -1,6 +1,8 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
 using Xunit;
 using static Aspire.Hosting.DocumentDB.Tests.DocumentDBEndToEndSupport;
@@ -22,8 +24,13 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 public class DocumentDBStorageBehaviorTests
 {
     private const string CandidateVersion = "0.116.0";
+    private const string BaselineVersion = "0.114.0";
+
     private static readonly string s_candidateImage =
         $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-{CandidateVersion}";
+
+    private static readonly string s_baselineImage =
+        $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-{BaselineVersion}";
 
     private static readonly string[] s_credentialEnvironment =
     [
@@ -41,7 +48,7 @@ public class DocumentDBStorageBehaviorTests
     public async Task ImageDeclaresDataVolumeAndUnmountedRunsGetAnAnonymousVolume()
     {
         RequireDocker();
-        await EnsureImageAsync();
+        await EnsureImageAsync(s_candidateImage);
 
         var (inspectExit, declared) = await RunDockerAsync(
             "image", "inspect", s_candidateImage, "--format", "{{json .Config.Volumes}}");
@@ -89,7 +96,7 @@ public class DocumentDBStorageBehaviorTests
     public async Task DataDirectoryIsClaimedByOneContainerAtATime()
     {
         RequireDocker();
-        await EnsureImageAsync();
+        await EnsureImageAsync(s_candidateImage);
 
         var volumeName = UniqueName("lock-vol");
         var firstContainer = UniqueName("lock-a");
@@ -140,7 +147,7 @@ public class DocumentDBStorageBehaviorTests
     public async Task ReadOnlyDataDirectoryFailsInitializationWithAMisleadingTimeout()
     {
         RequireDocker();
-        await EnsureImageAsync();
+        await EnsureImageAsync(s_candidateImage);
 
         var volumeName = UniqueName("ro-vol");
         var containerName = UniqueName("ro");
@@ -175,19 +182,168 @@ public class DocumentDBStorageBehaviorTests
         }
     }
 
+    /// <summary>
+    /// The image volume is a v0.116-0 addition, not a property of DocumentDB Local in general:
+    /// on the previous release an unmounted <c>/data</c> is an ordinary directory in the
+    /// container's writable layer. The package's anonymous-volume warning is gated on this
+    /// difference, so the difference itself is worth asserting.
+    /// </summary>
+    [Fact]
+    public async Task ThePreviousImageDeclaresNoDataVolume()
+    {
+        RequireDocker();
+        await EnsureImageAsync(s_baselineImage);
+
+        var (inspectExit, declared) = await RunDockerAsync(
+            "image", "inspect", s_baselineImage, "--format", "{{json .Config.Volumes}}");
+
+        Assert.Equal(0, inspectExit);
+        Assert.Equal("null", declared.Trim());
+    }
+
+    /// <summary>
+    /// A data directory that holds anything other than a PostgreSQL cluster is refused, not
+    /// cleaned: the container leaves the contents alone, never starts PostgreSQL, and exits behind
+    /// the same misleading 60-second banner. One stray dot-file — a <c>.gitkeep</c> committed to
+    /// keep the directory in source control, or a <c>.DS_Store</c> the host wrote — is enough.
+    /// </summary>
+    [Fact]
+    public async Task ANonEmptyDataDirectoryWithoutAClusterIsRefusedAndLeftIntact()
+    {
+        RequireDocker();
+        await EnsureImageAsync(s_candidateImage);
+
+        var hostDirectory = Path.Combine(AppContext.BaseDirectory, UniqueName("stray"));
+        Directory.CreateDirectory(hostDirectory);
+        var strayFile = Path.Combine(hostDirectory, ".gitkeep");
+        await File.WriteAllTextAsync(strayFile, "keep");
+
+        var containerName = UniqueName("stray");
+        try
+        {
+            var (runExit, _) = await RunDockerAsync(
+                ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, s_candidateImage]);
+            Assert.Equal(0, runExit);
+
+            var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
+
+            Assert.Contains(
+                "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory",
+                logs,
+                StringComparison.Ordinal);
+
+            var (_, exitCodeOutput) = await RunDockerAsync("inspect", containerName, "--format", "{{.State.ExitCode}}");
+            Assert.Equal("1", exitCodeOutput.Trim());
+
+            // The refusal is not destructive: the stray file is still there, and nothing was
+            // initialized over it.
+            Assert.True(File.Exists(strayFile), "The container removed the stray file it refused to initialize over.");
+            Assert.Equal("keep", await File.ReadAllTextAsync(strayFile));
+            Assert.False(File.Exists(Path.Combine(hostDirectory, "PG_VERSION")));
+        }
+        finally
+        {
+            await RunDockerAsync("rm", "-f", "-v", containerName);
+            TryDeleteDirectory(hostDirectory);
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        catch (IOException)
+        {
+            // The container took ownership of the contents; leaving the scratch directory behind
+            // in the test output folder is preferable to failing a passing test on cleanup.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
     private static string UniqueName(string prefix) =>
         $"docdb-storage-{prefix}-{Guid.NewGuid().ToString("N")[..8]}";
 
-    private static async Task EnsureImageAsync()
+    /// <summary>
+    /// Makes the candidate image available locally, pulling it if necessary.
+    /// </summary>
+    /// <remarks>
+    /// The shared <see cref="RunDockerAsync"/> helper bounds every command at 30 seconds, which is
+    /// right for introspection and far too short for a multi-hundred-megabyte pull on a cold CI
+    /// agent. The pull therefore runs through a local runner with its own generous deadline. The
+    /// work is memoized in a <see cref="Lazy{T}"/> so it happens exactly once per test class no
+    /// matter which test runs first or how many run in parallel — no test may depend on another
+    /// having warmed the cache.
+    /// </remarks>
+    private static readonly ConcurrentDictionary<string, Lazy<Task>> s_imagesReady = new(StringComparer.Ordinal);
+
+    private static Task EnsureImageAsync(string image) =>
+        s_imagesReady.GetOrAdd(image, key => new Lazy<Task>(() => PullImageAsync(key))).Value;
+
+    private static async Task PullImageAsync(string image)
     {
-        var (exitCode, _) = await RunDockerAsync("image", "inspect", s_candidateImage);
-        if (exitCode == 0)
+        var (inspectExit, _, _) = await RunDockerWithTimeoutAsync(ImageInspectTimeout, "image", "inspect", image);
+        if (inspectExit == 0)
         {
             return;
         }
 
-        var (pullExit, output) = await RunDockerAsync("pull", s_candidateImage);
-        Assert.True(pullExit == 0, $"Could not pull '{s_candidateImage}': {output}");
+        var (pullExit, output, error) = await RunDockerWithTimeoutAsync(ImagePullTimeout, "pull", image);
+        Assert.True(pullExit == 0, $"Could not pull '{image}': {output}{Environment.NewLine}{error}");
+    }
+
+    private static readonly TimeSpan ImageInspectTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ImagePullTimeout = TimeSpan.FromMinutes(15);
+
+    private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunDockerWithTimeoutAsync(
+        TimeSpan timeout,
+        params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo("docker")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException($"Failed to start 'docker {string.Join(' ', arguments)}'.");
+
+        using var deadline = new CancellationTokenSource(timeout);
+
+        // Both streams are drained concurrently with the wait: a pull writes progress to stderr
+        // continuously, and a full pipe buffer would deadlock the process.
+        var stdout = process.StandardOutput.ReadToEndAsync(deadline.Token);
+        var stderr = process.StandardError.ReadToEndAsync(deadline.Token);
+
+        try
+        {
+            await Task.WhenAll(stdout, stderr, process.WaitForExitAsync(deadline.Token));
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException)
+            {
+                // Already exited.
+            }
+
+            throw new InvalidOperationException(
+                $"'docker {string.Join(' ', arguments)}' did not complete within {timeout.TotalSeconds:0}s.");
+        }
+
+        return (process.ExitCode, await stdout, await stderr);
     }
 
     private static async Task<string> WaitForLogAsync(string containerName, string expected)
