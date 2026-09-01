@@ -156,11 +156,11 @@ def assert_publish_steps_guarded(workflow: str) -> list[tuple[str | None, str]]:
         )
 
     validation_fields = {key for key, _ in step_level_fields(steps[validation_index][1])}
-    forbidden_validation_fields = validation_fields & {"if", "continue-on-error"}
+    forbidden_validation_fields = validation_fields & {"if", "continue-on-error", "shell"}
     if forbidden_validation_fields:
         fields = ", ".join(sorted(forbidden_validation_fields))
         raise AssertionError(
-            "'Validate packed package' must be unconditional and fatal; "
+            "'Validate packed package' must be unconditional and fatal and use the default shell; "
             f"remove step-level key(s): {fields}."
         )
 
@@ -345,6 +345,16 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(
             AssertionError, "unconditional and fatal.*continue-on-error"
         ):
+            assert_publish_steps_guarded(mutated)
+
+    def test_custom_validation_shell_fails(self):
+        mutated = self.workflow.replace(
+            "      - name: Validate packed package\n",
+            "      - name: Validate packed package\n        shell: pwsh\n",
+            1,
+        )
+
+        with self.assertRaisesRegex(AssertionError, "unconditional and fatal.*shell"):
             assert_publish_steps_guarded(mutated)
 
     def test_empty_tag_argument_fails(self):
