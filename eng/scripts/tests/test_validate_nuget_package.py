@@ -56,12 +56,32 @@ def parse_workflow_steps(workflow: str) -> list[tuple[str | None, str]]:
     return steps
 
 
+def step_level_fields(body: str) -> list[tuple[str, str]]:
+    fields = []
+    for line in body.splitlines():
+        match = re.match(
+            r"^(?:      -[ \t]+|        )(?P<key>[A-Za-z][A-Za-z0-9-]*):(?P<value>.*)$",
+            line,
+        )
+        if match is not None:
+            fields.append((match.group("key"), match.group("value").strip()))
+    return fields
+
+
 def is_publishing_step(name: str | None, body: str) -> bool:
-    normalized_body = body.lower()
+    uses_values = [
+        value.lower().strip("'\"")
+        for key, value in step_level_fields(body)
+        if key == "uses"
+    ]
     return (
         name in KNOWN_PUBLISHING_STEPS
         or any(pattern.search(body) for pattern in PUBLISHING_COMMANDS)
-        or any(f"uses: {action}" in normalized_body for action in PUBLISHING_ACTIONS)
+        or any(
+            value.startswith(action)
+            for value in uses_values
+            for action in PUBLISHING_ACTIONS
+        )
     )
 
 
@@ -77,6 +97,15 @@ def assert_publish_steps_guarded(workflow: str) -> list[tuple[str | None, str]]:
 
     guard_line = f"        {PUBLISH_GUARD}"
     validation_index = validation_indexes[0]
+    validation_fields = {key for key, _ in step_level_fields(steps[validation_index][1])}
+    forbidden_validation_fields = validation_fields & {"if", "continue-on-error"}
+    if forbidden_validation_fields:
+        fields = ", ".join(sorted(forbidden_validation_fields))
+        raise AssertionError(
+            "'Validate packed package' must be unconditional and fatal; "
+            f"remove step-level key(s): {fields}."
+        )
+
     for index, (name, body) in enumerate(steps):
         if not is_publishing_step(name, body):
             continue
@@ -238,6 +267,43 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
                         1, body.splitlines().count(f"        {PUBLISH_GUARD}")
                     )
 
+    def test_conditional_validation_step_fails(self):
+        mutated = self.workflow.replace(
+            "      - name: Validate packed package\n",
+            "      - name: Validate packed package\n        if: false\n",
+            1,
+        )
+
+        with self.assertRaisesRegex(AssertionError, "unconditional and fatal.*if"):
+            assert_publish_steps_guarded(mutated)
+
+    def test_continue_on_error_validation_step_fails(self):
+        mutated = self.workflow.replace(
+            "      - name: Validate packed package\n",
+            "      - name: Validate packed package\n        continue-on-error: true\n",
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "unconditional and fatal.*continue-on-error"
+        ):
+            assert_publish_steps_guarded(mutated)
+
+    def test_validation_run_content_cannot_impersonate_step_level_keys(self):
+        workflow = f"""jobs:
+  publish:
+    steps:
+      - name: Validate packed package
+        run: |
+          echo "if: false"
+          echo "continue-on-error: true"
+      - name: Push to NuGet
+        {PUBLISH_GUARD}
+        run: dotnet nuget push package.nupkg
+"""
+
+        assert_publish_steps_guarded(workflow)
+
     def test_unguarded_nuget_push_before_artifact_upload_fails(self):
         workflow = """jobs:
   publish:
@@ -287,13 +353,13 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "unnamed step #3"):
             assert_publish_steps_guarded(workflow)
 
-    def test_unnamed_release_action_requires_guard(self):
+    def test_unnamed_release_action_with_extra_spacing_requires_guard(self):
         workflow = """jobs:
   publish:
     steps:
       - name: Validate packed package
         run: validate
-      - uses: softprops/action-gh-release@sha
+      - uses:  softprops/action-gh-release@sha
 """
 
         with self.assertRaisesRegex(AssertionError, "unnamed step #2"):
