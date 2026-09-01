@@ -352,6 +352,38 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Theory]
+    [InlineData(AppHost.Pg15Scenario, "pg15-")]
+    [InlineData(AppHost.Pg16Scenario, "pg16-")]
+    public async Task EveryCurrentPostgresVariantResolvesToARealImageAndServesTraffic(
+        string scenarioName,
+        string expectedTagPrefix)
+    {
+        // Pg17 (the default) and Pg18 are covered elsewhere; together these four mean every
+        // member of DocumentDBPostgresVersion is proven to name an image that exists and runs,
+        // not merely a well-formed tag.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope((AppHost.ScenarioEnvironmentVariable, scenarioName));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
+        Assert.StartsWith(expectedTagPrefix, image.Tag, StringComparison.Ordinal);
+
+        await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "widgets", $"{scenarioName}-widget", cts.Token);
+    }
+
+    [Theory]
     [InlineData(AppHost.Pg15Scenario, 15)]
     [InlineData(AppHost.Pg16Scenario, 16)]
     [InlineData(AppHost.Pg17Scenario, 17)]
@@ -413,6 +445,41 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
     // Container configuration knobs, asserted against the container
     // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachTheCurrentContainer()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var otelEndpoint = "http://localhost:4317";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.ObservableConfigScenario),
+            (AppHost.OtelEndpointEnvironmentVariable, otelEndpoint));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+
+        Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]);
+        Assert.Equal(otelEndpoint, environment["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]);
+        Assert.Equal("15000", environment["OTEL_METRIC_EXPORT_INTERVAL"]);
+        Assert.Equal("7000", environment["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
+        Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
+        Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
+        Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("aspireowner", environment["OWNER"]);
+
+        var logs = await WaitForContainerLogAsync(containerId, "Using owner: aspireowner", cts.Token);
+        Assert.Contains("Using owner: aspireowner", logs, StringComparison.Ordinal);
+    }
 
     [Fact]
     public async Task OpenTelemetryMetricsAreExportedFrom0116()
@@ -551,17 +618,32 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task PostgresEndpointHonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
+    public async Task CurrentPostgresEndpointHonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
+    {
+        await AssertPostgresExtrasAsync(imageTag: null, assertLz4: false);
+    }
+
+    [Fact]
+    public async Task PostgresEndpointOn0116UsesLz4ToastCompression()
+    {
+        await AssertPostgresExtrasAsync(CandidateTag(17), assertLz4: true);
+    }
+
+    private static async Task AssertPostgresExtrasAsync(string? imageTag, bool assertLz4)
     {
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
         var postgresPort = GetAvailableTcpPort();
 
-        using var scenario = new EnvironmentScope(
-            (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresExtrasScenario),
-            (AppHost.PostgresPortEnvironmentVariable, postgresPort.ToString()),
-            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+        using var scenario = imageTag is null
+            ? new EnvironmentScope(
+                (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresExtrasScenario),
+                (AppHost.PostgresPortEnvironmentVariable, postgresPort.ToString()))
+            : new EnvironmentScope(
+                (AppHost.ScenarioEnvironmentVariable, AppHost.PostgresExtrasScenario),
+                (AppHost.PostgresPortEnvironmentVariable, postgresPort.ToString()),
+                (AppHost.ImageTagEnvironmentVariable, imageTag));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -596,11 +678,14 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         Assert.Equal(0L, Convert.ToInt64(accessMethods));
 
-        var toastCompression = await QueryPostgresAsync(
-            postgresConnectionString!,
-            "SHOW default_toast_compression",
-            cts.Token);
-        Assert.Equal("lz4", Convert.ToString(toastCompression));
+        if (assertLz4)
+        {
+            var toastCompression = await QueryPostgresAsync(
+                postgresConnectionString!,
+                "SHOW default_toast_compression",
+                cts.Token);
+            Assert.Equal("lz4", Convert.ToString(toastCompression));
+        }
     }
 
     [Fact]
@@ -629,6 +714,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             $"username '{AppHost.ReservedUserName}' uses reserved prefix 'pg'",
             logs,
             StringComparison.Ordinal);
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
     }
 
     [Fact]
@@ -774,13 +860,19 @@ public class DocumentDBFeatureMatrixEndToEndTests
                     continue;
                 }
 
-                if (resourceEvent.Snapshot.State?.Text is { } stateText &&
-                    (stateText.Contains("Fail", StringComparison.OrdinalIgnoreCase) ||
-                     stateText.Contains("Error", StringComparison.OrdinalIgnoreCase)))
+                var stateText = resourceEvent.Snapshot.State?.Text;
+                if (string.Equals(stateText, KnownResourceStates.FailedToStart, StringComparison.Ordinal) ||
+                    ((string.Equals(stateText, KnownResourceStates.Exited, StringComparison.Ordinal) ||
+                      string.Equals(stateText, KnownResourceStates.Finished, StringComparison.Ordinal)) &&
+                     resourceEvent.Snapshot.ExitCode is { } exitCode &&
+                     exitCode != 0))
                 {
                     return;
                 }
             }
+
+            throw new InvalidOperationException(
+                $"Resource '{resourceName}' stopped reporting state before a failure was observed.");
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {

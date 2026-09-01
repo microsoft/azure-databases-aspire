@@ -27,6 +27,7 @@ public class Program
     public const string ImageTagEnvironmentVariable = "DOCUMENTDB_FEATURE_IMAGE_TAG";
     public const string InitDataPathEnvironmentVariable = "DOCUMENTDB_FEATURE_INIT_DATA";
     public const string OtelOutputPathEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_OUTPUT";
+    public const string OtelEndpointEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_ENDPOINT";
 
     /// <summary>Custom credential parameters, two databases, one with a distinct database name.</summary>
     public const string CustomCredentialsMultiDbScenario = "custom-credentials-multi-db";
@@ -153,29 +154,43 @@ public class Program
                 break;
 
             case ObservableConfigScenario:
-                var otelOutputPath = GetRequired(OtelOutputPathEnvironmentVariable);
-                var otelConfigPath = CreateOtelCollectorConfiguration(otelOutputPath);
+                var otelOutputPath = Environment.GetEnvironmentVariable(OtelOutputPathEnvironmentVariable);
+                var otelEndpoint = Environment.GetEnvironmentVariable(OtelEndpointEnvironmentVariable);
+                IResourceBuilder<ContainerResource>? collector = null;
 
-                builder.AddContainer(
-                        "otel-collector",
-                        "otel/opentelemetry-collector-contrib",
-                        "0.130.1")
-                    .WithBindMount(otelConfigPath, "/etc/otelcol-contrib/config.yaml", isReadOnly: true)
-                    .WithBindMount(otelOutputPath, "/var/lib/otel")
-                    .WithContainerRuntimeArgs("--user", "0:0")
-                    .WithArgs("--config=/etc/otelcol-contrib/config.yaml")
-                    .WithEndpoint(targetPort: 4317, name: "grpc");
+                if (!string.IsNullOrWhiteSpace(otelOutputPath))
+                {
+                    var otelConfigPath = CreateOtelCollectorConfiguration(otelOutputPath);
+                    collector = builder.AddContainer(
+                            "otel-collector",
+                            "otel/opentelemetry-collector-contrib",
+                            "0.130.1")
+                        .WithBindMount(otelConfigPath, "/etc/otelcol-contrib/config.yaml", isReadOnly: true)
+                        .WithBindMount(otelOutputPath, "/var/lib/otel")
+                        .WithContainerRuntimeArgs("--user", "0:0")
+                        .WithArgs("--config=/etc/otelcol-contrib/config.yaml")
+                        .WithEndpoint(targetPort: 4317, name: "grpc");
+                    otelEndpoint = "http://otel-collector:4317";
+                }
 
                 documentDB
                     .WithLogLevel(DocumentDBLogLevel.Debug)
                     .WithOwner("aspireowner")
                     .WithOpenTelemetryMetrics(
-                        endpoint: "http://otel-collector:4317",
+                        endpoint: string.IsNullOrWhiteSpace(otelEndpoint)
+                            ? throw new InvalidOperationException(
+                                $"{OtelOutputPathEnvironmentVariable} or {OtelEndpointEnvironmentVariable} must be set.")
+                            : otelEndpoint,
                         enabled: true,
-                        exportInterval: TimeSpan.FromSeconds(1),
+                        exportInterval: collector is null ? TimeSpan.FromSeconds(15) : TimeSpan.FromSeconds(1),
                         timeout: TimeSpan.FromSeconds(7),
                         serviceName: "aspire-documentdb-e2e",
                         serviceVersion: "1.2.3");
+
+                if (collector is not null)
+                {
+                    documentDB.WaitFor(collector);
+                }
                 break;
 
             case Pg15Scenario:

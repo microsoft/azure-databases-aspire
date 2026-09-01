@@ -766,10 +766,20 @@ public class AddDocumentDBTests
                 .OfType<ContainerFileSystemCallbackAnnotation>()
                 .Where(annotation =>
                     annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
+        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
+        var file = Assert.IsType<ContainerFile>(Assert.Single(entries));
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         Assert.False(env.ContainsKey("CONFIG_DIR"));
-        Assert.NotNull(configuration.Callback);
+        Assert.Equal("SetupConfiguration.json", file.Name);
+        Assert.Contains("\"BlockedRolePrefixes\"", file.Contents, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"TelemetryOptions\"", file.Contents, StringComparison.Ordinal);
+        Assert.Equal(
+            UnixFileMode.UserRead |
+            UnixFileMode.UserWrite |
+            UnixFileMode.GroupRead |
+            UnixFileMode.OtherRead,
+            file.Mode);
     }
 
     [Fact]
@@ -777,6 +787,7 @@ public class AddDocumentDBTests
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
             .WithEnvironment("CONFIG_DIR", "/custom/documentdb/config")
             .WithOpenTelemetryMetrics();
 
@@ -790,7 +801,7 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public void WithOpenTelemetryMetricsAppliesCompatibilityConfigurationToPrivateMirrors()
+    public async Task WithOpenTelemetryMetricsAppliesCompatibilityConfigurationToPrivateMirrors()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
@@ -802,11 +813,84 @@ public class AddDocumentDBTests
 
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        Assert.Single(
+        var configuration = Assert.Single(
             containerResource.Annotations
                 .OfType<ContainerFileSystemCallbackAnnotation>()
                 .Where(annotation =>
                     annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
+        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
+        Assert.IsType<ContainerFile>(Assert.Single(entries));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDoesNotInjectCompatibilityConfigurationFor0114()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.114.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
+        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
+
+        Assert.Empty(entries);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDoesNotInjectCompatibilityConfigurationForCustomImages()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("contoso/documentdb-local", "pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
+        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
+
+        Assert.Empty(entries);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPreserves0116DefaultServiceName()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal("documentdb_gateway", env["OTEL_SERVICE_NAME"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPreservesCallerProvided0116ServiceName()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("OTEL_SERVICE_NAME", "caller-service")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal("caller-service", env["OTEL_SERVICE_NAME"]);
     }
 
     [Fact]
@@ -1045,6 +1129,43 @@ public class AddDocumentDBTests
 
         Assert.Contains("v0.116.0", exception.Message, StringComparison.Ordinal);
         Assert.Contains("SetupConfiguration.json", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllows0116PublishModeWhenDisabled()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics()
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("false", manifest["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
+        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
+
+        Assert.Empty(entries);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejects0116PublishModeWhenFinalCallEnablesMetrics()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(enabled: false)
+            .WithOpenTelemetryMetrics();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ManifestUtils.GetManifest(documentDB.Resource));
+
+        Assert.Contains("v0.116.0", exception.Message, StringComparison.Ordinal);
     }
 
 
@@ -1849,5 +1970,21 @@ public class AddDocumentDBTests
         }
 
         return environmentVariables;
+    }
+
+    private static async Task<IReadOnlyList<ContainerFileSystemItem>> InvokeContainerFileCallbackAsync(
+        ContainerFileSystemCallbackAnnotation annotation,
+        DocumentDBServerResource resource,
+        IServiceProvider services)
+    {
+        var entries = await annotation.Callback(
+            new ContainerFileSystemCallbackContext
+            {
+                Model = resource,
+                Services = services,
+            },
+            CancellationToken.None);
+
+        return entries.ToList();
     }
 }

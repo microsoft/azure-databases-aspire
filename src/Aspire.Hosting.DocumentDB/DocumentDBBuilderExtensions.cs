@@ -17,7 +17,7 @@ public static class DocumentDBBuilderExtensions
 {
     private sealed class OpenTelemetryEnvironmentConfigurationAnnotation : IResourceAnnotation
     {
-        public static OpenTelemetryEnvironmentConfigurationAnnotation Instance { get; } = new();
+        public bool MetricsEnabled { get; set; }
     }
 
     // default internal port is 10260.
@@ -50,6 +50,7 @@ public static class DocumentDBBuilderExtensions
     private const string DefaultMountedDataPath = "/data";
     private const string InitDataMountPath = "/init_doc_db.d";
     private const string DefaultGatewayConfigurationPath = "/home/documentdb/gateway/pg_documentdb_gw";
+    private const string DefaultOpenTelemetryServiceName = "documentdb_gateway";
     private const string OpenTelemetryEnvironmentConfiguration = """
         {
           "NodeHostName": "localhost",
@@ -744,12 +745,13 @@ public static class DocumentDBBuilderExtensions
     /// <para>
     /// DocumentDB v0.116-0 ships telemetry values in <c>SetupConfiguration.json</c> that take
     /// precedence over the standard OpenTelemetry environment variables. For the stock Local
-    /// image configuration, this method replaces that file with the stable gateway defaults but
-    /// no telemetry section, so the environment variables documented below remain authoritative.
-    /// A caller-supplied <c>CONFIG_DIR</c> remains authoritative and is not replaced.
-    /// Aspire publish mode is rejected with an actionable error when this method is combined
-    /// with the official v0.116-0 image, because not every publisher carries the required runtime
-    /// file override. Direct AppHost run mode is supported.
+    /// image configuration, this method replaces that file when metrics are enabled with the
+    /// stable gateway defaults but no telemetry section, so the environment variables documented
+    /// below remain authoritative. A caller-supplied <c>CONFIG_DIR</c> remains authoritative and
+    /// is not replaced. Aspire publish mode is rejected with an actionable error when metrics are
+    /// enabled for the official v0.116-0 image, because not every publisher carries the required
+    /// runtime file override. Explicitly disabled metrics remain publishable. Direct AppHost run
+    /// mode is supported.
     /// </para>
     /// <para>
     /// Merge semantics across multiple calls on the same builder:
@@ -858,12 +860,13 @@ public static class DocumentDBBuilderExtensions
             ArgumentOutOfRangeException.ThrowIfLessThan(to, TimeSpan.Zero, nameof(timeout));
         }
 
-        EnsureOpenTelemetryEnvironmentConfiguration(builder);
+        EnsureOpenTelemetryEnvironmentConfiguration(builder, enabled);
 
         return builder.WithEnvironment(context =>
         {
             if (context.ExecutionContext.IsPublishMode &&
                 context.Resource is DocumentDBServerResource resource &&
+                IsOpenTelemetryCompatibilityEnabled(resource) &&
                 RequiresOpenTelemetryEnvironmentConfiguration(resource))
             {
                 throw new InvalidOperationException(
@@ -898,6 +901,13 @@ public static class DocumentDBBuilderExtensions
             {
                 context.EnvironmentVariables[OtelServiceNameEnvVarName] = serviceName;
             }
+            else if (context.Resource is DocumentDBServerResource serviceNameResource &&
+                     IsOpenTelemetryCompatibilityEnabled(serviceNameResource) &&
+                     RequiresOpenTelemetryEnvironmentConfiguration(serviceNameResource) &&
+                     !context.EnvironmentVariables.ContainsKey(OtelServiceNameEnvVarName))
+            {
+                context.EnvironmentVariables[OtelServiceNameEnvVarName] = DefaultOpenTelemetryServiceName;
+            }
 
             if (serviceVersion is not null)
             {
@@ -907,21 +917,30 @@ public static class DocumentDBBuilderExtensions
     }
 
     private static void EnsureOpenTelemetryEnvironmentConfiguration(
-        IResourceBuilder<DocumentDBServerResource> builder)
+        IResourceBuilder<DocumentDBServerResource> builder,
+        bool metricsEnabled)
     {
-        if (builder.Resource.Annotations
+        var configuration = builder.Resource.Annotations
             .OfType<OpenTelemetryEnvironmentConfigurationAnnotation>()
-            .Any())
+            .SingleOrDefault();
+
+        if (configuration is not null)
         {
+            configuration.MetricsEnabled = metricsEnabled;
             return;
         }
 
-        builder.Resource.Annotations.Add(OpenTelemetryEnvironmentConfigurationAnnotation.Instance);
+        configuration = new OpenTelemetryEnvironmentConfigurationAnnotation
+        {
+            MetricsEnabled = metricsEnabled,
+        };
+        builder.Resource.Annotations.Add(configuration);
         builder.WithContainerFiles(
             DefaultGatewayConfigurationPath,
             (_, _) =>
             {
                 IEnumerable<ContainerFileSystemItem> entries =
+                    configuration.MetricsEnabled &&
                     RequiresOpenTelemetryEnvironmentConfiguration(builder.Resource)
                         ? [
                             new ContainerFile
@@ -939,6 +958,12 @@ public static class DocumentDBBuilderExtensions
                 return Task.FromResult(entries);
             });
     }
+
+    private static bool IsOpenTelemetryCompatibilityEnabled(DocumentDBServerResource resource) =>
+        resource.Annotations
+            .OfType<OpenTelemetryEnvironmentConfigurationAnnotation>()
+            .SingleOrDefault()
+            ?.MetricsEnabled == true;
 
     private static bool RequiresOpenTelemetryEnvironmentConfiguration(
         DocumentDBServerResource resource)

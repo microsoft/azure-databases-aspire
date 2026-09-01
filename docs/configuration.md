@@ -246,7 +246,7 @@ var server = builder.AddDocumentDB("documentdb")
 | `enabled` | `bool` | `true` | Whether metrics export is enabled. Sets `OTEL_METRICS_ENABLED`. The container default is `false`; calling this method flips it on unless `enabled: false` is passed. |
 | `exportInterval` | `TimeSpan?` | `null` | How often the gateway flushes metrics. When provided, sets `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds, integer, invariant culture). Must be non-negative. |
 | `timeout` | `TimeSpan?` | `null` | Per-export request timeout. When provided, sets `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` (milliseconds, integer, invariant culture). Must be non-negative. |
-| `serviceName` | `string?` | `null` | Logical service name attached to the metrics. When provided, sets `OTEL_SERVICE_NAME`. Must be non-empty when provided. |
+| `serviceName` | `string?` | `null` | Logical service name attached to the metrics. When provided, sets `OTEL_SERVICE_NAME`. Must be non-empty when provided. For the official `0.116.0` image, omitting it preserves the image default of `documentdb_gateway`. |
 | `serviceVersion` | `string?` | `null` | Logical service version attached to the metrics. When provided, sets `OTEL_SERVICE_VERSION`. Must be non-empty when provided. |
 
 When `endpoint` is omitted, the gateway falls back to the standard OTLP/gRPC default
@@ -274,20 +274,23 @@ metrics settings from the environment on both older images and `0.116.0`. If the
 custom `CONFIG_DIR`, that custom configuration remains authoritative.
 
 The compatibility file is injected when the AppHost runs the official `0.116.0` Local image.
-Aspire publish mode is rejected for that exact image with `WithOpenTelemetryMetrics`, because not
-every publisher carries the required runtime file override. Failing explicitly avoids publishing
-a deployment where metrics are silently disabled. Direct AppHost run mode is supported. A custom
-image with corrected upstream telemetry configuration is not subject to this guard. A private
-registry mirror that keeps the official `documentdb/documentdb-local:pgNN-0.116.0` image path and
-tag receives the same compatibility override and publish guard.
+Aspire publish mode is rejected for that exact image when metrics are enabled, because not every
+publisher carries the required runtime file override. Failing explicitly avoids publishing a
+deployment where metrics are silently disabled. Explicitly disabling metrics does not require the
+override and remains publishable. Direct AppHost run mode is supported. A custom image with
+corrected upstream telemetry configuration is not subject to this guard. A private registry mirror
+that keeps the official `documentdb/documentdb-local:pgNN-0.116.0` image path and tag receives the
+same compatibility override and publish guard.
 
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
 larger granularities.
 
 The gateway also reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TIMEOUT` when the
-signal-specific variants above are unset, plus `OTEL_RESOURCE_ATTRIBUTES`. These are not exposed
-by the typed API — set them via `WithEnvironment(...)` if you need them.
+signal-specific variants above are unset. Starting in `0.116.0`, it also applies
+`OTEL_RESOURCE_ATTRIBUTES`; the current default `0.114.0` image parses that variable but does not
+apply it during startup. These are not exposed by the typed API — set them via
+`WithEnvironment(...)` if you need them.
 
 
 ## WithOwner
