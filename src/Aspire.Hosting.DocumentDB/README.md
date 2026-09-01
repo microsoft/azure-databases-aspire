@@ -106,7 +106,7 @@ var db = documentdb.AddDatabase("mydb");
 ```
 
 `WithLogLevel(...)` becomes observably effective on DocumentDB `0.114.0` and later through
-`DOCUMENTDB_LOG_LEVEL`, including the current default `0.114.0` image. On images through `0.113.0`,
+`DOCUMENTDB_LOG_LEVEL`, including the current default image. On images through `0.113.0`,
 neither variable controls gateway verbosity; `LOG_LEVEL` is retained because the Local entrypoint
 validates its six-value contract, not because a Local image uses it to select gateway verbosity.
 `Quiet` remains mapped to `quiet` for API compatibility and becomes newly effective on `0.114.0`
