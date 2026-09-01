@@ -73,7 +73,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.AddDatabase(name, databaseName?)` | Add a named database |
 | `.WithHostPort(port)` | Bind to a fixed host port (default: random) |
 | `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume |
-| `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
+| `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount. Does **not** survive a restart on Docker Desktop — see [Bind-mounted data fails to restart on Docker Desktop](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/troubleshooting.md#bind-mounted-data-fails-to-restart-on-docker-desktop) |
 | `.WithLogLevel(level)` | Set the container `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
 | `.WithInitData(source)` | Bind-mount initialization scripts to `/init_doc_db.d` and disable built-in sample data |
 | `.WithoutSampleData()` | Disable the built-in sample data initialization |
@@ -137,6 +137,14 @@ builder.AddDocumentDB("documentdb")
 DocumentDB `0.116.0` declares `/data` as an image volume, so Docker may create an anonymous
 volume even without this helper. Anonymous-volume lifetime is controlled by the container
 runtime; use a named volume and stable credentials for intentional persistence.
+
+`WithDataBindMount()` is not an equivalent choice on Docker Desktop. Its host file sharing does
+not apply ownership changes to the mounted path in time for PostgreSQL's data-directory check, so
+the first run works and every later run fails to start with
+`FATAL: data directory "/data" has wrong ownership`, leaving the data on the host but unreadable.
+This was measured on macOS (VirtioFS) and is expected on Docker Desktop's other hosts, which share
+that design. See
+[Bind-mounted data fails to restart on Docker Desktop](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/troubleshooting.md#bind-mounted-data-fails-to-restart-on-docker-desktop).
 
 ## More information
 

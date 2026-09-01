@@ -162,7 +162,7 @@ var server = builder.AddDocumentDB("documentdb", userName: userName, password: p
                     .WithDataBindMount("./data/documentdb");
 ```
 
-On Docker Desktop for macOS or Windows, prefer `WithDataVolume()` — see [Bind-mounted data fails to restart on Docker Desktop](#bind-mounted-data-fails-to-restart-on-docker-desktop).
+On Docker Desktop, prefer `WithDataVolume()` — see [Bind-mounted data fails to restart on Docker Desktop](#bind-mounted-data-fails-to-restart-on-docker-desktop).
 
 ### Bind-mounted data fails to restart on Docker Desktop
 
@@ -174,12 +174,14 @@ pg_ctl: could not start server
 [POSTGRES] HINT:  The server must be started by the user that owns the data directory.
 ```
 
-**Cause:** PostgreSQL refuses to start unless the data directory's owner is the user starting the postmaster. The DocumentDB container establishes that by running `chown` on `DATA_PATH` and starting the postmaster a few milliseconds later. Docker Desktop's macOS and Windows file sharing applies `chown` on a bind mount asynchronously: for about a second afterwards the container still sees the previous owner, so the postmaster reads a stale owner and aborts. The first run is unaffected because `initdb` runs for several seconds in between. A restart has no `initdb`, so it fails every time. Named volumes do not go through that file-sharing layer, and Linux bind mounts are ordinary mounts, so neither is affected.
+**Cause:** PostgreSQL refuses to start unless the data directory's owner is the user starting the postmaster. The DocumentDB container establishes that by running `chown` on `DATA_PATH` and starting the postmaster a few milliseconds later. Docker Desktop's host file sharing applies `chown` on a bind mount asynchronously: **measured on macOS with VirtioFS**, `stat` inside the container keeps reporting the previous owner for roughly a second afterwards, so the postmaster reads a stale owner and aborts. The first run is unaffected because `initdb` runs for several seconds in between. A restart has no `initdb`, so it fails every time.
+
+Docker Desktop on Windows and on Linux is expected to be affected in the same way, since both share host paths through the same VM file-sharing design, but that has not been measured here; whether a particular Windows setup is affected can depend on how the host path is shared. Named volumes do not go through that layer, and a bind mount on a native container engine (a Linux host running Docker Engine, which is what CI uses) is an ordinary mount, so neither is affected — the end-to-end test requires the restart to succeed there and only tolerates the failure when `docker info` reports `Docker Desktop`.
 
 **Solutions:**
 1. **Use `WithDataVolume()`** instead. It is the persistence mechanism the DocumentDB image documents and tests, and it is unaffected by this.
 2. **Need the files on the host?** Copy them out of the volume when you need them (`docker run --rm -v <volume>:/data -v "$PWD":/out alpine tar -C /data -cf /out/data.tar .`) rather than running the database directly on a bind mount.
-3. **On Linux**, `WithDataBindMount()` restarts normally; nothing needs to change.
+3. **On a native container engine**, `WithDataBindMount()` restarts normally; nothing needs to change.
 
 ### Authentication fails on the second run after adding a data volume
 
@@ -256,6 +258,6 @@ DocumentDB container logs can help diagnose startup and runtime issues:
 
 - **Health readiness is gateway readiness.** The built-in authenticated MongoDB health check does
   not prove that DocumentDB `0.116.0` one-shot initialization scripts have completed.
-- **`WithDataBindMount()` does not restart on Docker Desktop.** Docker Desktop for macOS and Windows applies ownership changes to bind-mounted host paths asynchronously, and PostgreSQL reads the stale owner and refuses the data directory. Use `WithDataVolume()` on those hosts — see [Bind-mounted data fails to restart on Docker Desktop](#bind-mounted-data-fails-to-restart-on-docker-desktop).
+- **`WithDataBindMount()` does not restart on Docker Desktop.** Docker Desktop's host file sharing applies ownership changes to bind-mounted paths asynchronously — measured on macOS/VirtioFS, and expected on its other hosts — and PostgreSQL reads the stale owner and refuses the data directory. Use `WithDataVolume()` there — see [Bind-mounted data fails to restart on Docker Desktop](#bind-mounted-data-fails-to-restart-on-docker-desktop).
 - **No built-in backup/restore.** For development data, use `WithDataVolume()` for persistence. For important data, use `mongodump` / `mongorestore` manually.
 - **Single server only.** The extension does not support replica sets or sharded clusters. It runs a single DocumentDB container intended for local development.

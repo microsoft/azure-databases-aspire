@@ -110,7 +110,7 @@ You can find the generated connection string in the Aspire dashboard under the r
 
 - **TLS is enabled by default.** The DocumentDB container uses a self-signed certificate. The extension automatically adds `tls=true&tlsInsecure=true` to the connection string so the .NET MongoDB driver accepts the self-signed certificate.
 - **Credentials are auto-generated.** Unless you provide explicit parameters, the extension generates a random password and uses `admin` as the default username.
-- **Data is ephemeral.** By default, DocumentDB stores data inside the container. When the container stops, you lose that data. Use `WithDataVolume()` or `WithDataBindMount()` to persist data across restarts. See [Configuration](configuration.md) for details.
+- **Data is ephemeral.** By default, DocumentDB stores data inside the container. When the container stops, you lose that data. Use `WithDataVolume()` to persist data across restarts. `WithDataBindMount()` also persists data to a host directory, but on Docker Desktop the container only starts against it once — later runs fail with `FATAL: data directory "/data" has wrong ownership` and the data, though intact on the host, is unreadable. Prefer `WithDataVolume()` unless you are on a native container engine and need the files on the host. See [Configuration](configuration.md) and [Bind-mounted data fails to restart on Docker Desktop](troubleshooting.md#bind-mounted-data-fails-to-restart-on-docker-desktop) for details.
 
 ## Next steps
 
