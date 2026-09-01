@@ -18,20 +18,54 @@ SCRIPT_PATH = REPO_ROOT / "eng" / "scripts" / "validate-nuget-package.py"
 PUBLISH_GUARD = "if: github.event_name == 'push' && github.ref_type == 'tag'"
 KNOWN_PUBLISHING_STEPS = {"Push to NuGet", "Create GitHub Release"}
 PUBLISHING_COMMANDS = (
-    re.compile(r"\bdotnet\s+nuget\s+push\b"),
+    re.compile(r"\b(?:dotnet\s+)?nuget\s+push\b"),
     re.compile(r"\bgh\s+release\s+(?:create|edit|delete|upload)\b"),
+)
+PUBLISHING_ACTIONS = (
+    "actions/create-release@",
+    "alirezanet/publish-nuget@",
+    "ncipollo/release-action@",
+    "softprops/action-gh-release@",
+    "svenstaro/upload-release-action@",
 )
 
 
-def parse_workflow_steps(workflow: str) -> list[tuple[str, str]]:
+def parse_workflow_steps(workflow: str) -> list[tuple[str | None, str]]:
+    steps_markers = list(re.finditer(r"(?m)^    steps:\s*$", workflow))
+    if not steps_markers:
+        raise AssertionError("Workflow must contain a steps section.")
+
     steps = []
-    for step in workflow.split("      - name: ")[1:]:
-        name, body = step.split("\n", 1)
-        steps.append((name, body))
+    for steps_marker in steps_markers:
+        section_start = steps_marker.end()
+        section_end_match = re.search(r"(?m)^(?= {0,4}\S)", workflow[section_start:])
+        section_end = (
+            section_start + section_end_match.start()
+            if section_end_match is not None
+            else len(workflow)
+        )
+        section = workflow[section_start:section_end]
+        entries = list(re.finditer(r"(?m)^      -(?:[ \t]+(?P<head>.*))?$", section))
+
+        for index, entry in enumerate(entries):
+            end = entries[index + 1].start() if index + 1 < len(entries) else len(section)
+            body = section[entry.start():end]
+            head = (entry.group("head") or "").strip()
+            name = head.removeprefix("name:").strip() if head.startswith("name:") else None
+            steps.append((name, body))
     return steps
 
 
-def assert_publish_steps_guarded(workflow: str) -> list[tuple[str, str]]:
+def is_publishing_step(name: str | None, body: str) -> bool:
+    normalized_body = body.lower()
+    return (
+        name in KNOWN_PUBLISHING_STEPS
+        or any(pattern.search(body) for pattern in PUBLISHING_COMMANDS)
+        or any(f"uses: {action}" in normalized_body for action in PUBLISHING_ACTIONS)
+    )
+
+
+def assert_publish_steps_guarded(workflow: str) -> list[tuple[str | None, str]]:
     steps = parse_workflow_steps(workflow)
     validation_indexes = [
         index for index, (name, _) in enumerate(steps) if name == "Validate packed package"
@@ -42,13 +76,19 @@ def assert_publish_steps_guarded(workflow: str) -> list[tuple[str, str]]:
         )
 
     guard_line = f"        {PUBLISH_GUARD}"
-    for name, body in steps[validation_indexes[0] + 1 :]:
-        is_publishing = name in KNOWN_PUBLISHING_STEPS or any(
-            pattern.search(body) for pattern in PUBLISHING_COMMANDS
-        )
-        if is_publishing and body.splitlines().count(guard_line) != 1:
+    validation_index = validation_indexes[0]
+    for index, (name, body) in enumerate(steps):
+        if not is_publishing_step(name, body):
+            continue
+
+        display_name = name or f"unnamed step #{index + 1}"
+        if index < validation_index:
             raise AssertionError(
-                f"Publishing step {name!r} must contain exactly this guard: {PUBLISH_GUARD}"
+                f"Publishing step {display_name!r} appears before 'Validate packed package'."
+            )
+        if index > validation_index and body.splitlines().count(guard_line) != 1:
+            raise AssertionError(
+                f"Publishing step {display_name!r} must contain exactly this guard: {PUBLISH_GUARD}"
             )
     return steps
 
@@ -166,13 +206,25 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         self.assertIn("- 'v[0-9]+.[0-9]+.[0-9]+'", self.workflow)
         self.assertNotIn("- 'v*'", self.workflow)
 
-    def test_validation_precedes_every_upload(self):
-        validation = self.workflow.index("- name: Validate packed package")
-        artifact_upload = self.workflow.index("- name: Upload artifact")
-        nuget_push = self.workflow.index("- name: Push to NuGet")
+    def test_validation_precedes_artifact_upload_and_all_publishing_steps(self):
+        validation_index = next(
+            index
+            for index, (name, _) in enumerate(self.steps)
+            if name == "Validate packed package"
+        )
+        artifact_indexes = [
+            index for index, (name, _) in enumerate(self.steps) if name == "Upload artifact"
+        ]
+        publishing_indexes = [
+            index
+            for index, (name, body) in enumerate(self.steps)
+            if is_publishing_step(name, body)
+        ]
 
-        self.assertLess(validation, artifact_upload)
-        self.assertLess(validation, nuget_push)
+        self.assertTrue(artifact_indexes)
+        self.assertTrue(publishing_indexes)
+        self.assertTrue(all(validation_index < index for index in artifact_indexes))
+        self.assertTrue(all(validation_index < index for index in publishing_indexes))
 
     def test_manual_dispatch_cannot_publish_or_create_a_release(self):
         steps = assert_publish_steps_guarded(self.workflow)
@@ -201,6 +253,52 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Early package publication"):
             assert_publish_steps_guarded(workflow)
 
+    def test_unguarded_nuget_push_before_validation_fails_with_ordering_error(self):
+        workflow = """jobs:
+  publish:
+    steps:
+      - run: dotnet nuget push ./artifacts/*.nupkg
+      - name: Validate packed package
+        run: validate
+"""
+
+        with self.assertRaisesRegex(
+            AssertionError, "unnamed step #1.*appears before 'Validate packed package'"
+        ):
+            assert_publish_steps_guarded(workflow)
+
+    def test_unnamed_unguarded_push_after_guarded_step_fails(self):
+        workflow = f"""jobs:
+  publish:
+    steps:
+      - name: Validate packed package
+        run: validate
+      - name: Push to NuGet
+        {PUBLISH_GUARD}
+        run: dotnet nuget push ./artifacts/package.nupkg
+      - run: dotnet nuget push ./artifacts/other.nupkg
+"""
+
+        steps = parse_workflow_steps(workflow)
+        self.assertEqual(
+            ["Validate packed package", "Push to NuGet", None],
+            [name for name, _ in steps],
+        )
+        with self.assertRaisesRegex(AssertionError, "unnamed step #3"):
+            assert_publish_steps_guarded(workflow)
+
+    def test_unnamed_release_action_requires_guard(self):
+        workflow = """jobs:
+  publish:
+    steps:
+      - name: Validate packed package
+        run: validate
+      - uses: softprops/action-gh-release@sha
+"""
+
+        with self.assertRaisesRegex(AssertionError, "unnamed step #2"):
+            assert_publish_steps_guarded(workflow)
+
     def test_duplicate_name_unguarded_release_step_fails(self):
         workflow = f"""jobs:
   publish:
@@ -222,16 +320,17 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Create GitHub Release"):
             assert_publish_steps_guarded(workflow)
 
-    def test_harmless_post_validation_steps_do_not_require_publish_guard(self):
+    def test_harmless_named_and_unnamed_steps_do_not_require_publish_guard(self):
         workflow = """jobs:
   publish:
     steps:
+      - run: echo "Preparing validation"
       - name: Validate packed package
         run: validate
-      - name: Upload artifact
-        uses: actions/upload-artifact@sha
+      - uses: actions/upload-artifact@sha
       - name: Write job summary
         run: echo "Validation complete" >> "$GITHUB_STEP_SUMMARY"
+      - run: echo "Done"
 """
 
         assert_publish_steps_guarded(workflow)
