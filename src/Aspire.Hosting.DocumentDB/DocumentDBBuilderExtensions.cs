@@ -566,8 +566,16 @@ public static class DocumentDBBuilderExtensions
     /// Configures the DocumentDB Local container log level.
     /// </summary>
     /// <remarks>
-    /// Sets both the gateway's canonical <c>DOCUMENTDB_LOG_LEVEL</c> variable and the legacy
-    /// container <c>LOG_LEVEL</c> variable for compatibility across DocumentDB Local versions.
+    /// Starting with DocumentDB <c>0.114.0</c>, the gateway reads
+    /// <c>DOCUMENTDB_LOG_LEVEL</c> as a tracing filter. This makes the API observably effective on
+    /// the current default <c>0.114.0</c> image. The legacy <c>LOG_LEVEL</c> variable is also set
+    /// because the Local image entrypoint validates that contract, although no Local image uses it
+    /// to select gateway verbosity. Images through <c>0.113.0</c> therefore treat this API as a
+    /// verbosity no-op.
+    /// <see cref="DocumentDBLogLevel.Quiet"/> remains mapped to <c>quiet</c> for API compatibility.
+    /// It is not a tracing level: on <c>0.114.0</c> and later it becomes newly effective because
+    /// the gateway parses it as an unmatched target directive, which suppresses gateway output but
+    /// depends on upstream filter semantics.
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="logLevel">The log level to configure.</param>

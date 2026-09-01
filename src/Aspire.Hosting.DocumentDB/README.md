@@ -74,7 +74,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithHostPort(port)` | Bind to a fixed host port (default: random) |
 | `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume |
 | `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
-| `.WithLogLevel(level)` | Set canonical `DOCUMENTDB_LOG_LEVEL` and legacy `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
+| `.WithLogLevel(level)` | Set gateway `DOCUMENTDB_LOG_LEVEL` and entrypoint-contract `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
 | `.WithInitData(source)` | Bind-mount initialization scripts to `/init_doc_db.d` and disable built-in sample data |
 | `.WithoutSampleData()` | Disable the built-in sample data initialization |
 | `.WithoutExtendedRum()` | Disable the `extended_rum` index access method (DocumentDB v0.111.0+) |
@@ -104,6 +104,14 @@ var documentdb = builder.AddDocumentDB("documentdb")
 
 var db = documentdb.AddDatabase("mydb");
 ```
+
+`WithLogLevel(...)` becomes observably effective on DocumentDB `0.114.0` and later through
+`DOCUMENTDB_LOG_LEVEL`, including the current default `0.114.0` image. On images through `0.113.0`,
+neither variable controls gateway verbosity; `LOG_LEVEL` is retained because the Local entrypoint
+validates its six-value contract, not because a Local image uses it to select gateway verbosity.
+`Quiet` remains mapped to `quiet` for API compatibility and becomes newly effective on `0.114.0`
+and later. Because upstream tracing has no `quiet` level, current gateways suppress output by parsing
+it as an unmatched tracing target; that behavior depends on upstream filter semantics.
 
 `WithInitData(...)` mounts a host directory into `/init_doc_db.d` and also
 disables the built-in sample data so your custom scripts are the only

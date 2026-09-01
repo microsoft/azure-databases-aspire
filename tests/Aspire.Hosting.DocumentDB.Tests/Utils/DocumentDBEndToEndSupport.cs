@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.TestUtilities;
@@ -392,6 +393,16 @@ internal static class DocumentDBEndToEndSupport
     public static async Task<string> GetContainerLogsAsync(string containerId)
     {
         var (_, output, error) = await RunDockerCoreAsync("logs", containerId);
+        return CombineStandardOutputAndError(output, error);
+    }
+
+    public static async Task<string> GetContainerLogsSinceAsync(string containerId, DateTimeOffset since)
+    {
+        var (_, output, error) = await RunDockerCoreAsync(
+            "logs",
+            "--since",
+            since.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
+            containerId);
         return CombineStandardOutputAndError(output, error);
     }
 

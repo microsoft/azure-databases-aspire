@@ -47,8 +47,11 @@ public class Program
     /// <summary>WithLogLevel + WithOwner + WithOpenTelemetryMetrics, all observable on the container.</summary>
     public const string ObservableConfigScenario = "observable-config";
 
-    /// <summary>WithLogLevel(Debug) plus a periodic gateway operation that emits debug tracing.</summary>
+    /// <summary>WithLogLevel(Debug), exercised with normal MongoDB traffic by the test.</summary>
     public const string DebugLogLevelScenario = "debug-log-level";
+
+    /// <summary>WithLogLevel(Quiet), exercised with normal MongoDB traffic by the test.</summary>
+    public const string QuietLogLevelScenario = "quiet-log-level";
 
     /// <summary>WithPostgresVersion(Pg15).</summary>
     public const string Pg15Scenario = "pg15";
@@ -206,12 +209,11 @@ public class Program
                 break;
 
             case DebugLogLevelScenario:
-                documentDB
-                    .WithLogLevel(DocumentDBLogLevel.Debug)
-                    .WithOpenTelemetryMetrics(
-                        endpoint: "http://127.0.0.1:1",
-                        exportInterval: TimeSpan.FromSeconds(1),
-                        timeout: TimeSpan.FromMilliseconds(100));
+                documentDB.WithLogLevel(DocumentDBLogLevel.Debug);
+                break;
+
+            case QuietLogLevelScenario:
+                documentDB.WithLogLevel(DocumentDBLogLevel.Quiet);
                 break;
 
             case Pg15Scenario:

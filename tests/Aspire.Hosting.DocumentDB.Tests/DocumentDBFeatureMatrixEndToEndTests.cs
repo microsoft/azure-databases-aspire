@@ -3,6 +3,7 @@
 
 using System.Net;
 using System.Net.Sockets;
+using System.Text.RegularExpressions;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Testing;
 using Microsoft.Extensions.DependencyInjection;
@@ -32,6 +33,12 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 public class DocumentDBFeatureMatrixEndToEndTests
 {
     private const string ReleasedVersion = DocumentDBVersions.V0_116_0;
+    private static readonly Regex AnsiEscapeSequenceRegex = new(
+        "\u001B\\[[0-?]*[ -/]*[@-~]",
+        RegexOptions.CultureInvariant);
+    private static readonly Regex GatewaySeverityLineRegex = new(
+        @"(?m)^(?:\[GATEWAY-FILE\]\s+)?\d{4}-\d{2}-\d{2}T[^\r\n]*\s(?:INFO|WARN|ERROR|DEBUG)\s",
+        RegexOptions.CultureInvariant);
 
     // ------------------------------------------------------------------
     // Credentials, multiple databases, database naming
@@ -485,14 +492,64 @@ public class DocumentDBFeatureMatrixEndToEndTests
         Assert.Contains("Using owner: aspireowner", logs, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(null, "pg17-0.114.0")]
+    [InlineData("pg17-0.116.0", "pg17-0.116.0")]
+    public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var variables = new List<(string Name, string Value)>
+        {
+            (AppHost.ScenarioEnvironmentVariable, AppHost.DebugLogLevelScenario),
+        };
+        if (imageTag is not null)
+        {
+            variables.Add((AppHost.ImageTagEnvironmentVariable, imageTag));
+        }
+
+        using var scenario = new EnvironmentScope([.. variables]);
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
+        Assert.Equal(expectedImageTag, image.Tag);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+
+        Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "log-level", "debug-source", cts.Token);
+
+        // Match the gateway's Mongo insert translation, tying DEBUG output to the operation above
+        // instead of to a dependency's startup or telemetry-internal event.
+        var logs = await WaitForContainerLogAsync(
+            containerId,
+            "documentdb_api.insert",
+            cts.Token);
+        Assert.Matches(@"DEBUG[^\r\n]*documentdb_api\.insert", logs);
+    }
+
     [Fact]
-    public async Task DebugLogLevelIsAppliedBy0116Gateway()
+    public async Task QuietLogLevelSuppresses0116GatewayOutput()
     {
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
         using var scenario = new EnvironmentScope(
-            (AppHost.ScenarioEnvironmentVariable, AppHost.DebugLogLevelScenario),
+            (AppHost.ScenarioEnvironmentVariable, AppHost.QuietLogLevelScenario),
             (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
@@ -508,18 +565,20 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
         var environment = await GetContainerEnvironmentAsync(containerId);
 
-        Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
-        Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("quiet", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("quiet", environment["LOG_LEVEL"], ignoreCase: true);
 
-        var logs = await WaitForContainerLogAsync(
-            containerId,
-            "PeriodReaderThreadExportingDueToTimer",
-            cts.Token);
-        var normalizedLogs = System.Text.RegularExpressions.Regex.Replace(
-            logs,
-            "\u001B\\[[0-?]*[ -/]*[@-~]",
-            string.Empty);
-        Assert.Contains("DEBUG opentelemetry_sdk:", normalizedLogs, StringComparison.Ordinal);
+        var windowStart = DateTimeOffset.UtcNow;
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "log-level", "quiet-source", cts.Token);
+        await Task.Delay(TimeSpan.FromSeconds(3), cts.Token);
+
+        var operationWindowLogs = NormalizeContainerLogs(
+            await GetContainerLogsSinceAsync(containerId, windowStart));
+
+        // Scope the absence check to tracing-formatted gateway lines. Entrypoint and PostgreSQL
+        // messages use different prefixes/formats and remain visible even when the gateway is quiet.
+        Assert.DoesNotMatch(GatewaySeverityLineRegex, operationWindowLogs);
     }
 
     [Fact]
@@ -813,7 +872,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         for (var attempt = 0; attempt < 60; attempt++)
         {
-            logs = await GetContainerLogsAsync(containerId);
+            logs = NormalizeContainerLogs(await GetContainerLogsAsync(containerId));
 
             if (logs.Contains(expectedSubstring, StringComparison.Ordinal))
             {
@@ -827,6 +886,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
             $"Container '{containerId}' did not log '{expectedSubstring}' before the timeout. " +
             $"Last logs:{Environment.NewLine}{logs}");
     }
+
+    private static string NormalizeContainerLogs(string logs) =>
+        AnsiEscapeSequenceRegex.Replace(logs, string.Empty);
 
     private static async Task<DistributedApplication> BuildAndStartAsync(CancellationToken cancellationToken)
     {
