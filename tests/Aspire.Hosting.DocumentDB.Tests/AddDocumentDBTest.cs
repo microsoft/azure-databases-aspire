@@ -215,10 +215,13 @@ public class AddDocumentDBTests
         var DocumentDBManifest = await ManifestUtils.GetManifest(DocumentDB.Resource);
         var dbManifest = await ManifestUtils.GetManifest(db.Resource);
 
+        // Credentials are percent-encoded for the URI, so the published connection string points at
+        // the "-uri-encoded" companion that Aspire derives from the password parameter. The
+        // container's PASSWORD environment variable keeps referencing the raw parameter.
         var expectedManifest = $$"""
             {
               "type": "container.v0",
-              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true",
+              "connectionString": "mongodb://admin:{DocumentDB-password-uri-encoded.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true",
               "image": "{{DocumentDBContainerImageTags.Registry}}/{{DocumentDBContainerImageTags.Image}}:{{DocumentDBContainerImageTags.Tag}}",
               "env": {
                 "USERNAME": "admin",
@@ -239,7 +242,7 @@ public class AddDocumentDBTests
         expectedManifest = """
             {
               "type": "value.v0",
-              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true"
+              "connectionString": "mongodb://admin:{DocumentDB-password-uri-encoded.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true"
             }
             """;
         Assert.Equal(expectedManifest, dbManifest.ToString());
