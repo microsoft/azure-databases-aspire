@@ -20,6 +20,16 @@ public static class DocumentDBBuilderExtensions
         public bool MetricsEnabled { get; set; }
     }
 
+    /// <summary>
+    /// Records the container path a data-persistence helper mounted storage at, so the
+    /// start-time storage guard can validate the mount that actually backs <c>DATA_PATH</c>
+    /// instead of assuming the image default.
+    /// </summary>
+    private sealed class DataMountAnnotation : IResourceAnnotation
+    {
+        public required string TargetPath { get; init; }
+    }
+
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
     // default PostgreSQL coordinator port inside the documentdb-local container.
@@ -154,7 +164,8 @@ public static class DocumentDBBuilderExtensions
                 context.EnvironmentVariables[PasswordEnvVarName] = DocumentDBContainer.PasswordParameter!;
             })
             .WithHealthCheck(healthCheckKey)
-            .SubscribeMinimumPgVariantImageGuard();
+            .SubscribeMinimumPgVariantImageGuard()
+            .SubscribeDataStorageGuard();
     }
 
     /// <summary>
@@ -488,19 +499,36 @@ public static class DocumentDBBuilderExtensions
     /// Adds a named volume for the data folder to a DocumentDB container resource.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The bare DocumentDB container defaults <c>DATA_PATH</c> to <c>/data</c>. Starting with
-    /// DocumentDB v0.116-0, the image declares that path as a Docker volume, so omitting this
-    /// helper can create an anonymous volume whose lifetime is controlled by the container
-    /// runtime. Use this helper when persistence should be explicit and predictable.
-    /// This helper mounts the volume at <paramref name="targetPath"/> and sets
-    /// <c>DATA_PATH</c> to the same value so DocumentDB writes to the mounted directory.
-    /// A persisted data directory may be attached to only one running v0.116-0 container.
+    /// DocumentDB v0.116-0, the image declares that path as a Docker <c>VOLUME</c>, so every run
+    /// that does not mount storage there gets a fresh anonymous volume whose lifetime the
+    /// container runtime controls (and which container removal can strand). Mounting at the
+    /// default <paramref name="targetPath"/> is what suppresses that anonymous volume: neither
+    /// Docker nor Aspire can un-declare an image volume, so a non-default
+    /// <paramref name="targetPath"/> leaves an unused anonymous volume behind at <c>/data</c>
+    /// and the resource logs a warning at start.
+    /// </para>
+    /// <para>
+    /// This helper mounts the volume at <paramref name="targetPath"/> and sets <c>DATA_PATH</c>
+    /// to the same value so DocumentDB writes to the mounted directory. The container claims the
+    /// directory with an exclusive <c>flock</c>, so a persisted data directory may back only one
+    /// running v0.116-0 container at a time; a second container that mounts it exits immediately
+    /// with an explicit refusal instead of corrupting the directory.
+    /// </para>
+    /// <para>
+    /// The data directory must be writable. The entrypoint takes ownership of it (the container's
+    /// <c>documentdb</c> runtime user) and PostgreSQL initialises and writes WAL there, so
+    /// <paramref name="isReadOnly"/> is rejected rather than being allowed to fail a minute into
+    /// startup behind a misleading "PostgreSQL failed to start within 60 seconds" banner.
+    /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder.</param>
     /// <param name="name">The name of the volume. Defaults to an auto-generated name based on the application and resource names.</param>
-    /// <param name="isReadOnly">A flag that indicates if this is a read-only volume.</param>
-    /// <param name="targetPath">The target path inside the container. Defaults to /data to match the container default when this helper is used.</param>
+    /// <param name="isReadOnly">Unsupported. DocumentDB requires a writable data directory; passing <see langword="true"/> throws.</param>
+    /// <param name="targetPath">The target path inside the container. Defaults to /data to match the container default (and the path the image declares as a volume) when this helper is used.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <exception cref="ArgumentException"><paramref name="isReadOnly"/> is <see langword="true"/>, or <paramref name="targetPath"/> is not an absolute container path below the root.</exception>
     /// <example>
     /// <code>
     /// var server = builder.AddDocumentDB("documentdb")
@@ -515,10 +543,16 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        targetPath ??= DefaultMountedDataPath;
+        if (isReadOnly)
+        {
+            throw new ArgumentException(ReadOnlyDataMountMessage(nameof(WithDataVolume)), nameof(isReadOnly));
+        }
+
+        targetPath = NormalizeDataTargetPath(targetPath, nameof(targetPath));
 
         return builder
-            .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly)
+            .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly: false)
+            .WithAnnotation(new DataMountAnnotation { TargetPath = targetPath }, ResourceAnnotationMutationBehavior.Replace)
             .WithEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
@@ -529,16 +563,31 @@ public static class DocumentDBBuilderExtensions
     /// Adds a bind mount for the data folder to a DocumentDB container resource.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Prefer <see cref="WithDataVolume"/> for most cases. Bind mounts are useful when you need
-    /// direct access to the data files on the host filesystem.
-    /// The bare DocumentDB container defaults <c>DATA_PATH</c> to <c>/data</c>.
-    /// This helper mounts the directory at <c>/data</c> (the container default) and sets
-    /// <c>DATA_PATH</c> to the same value so DocumentDB writes to the mounted directory.
+    /// direct access to the data files on the host filesystem, but the host directory has to be
+    /// writable by the container's <c>documentdb</c> runtime user, which the entrypoint enforces
+    /// by taking ownership of the directory's contents.
+    /// </para>
+    /// <para>
+    /// The bare DocumentDB container defaults <c>DATA_PATH</c> to <c>/data</c>. This helper mounts
+    /// the directory at <c>/data</c> (the container default, and the path DocumentDB v0.116-0
+    /// declares as an image volume, so no anonymous volume is created) and sets <c>DATA_PATH</c>
+    /// to the same value so DocumentDB writes to the mounted directory. Like a data volume, the
+    /// directory is claimed with an exclusive <c>flock</c> and can back only one running container
+    /// at a time.
+    /// </para>
+    /// <para>
+    /// <paramref name="isReadOnly"/> is rejected: PostgreSQL cannot initialise or run against a
+    /// read-only data directory, and the container would otherwise spend a minute failing with a
+    /// misleading "PostgreSQL failed to start within 60 seconds" banner.
+    /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder.</param>
     /// <param name="source">The source directory on the host to mount into the container.</param>
-    /// <param name="isReadOnly">A flag that indicates if this is a read-only mount.</param>
+    /// <param name="isReadOnly">Unsupported. DocumentDB requires a writable data directory; passing <see langword="true"/> throws.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
+    /// <exception cref="ArgumentException"><paramref name="isReadOnly"/> is <see langword="true"/>.</exception>
     /// <example>
     /// <code>
     /// var server = builder.AddDocumentDB("documentdb")
@@ -550,14 +599,246 @@ public static class DocumentDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrEmpty(source);
 
+        if (isReadOnly)
+        {
+            throw new ArgumentException(ReadOnlyDataMountMessage(nameof(WithDataBindMount)), nameof(isReadOnly));
+        }
+
         const string targetPath = DefaultMountedDataPath;
 
         return builder
-            .WithBindMount(source, targetPath, isReadOnly)
+            .WithBindMount(source, targetPath, isReadOnly: false)
+            .WithAnnotation(new DataMountAnnotation { TargetPath = targetPath }, ResourceAnnotationMutationBehavior.Replace)
             .WithEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
             });
+    }
+
+    private static string ReadOnlyDataMountMessage(string methodName) =>
+        $"{methodName}(isReadOnly: true) is not supported: DocumentDB requires a writable data " +
+        $"directory. The container entrypoint takes an exclusive lock on '{DefaultMountedDataPath}', " +
+        $"takes ownership of it, and lets PostgreSQL initialise and write WAL there, so a read-only " +
+        $"mount fails about a minute into startup behind the misleading banner 'PostgreSQL failed to " +
+        $"start within 60 seconds' (the real cause, 'initdb: error: could not change permissions of " +
+        $"directory \"{DefaultMountedDataPath}\": Read-only file system', is buried in interleaved " +
+        $"container logs). Recovery: mount the data directory writable, and mount read-only content " +
+        $"elsewhere — for example WithInitData(...), which mounts seed scripts read-only at " +
+        $"'{InitDataMountPath}'.";
+
+    /// <summary>
+    /// Validates and normalizes the container path a data mount targets. Container paths are
+    /// always Linux-style absolute paths; a relative or empty path would be rejected by the
+    /// container runtime with an opaque mount error, and the container root cannot be a mount
+    /// target at all.
+    /// </summary>
+    private static string NormalizeDataTargetPath(string? targetPath, string parameterName)
+    {
+        if (targetPath is null)
+        {
+            return DefaultMountedDataPath;
+        }
+
+        if (string.IsNullOrWhiteSpace(targetPath))
+        {
+            throw new ArgumentException(
+                "The DocumentDB data target path cannot be empty or whitespace. Omit the argument to " +
+                $"use the container default '{DefaultMountedDataPath}'.",
+                parameterName);
+        }
+
+        if (!targetPath.StartsWith('/'))
+        {
+            throw new ArgumentException(
+                $"The DocumentDB data target path '{targetPath}' must be an absolute path inside the " +
+                $"container (starting with '/'), because it is used both as the mount target and as the " +
+                $"container's DATA_PATH. Omit the argument to use the container default " +
+                $"'{DefaultMountedDataPath}'.",
+                parameterName);
+        }
+
+        var normalized = targetPath.TrimEnd('/');
+        if (normalized.Length == 0)
+        {
+            throw new ArgumentException(
+                "The DocumentDB data target path cannot be the container root '/'. Omit the argument to " +
+                $"use the container default '{DefaultMountedDataPath}'.",
+                parameterName);
+        }
+
+        return normalized;
+    }
+
+    // Host paths are compared case-sensitively only where the platform's filesystem is,
+    // so a bind mount reused as "C:\Data" and "c:\data" is still recognised as shared.
+    private static readonly StringComparison HostPathComparison =
+        OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+
+    /// <summary>
+    /// Subscribes a <see cref="BeforeResourceStartedEvent"/> handler that rejects data-directory
+    /// mounts the DocumentDB Local container cannot use, before the container is started and fails
+    /// with a misleading message.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Covers three unsupported shapes, including mounts added with the raw Aspire APIs
+    /// (<c>WithVolume</c> / <c>WithBindMount</c>) rather than <see cref="WithDataVolume"/> or
+    /// <see cref="WithDataBindMount"/>:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>a read-only mount on the data path — PostgreSQL cannot initialise or
+    /// write there, and the container burns 60 seconds before reporting an unrelated-looking
+    /// timeout;</description></item>
+    /// <item><description>two mounts on the same data path — the container runtime rejects
+    /// duplicate mount targets;</description></item>
+    /// <item><description>storage shared with another DocumentDB resource — DocumentDB v0.116-0
+    /// claims its data directory with an exclusive <c>flock</c> and the second container exits
+    /// immediately.</description></item>
+    /// </list>
+    /// <para>
+    /// It also warns once when the data mount does not cover <c>/data</c>: DocumentDB v0.116-0
+    /// declares <c>/data</c> as an image <c>VOLUME</c>, and neither Docker nor Aspire can
+    /// un-declare it, so the only way to suppress the anonymous volume the runtime would otherwise
+    /// create is to mount the caller's storage on that exact path.
+    /// </para>
+    /// <para>
+    /// Like the image guards, this is run-mode only: <see cref="BeforeResourceStartedEvent"/> is
+    /// not published during manifest generation, where no container is started.
+    /// </para>
+    /// </remarks>
+    private static IResourceBuilder<DocumentDBServerResource> SubscribeDataStorageGuard(
+        this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        // One-shot so restart attempts don't repeat advisory warnings. Hard failures are
+        // deterministic and intentionally re-thrown on every start attempt.
+        var sharedStorageWarningLogged = 0;
+        var declaredVolumeWarningLogged = 0;
+
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(
+            builder.Resource,
+            (evt, ct) =>
+            {
+                var resource = evt.Resource;
+                var dataPath = resource.Annotations.OfType<DataMountAnnotation>().LastOrDefault()?.TargetPath
+                    ?? DefaultMountedDataPath;
+
+                var mounts = resource.Annotations.OfType<ContainerMountAnnotation>().ToList();
+                var dataMounts = mounts
+                    .Where(mount => string.Equals(mount.Target.TrimEnd('/'), dataPath, StringComparison.Ordinal))
+                    .ToList();
+
+                if (dataMounts.FirstOrDefault(mount => mount.IsReadOnly) is { } readOnlyMount)
+                {
+                    throw new InvalidOperationException(
+                        $"DocumentDB resource '{resource.Name}' mounts its data directory " +
+                        $"('{dataPath}') read-only. DocumentDB requires a writable data directory: " +
+                        $"the container entrypoint takes ownership of it and PostgreSQL initialises " +
+                        $"and writes WAL there. The container would run for about a minute and then " +
+                        $"fail with the misleading banner 'PostgreSQL failed to start within 60 " +
+                        $"seconds', hiding the real cause ('initdb: error: could not change " +
+                        $"permissions of directory \"{dataPath}\": Read-only file system'). " +
+                        $"Recovery: mount " +
+                        $"{(readOnlyMount.Type == ContainerMountType.BindMount ? $"'{readOnlyMount.Source}'" : $"volume '{readOnlyMount.Source}'")} " +
+                        $"writable, or use WithDataVolume()/WithDataBindMount(...), which reject " +
+                        $"read-only data storage up front.");
+                }
+
+                if (dataMounts.Count > 1)
+                {
+                    throw new InvalidOperationException(
+                        $"DocumentDB resource '{resource.Name}' has {dataMounts.Count} mounts on its " +
+                        $"data directory ('{dataPath}'). The container runtime rejects duplicate mount " +
+                        $"targets, so the container would fail to be created. Recovery: configure the " +
+                        $"data directory once — call either WithDataVolume(...) or " +
+                        $"WithDataBindMount(...), not both, and do not add a second volume or bind " +
+                        $"mount on the same path.");
+                }
+
+                var dataMount = dataMounts.Count == 1 ? dataMounts[0] : null;
+                var model = evt.Services.GetService<DistributedApplicationModel>();
+
+                if (dataMount is not null && dataMount.Source is not null && model is not null)
+                {
+                    foreach (var other in model.Resources)
+                    {
+                        // Only another DocumentDB server contends for the lock. A different
+                        // container mounting the same directory (a backup or inspection sidecar,
+                        // say) is a different question this guard cannot answer.
+                        if (ReferenceEquals(other, resource) ||
+                            other is not DocumentDBServerResource ||
+                            !other.TryGetAnnotationsOfType<ContainerMountAnnotation>(out var otherMounts))
+                        {
+                            continue;
+                        }
+
+                        var shared = otherMounts.FirstOrDefault(mount => IsSameStorage(dataMount, mount));
+                        if (shared is null)
+                        {
+                            continue;
+                        }
+
+                        var description = dataMount.Type == ContainerMountType.BindMount
+                            ? $"host directory '{dataMount.Source}'"
+                            : $"volume '{dataMount.Source}'";
+
+                        var message =
+                            $"DocumentDB resource '{resource.Name}' and DocumentDB resource " +
+                            $"'{other.Name}' both mount the same {description}. DocumentDB v0.116-0 " +
+                            $"claims its data directory with an exclusive lock, because two PostgreSQL " +
+                            $"instances on one data directory would corrupt it, so whichever container " +
+                            $"starts second exits immediately with 'Error: another DocumentDB container " +
+                            $"is already using the data directory'. Recovery: give each resource its own " +
+                            $"storage (for example WithDataVolume(name: \"{resource.Name}-data\")).";
+
+                        // A resource the user starts by hand may never run alongside this one, so the
+                        // unsupported-but-possible combination is reported without blocking the app.
+                        if (other.Annotations.OfType<ExplicitStartupAnnotation>().Any() ||
+                            resource.Annotations.OfType<ExplicitStartupAnnotation>().Any())
+                        {
+                            if (Interlocked.CompareExchange(ref sharedStorageWarningLogged, 1, 0) == 0)
+                            {
+                                TryGetResourceLogger(evt)?.LogWarning("{Message}", message);
+                            }
+
+                            break;
+                        }
+
+                        throw new InvalidOperationException(message);
+                    }
+                }
+
+                if (!string.Equals(dataPath, DefaultMountedDataPath, StringComparison.Ordinal) &&
+                    !mounts.Any(mount => string.Equals(mount.Target.TrimEnd('/'), DefaultMountedDataPath, StringComparison.Ordinal)) &&
+                    Interlocked.CompareExchange(ref declaredVolumeWarningLogged, 1, 0) == 0)
+                {
+                    TryGetResourceLogger(evt)?.LogWarning(
+                        "DocumentDB resource '{ResourceName}' stores data at '{DataPath}', but the " +
+                        "DocumentDB v0.116-0 image still declares '{DefaultDataPath}' as a container " +
+                        "volume. Neither Docker nor Aspire can un-declare an image volume, so the " +
+                        "runtime creates an unused anonymous volume on that declared path on every " +
+                        "run, and container removal can strand it. Leave the data target path at its " +
+                        "default to avoid this.",
+                        resource.Name,
+                        dataPath,
+                        DefaultMountedDataPath);
+                }
+
+                return Task.CompletedTask;
+            });
+
+        return builder;
+    }
+
+    private static bool IsSameStorage(ContainerMountAnnotation left, ContainerMountAnnotation right)
+    {
+        if (left.Type != right.Type || left.Source is null || right.Source is null)
+        {
+            return false;
+        }
+
+        return left.Type == ContainerMountType.BindMount
+            ? string.Equals(left.Source.TrimEnd('/', '\\'), right.Source.TrimEnd('/', '\\'), HostPathComparison)
+            : string.Equals(left.Source, right.Source, StringComparison.Ordinal);
     }
 
     /// <summary>

@@ -185,6 +185,49 @@ docker volume ls | grep documentdb
 docker volume rm <volume-name>
 ```
 
+### "Another DocumentDB container is already using the data directory"
+
+**Symptom:** A container exits immediately after start with:
+
+```text
+Error: another DocumentDB container is already using the data directory /data. Refusing to start: ...
+```
+
+Or the application fails to start with an `InvalidOperationException` saying two DocumentDB resources mount the same volume or host directory.
+
+**Cause:** DocumentDB `0.116.0` claims its data directory with an exclusive lock. Two PostgreSQL instances on one data directory would corrupt it, so the second container refuses to start rather than taking over. The container that already holds the directory keeps serving and is unaffected.
+
+**Solutions:**
+1. **Stop whatever already holds the directory.** A leftover `docker run` session, a second AppHost instance, or a container from a previous debug session that was not removed — `docker ps --filter volume=<volume-name>` finds it.
+2. **Give each resource its own storage.** Two DocumentDB resources in one application model cannot share a volume name or a bind-mount source; use `WithDataVolume(name: "<resource>-data")` per resource.
+3. **Do not run the AppHost twice against the same volume.** Only one instance can hold the data directory at a time.
+
+### Read-only data volume or bind mount is rejected
+
+**Symptom:** `WithDataVolume(isReadOnly: true)` or `WithDataBindMount(..., isReadOnly: true)` throws an `ArgumentException`; a read-only mount added with the raw `WithVolume`/`WithBindMount` APIs fails the resource start with an `InvalidOperationException`.
+
+**Cause:** DocumentDB cannot run against a read-only data directory. The entrypoint takes ownership of it, and `initdb` must change its permissions before PostgreSQL can create the cluster or write WAL. Allowed through, the container logs `chown: changing ownership of '/data': Read-only file system` and `initdb: error: could not change permissions of directory "/data": Read-only file system` inside interleaved log streams, then waits a full minute before exiting with the misleading `PostgreSQL failed to start within 60 seconds` banner.
+
+**Solution:** Mount the data directory writable. Read-only mounts are correct for *input* only — `WithInitData(...)` mounts seed scripts read-only at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and key read-only.
+
+### Initialization scripts do not re-run after being fixed
+
+**Symptom:** A custom initialization script mounted with `WithInitData(...)` failed or was corrected, but later runs log `Custom data already initialized ...; skipping` or `a previous custom data initialization was attempted but its success was not recorded` and the data never appears.
+
+**Cause:** DocumentDB `0.116.0` makes initialization one-shot per data directory. Markers under `<data-path>/.documentdb-local/` (`custom_data_attempted`, `custom_data_succeeded`, `sample_data_initialized`) live inside the persisted data, so they survive restarts, `docker compose down && up`, host reboots, and volume backups. The attempt marker is written *before* the first user script runs, so a non-idempotent script that failed part way is never retried — re-running it against half-seeded data caused restart loops.
+
+**Solution:** Fix the scripts, then start against a **fresh** data directory — a new volume name, or `docker volume rm <name>` / an emptied bind-mount directory. Editing script contents alone never re-triggers initialization. Writing idempotent scripts avoids the problem in the first place.
+
+### Orphaned anonymous volumes accumulate
+
+**Symptom:** `docker system df` shows a growing number of unused local volumes with random 64-character hexadecimal names, roughly the size of a PostgreSQL data directory each.
+
+**Cause:** DocumentDB `0.116.0` declares `/data` as an image `VOLUME`. Any run that does not mount storage there gets a fresh anonymous volume, and removing the container without `-v` strands it. Neither Docker nor Aspire can un-declare an image volume.
+
+**Solutions:**
+1. **Mount your own storage on `/data`.** `WithDataVolume()` and `WithDataBindMount(...)` do this by default, which suppresses the anonymous volume. A non-default `targetPath` cannot: the declared `/data` volume is still created, and the resource logs a warning saying so.
+2. **Reclaim what has accumulated:** `docker volume prune` (removes *all* unused local volumes — check `docker volume ls -f dangling=true` first).
+
 ## Debugging with mongosh
 
 You can connect to the running DocumentDB container directly using `mongosh` for debugging:
