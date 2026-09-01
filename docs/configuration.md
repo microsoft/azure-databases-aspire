@@ -295,7 +295,8 @@ apply it during startup. These are not exposed by the typed API — set them via
 
 ## WithOwner
 
-Sets the container `OWNER` environment variable, which DocumentDB Local uses to label resources.
+Sets the container `OWNER` environment variable, which names the PostgreSQL role used for
+DocumentDB database operations. It is not an arbitrary resource label.
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
@@ -304,7 +305,12 @@ var server = builder.AddDocumentDB("documentdb")
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `owner` | `string` | (required) | The owner value. |
+| `owner` | `string` | (required) | An existing PostgreSQL role used for DocumentDB database operations. |
+
+The bundled PostgreSQL instance creates the default `documentdb` role. A custom owner must already
+exist, which is primarily useful with an externally managed PostgreSQL instance. DocumentDB
+`0.116.0` fails startup explicitly when the configured role is absent; earlier images may
+continue startup without successfully creating the configured DocumentDB admin user.
 
 ## UseTls
 

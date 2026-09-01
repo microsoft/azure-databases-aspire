@@ -981,10 +981,17 @@ public static class DocumentDBBuilderExtensions
 
 
     /// <summary>
-    /// Configures the owner used by the DocumentDB Local container.
+    /// Configures the PostgreSQL owner role used by the DocumentDB Local container.
     /// </summary>
+    /// <remarks>
+    /// The bundled PostgreSQL instance creates the default <c>documentdb</c> role. A custom value
+    /// must name a role that already exists, such as the owner of an externally managed
+    /// PostgreSQL instance. DocumentDB <c>0.116.0</c> fails startup explicitly when the configured
+    /// role does not exist; earlier images may instead start without a usable DocumentDB admin
+    /// user.
+    /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
-    /// <param name="owner">The owner value to configure.</param>
+    /// <param name="owner">The existing PostgreSQL role used for DocumentDB database operations.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
     public static IResourceBuilder<DocumentDBServerResource> WithOwner(this IResourceBuilder<DocumentDBServerResource> builder, string owner)
     {

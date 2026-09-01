@@ -520,10 +520,6 @@ public class DocumentDBFeatureMatrixEndToEndTests
             Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
             Assert.False(environment.ContainsKey("CONFIG_DIR"));
             Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
-            Assert.Equal("aspireowner", environment["OWNER"]);
-
-            var logs = await WaitForContainerLogAsync(containerId, "Using owner: aspireowner", cts.Token);
-            Assert.Contains("Using owner: aspireowner", logs, StringComparison.Ordinal);
 
             var metrics = await WaitForFileContainingAsync(
                 Path.Combine(otelOutputPath, "metrics.json"),

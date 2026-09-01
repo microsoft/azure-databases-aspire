@@ -173,10 +173,16 @@ public class Program
                     otelEndpoint = "http://otel-collector:4317";
                 }
 
-                documentDB
-                    .WithLogLevel(DocumentDBLogLevel.Debug)
-                    .WithOwner("aspireowner")
-                    .WithOpenTelemetryMetrics(
+                documentDB.WithLogLevel(DocumentDBLogLevel.Debug);
+
+                if (collector is null)
+                {
+                    // Retain current-image environment propagation coverage without coupling the
+                    // 0.116 OTLP test to a PostgreSQL owner role that the image does not create.
+                    documentDB.WithOwner("aspireowner");
+                }
+
+                documentDB.WithOpenTelemetryMetrics(
                         endpoint: string.IsNullOrWhiteSpace(otelEndpoint)
                             ? throw new InvalidOperationException(
                                 $"{OtelOutputPathEnvironmentVariable} or {OtelEndpointEnvironmentVariable} must be set.")
