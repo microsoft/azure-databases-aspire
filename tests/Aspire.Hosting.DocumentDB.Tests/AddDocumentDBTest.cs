@@ -619,6 +619,44 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public async Task WithLogLevelOverridesEarlierEnvironmentValues()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("DOCUMENTDB_LOG_LEVEL", "warn")
+            .WithEnvironment("LOG_LEVEL", "error")
+            .WithLogLevel(DocumentDBLogLevel.Debug);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal("debug", env["DOCUMENTDB_LOG_LEVEL"]);
+        Assert.Equal("debug", env["LOG_LEVEL"]);
+    }
+
+    [Fact]
+    public async Task LaterEnvironmentValuesOverrideWithLogLevel()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithEnvironment("DOCUMENTDB_LOG_LEVEL", "warn")
+            .WithEnvironment("LOG_LEVEL", "error");
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal("warn", env["DOCUMENTDB_LOG_LEVEL"]);
+        Assert.Equal("error", env["LOG_LEVEL"]);
+    }
+
+    [Fact]
     public async Task WithInitDataAddsReadOnlyBindMountAndDisablesSampleData()
     {
         var source = Path.GetFullPath(Path.Combine("TestData", "init"));

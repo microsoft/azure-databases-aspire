@@ -8,7 +8,11 @@ namespace Aspire.Hosting;
 /// </summary>
 public enum DocumentDBLogLevel
 {
-    /// <summary>Suppresses all log output.</summary>
+    /// <summary>
+    /// Suppresses gateway output. This becomes effective on DocumentDB <c>0.114.0</c> and later,
+    /// where the preserved <c>quiet</c> value is parsed as an unmatched tracing target rather than
+    /// a native tracing level.
+    /// </summary>
     Quiet,
 
     /// <summary>Logs error messages only.</summary>
