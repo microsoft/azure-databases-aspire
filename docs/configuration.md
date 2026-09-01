@@ -84,17 +84,24 @@ var server = builder.AddDocumentDB("documentdb")
 
 This method mounts the volume at `targetPath` (which defaults to `/data`, matching the container default) and sets the `DATA_PATH` environment variable to match so DocumentDB writes to the mounted directory.
 
-Starting with DocumentDB `0.116.0`, the upstream image declares `/data` as a Docker
-`VOLUME` even when this helper is not called. Every run that does not mount storage on that path
-therefore gets a fresh **anonymous** volume that the container runtime names and owns; container
-removal can strand it, so unmounted runs accumulate orphaned volumes (`docker volume prune`
-reclaims them). Do not depend on that anonymous volume for durable or predictable storage. Use
-`WithDataVolume()` with an explicit or generated named volume when persistence is intentional.
+Where an unmounted `/data` lives depends on the image version:
 
-Mounting on `/data` is also the *only* way to suppress the anonymous volume: neither Docker nor
-Aspire can un-declare an image `VOLUME`. Leaving `targetPath` at its default does that for you. A
-non-default `targetPath` still stores data where you asked, but an unused anonymous volume is
-created at `/data` on every run, and the resource logs a warning saying so.
+| Image | `/data` when nothing is mounted there |
+|---|---|
+| `0.114.0` and earlier | An ordinary directory in the container's writable layer, discarded when the container is removed. |
+| `0.116.0` and later | The `Dockerfile` declares `/data` as a `VOLUME`, so every run gets a fresh **anonymous** volume that the container runtime names and owns. Container removal can strand it, so unmounted runs accumulate orphaned volumes (`docker volume prune` reclaims them). |
+
+Either way the data is not durable, and the anonymous volume is never reused: do not depend on it
+for predictable storage. Use `WithDataVolume()` with an explicit or generated named volume when
+persistence is intentional.
+
+On `0.116.0` and later, mounting on `/data` is also the *only* way to suppress the anonymous
+volume: neither Docker nor Aspire can un-declare an image `VOLUME`. Leaving `targetPath` at its
+default does that for you. A non-default `targetPath` still stores data where you asked, but an
+unused anonymous volume is created at `/data` on every run, and the resource logs a warning saying
+so. The warning is raised only for images known to declare that volume — recognised
+`documentdb-local` tags at `0.116.0` or later. Older tags, unrecognised tags, and custom images
+get no warning, because for them nothing is created at `/data`.
 
 > **Pin your credentials when you persist data.** The container hashes the configured password into a PostgreSQL role the first time it initialises a data directory, and that role then lives in the volume. `AddDocumentDB` generates a random password when you do not supply one, so the *second* run presents a different password than the one stored in the volume and every connection fails with `MongoAuthenticationException: ... Command saslContinue failed: Invalid key`. The data is intact but unreachable. Pass explicit `userName`/`password` parameters whenever you use `WithDataVolume` or `WithDataBindMount`:
 >
@@ -122,15 +129,17 @@ var server = builder.AddDocumentDB("documentdb")
 | `source` | `string` | (required) | Path on the host machine to mount. |
 | `isReadOnly` | `bool` | `false` | Unsupported. Passing `true` throws an `ArgumentException` — see [Storage requirements](#storage-requirements). |
 
-By default, this helper mounts data at `/data` inside the container (matching the container default, and the path the `0.116.0` image declares as a volume, so no anonymous volume is created) and sets `DATA_PATH` accordingly.
+By default, this helper mounts data at `/data` inside the container — the container default, and the path `0.116.0` and later declare as an image volume, so no anonymous volume is created there — and sets `DATA_PATH` accordingly.
 
 > The credential caveat under [WithDataVolume](#withdatavolume) applies here too: supply explicit `userName`/`password` parameters, or the generated password will stop matching the role stored in the mounted directory on the next run.
 
 ## Storage requirements
 
-These constraints come from the DocumentDB Local container itself (`0.116.0`), not from Aspire.
-Where a configuration cannot work, the integration fails it while the application model is being
-built, or at resource start, rather than letting the container fail confusingly a minute later.
+These constraints come from the DocumentDB Local container itself, not from Aspire. Where a
+configuration cannot work, the integration fails it while the application model is being built, or
+at resource start, rather than letting the container fail confusingly a minute later. Rules that
+arrived in a specific image version are marked as such; everything unmarked applies to every image
+this package supports.
 
 ### The data directory must be writable
 
@@ -149,26 +158,36 @@ at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and ke
 
 ### One running container per data directory
 
-DocumentDB `0.116.0` claims its data directory with an exclusive `flock`, because two PostgreSQL
-instances on one data directory would corrupt it. A second container that mounts the same volume or
-host directory exits immediately with:
+Two PostgreSQL instances on one data directory corrupt it. From `0.116.0` the container defends
+itself: it claims the directory with an exclusive `flock`, and a second container that mounts the
+same volume or host directory exits immediately with
 
 ```text
 Error: another DocumentDB container is already using the data directory /data. Refusing to start: ...
 ```
 
-The container already serving the directory keeps running and is unaffected. Because of this, give
-every DocumentDB resource its own storage: two DocumentDB resources in one application model that
-share a volume name or a bind-mount source fail at start with an explanatory
-`InvalidOperationException`. (If one of the two resources is started manually —
-`WithExplicitStart()` — the integration warns instead of failing, since the pair may never run at
-the same time.) The check compares DocumentDB resources within one application model only; a
-container started outside the AppHost, or a second AppHost instance, is still caught at runtime by
-the container's own lock.
+while the container already serving the directory keeps running, unaffected. **Images at or below
+`0.114.0` have no such interlock**: nothing refuses the second start, and the two instances corrupt
+the directory silently.
 
-The same rule applies across application models and across tools: stop a container that is holding
-a volume before starting another one on it, including `docker run` sessions and a second AppHost
-instance.
+Because of this, give every DocumentDB resource its own storage. Two DocumentDB resources in one
+application model whose *data directories* resolve to the same volume name or bind-mount source
+fail at start with an explanatory `InvalidOperationException`.
+
+One narrow case is downgraded to a warning: both resources resolve to a recognised `0.116.0`-or-
+later tag **and** one of them is started manually with `WithExplicitStart()`. There the pair may
+never run at the same time, and if they do, the image refuses the second start loudly rather than
+corrupting anything. When either side is an older, unrecognised, or custom image, the combination
+stays a hard failure even with `WithExplicitStart()`, because there is no interlock to fall back on.
+
+Sharing storage that is *not* the peer's data directory is not a conflict: a resource may point
+`WithInitData(...)` or `WithTlsCertificate(...)` at the same host directory another resource uses
+for data, because those are read-only inputs on different container paths.
+
+The check compares DocumentDB resources within one application model only. The same rule applies
+across application models and across tools: stop a container that is holding a volume before
+starting another one on it, including `docker run` sessions and a second AppHost instance. On
+`0.116.0` and later those cases are still caught at runtime by the container's own lock.
 
 ### Ownership and permissions
 
@@ -181,8 +200,13 @@ mode `0700`. Consequences:
   host directory changes uid/gid on disk, so after the first run the files usually belong to a uid
   your host user is not, and reading them back needs `sudo` or a container. Docker Desktop on macOS
   and Windows hides this behind its filesystem translation layer.
-- Point the mount at a directory that holds **only** DocumentDB data. The entrypoint deletes the
-  contents of an unrecognised data directory before running `initdb`.
+- Point the mount at a directory that is **empty** or holds an existing DocumentDB cluster. The
+  container does not clean a directory it does not recognise — it refuses it. A single stray file
+  (a `.gitkeep` committed to keep the directory in source control, or a `.DS_Store` written by
+  macOS) is enough to produce `Warning: Directory /data exists but doesn't appear to contain a
+  valid PostgreSQL data directory`, after which PostgreSQL never starts and the container exits
+  non-zero a minute later behind the `PostgreSQL failed to start within 60 seconds` banner. Your
+  files are left where they are.
 - Do not put two mounts on the data path (for example `WithDataVolume()` *and*
   `WithDataBindMount(...)`); the container runtime rejects duplicate mount targets, so the
   integration fails the start with a clear message instead.
@@ -191,7 +215,8 @@ mode `0700`. Consequences:
 
 Sample data (`INIT_DATA`) and custom scripts mounted with `WithInitData(...)` run **once per data
 directory**, not once per container start. `0.116.0` records markers under
-`<data-path>/.documentdb-local/`:
+`<data-path>/.documentdb-local/` (earlier images track initialization differently and do not write
+these files):
 
 | Marker | Meaning |
 |---|---|
@@ -213,7 +238,7 @@ up`, host reboots, and volume backups.
   container exits non-zero, so the resource fails fast rather than serving an incompletely seeded
   database.
 
-Without persistent storage, every run starts from an empty anonymous volume, so initialization runs
+Without persistent storage, every run starts from an empty data directory, so initialization runs
 on every run.
 
 ## WithLogLevel
@@ -645,7 +670,7 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 | Insecure TLS | Enabled (allows self-signed certificates) |
 | Container default data path | `/data` (declared as an image `VOLUME` from `0.116.0`) |
 | Persistence helper default path | `/data` |
-| Data directory access | Writable, exclusive to one running container, initialized once |
+| Data directory access | Writable, empty or an existing cluster, initialized once; exclusive to one running container from `0.116.0` |
 | Auth mechanism | `SCRAM-SHA-256` |
 | Auth database | `admin` |
 
@@ -657,7 +682,7 @@ The extension passes these environment variables to the DocumentDB container:
 |---|---|---|
 | `USERNAME` | The configured username | Container creates this user on startup |
 | `PASSWORD` | The configured password | Password for the created user |
-| `DATA_PATH` | Path inside the container for the mounted data directory | Only set when using `WithDataVolume` or `WithDataBindMount`; otherwise the container uses its default `/data` (an anonymous volume) |
+| `DATA_PATH` | Path inside the container for the mounted data directory | Only set when using `WithDataVolume` or `WithDataBindMount`; otherwise the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
 | `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Set by `WithLogLevel(...)` |
 | `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |

@@ -34,6 +34,23 @@ internal static partial class DocumentDBContainerImageTags
     internal static readonly Version MinimumPostgresEndpointVersion = new(0, 112, 0);
 
     /// <summary>
+    /// The earliest <c>documentdb-local</c> DocumentDB version whose <c>Dockerfile</c> declares
+    /// <c>/data</c> as a container <c>VOLUME</c> and whose entrypoint claims the data directory
+    /// with an exclusive <c>flock</c>. Both behaviours arrived together in <c>0.116-0</c>:
+    /// <list type="bullet">
+    /// <item><description>the declaration means a run that mounts nothing on <c>/data</c> gets an
+    /// anonymous, never-reused volume the container runtime manages;</description></item>
+    /// <item><description>the lock means a data directory backs at most one running container,
+    /// and the loser refuses to start instead of corrupting the cluster.</description></item>
+    /// </list>
+    /// Images at or below <c>0.114.0</c> declare no volume (an unmounted <c>/data</c> lives in
+    /// the writable container layer and is discarded with the container) and have no interlock,
+    /// so <see cref="Aspire.Hosting.DocumentDBBuilderExtensions.WithDataVolume"/> and the
+    /// data-storage guard scope their advice on this floor rather than stating it unconditionally.
+    /// </summary>
+    internal static readonly Version MinimumDeclaredDataVolumeVersion = new(0, 116, 0);
+
+    /// <summary>
     /// The earliest DocumentDB version for which upstream publishes each PostgreSQL backend
     /// variant. Every combination of <see cref="DocumentDBVersion"/> and
     /// <see cref="DocumentDBPostgresVersion"/> produces a well-formed <c>pg{NN}-X.Y.Z</c> tag,

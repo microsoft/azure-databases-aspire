@@ -16,6 +16,11 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Trait("Category", "Unit")]
 public class AddDocumentDBTests
 {
+    // The first curated tag whose image declares /data as a container VOLUME and whose entrypoint
+    // claims the data directory with an exclusive lock. Pinned explicitly so these tests describe
+    // that image's behaviour regardless of which version the package currently defaults to.
+    private const string InterlockedTag = "pg17-0.116.0";
+
     [Fact]
     public void CombineStandardOutputAndErrorPreservesStreamBoundary()
     {
@@ -620,8 +625,8 @@ public class AddDocumentDBTests
     public async Task DataVolumeSharedWithAnotherDocumentDBResourceThrowsAtStart()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
-        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
 
         using var app = appBuilder.Build();
         var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
@@ -634,6 +639,36 @@ public class AddDocumentDBTests
         Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
         Assert.Contains("exclusive lock", exception.Message, StringComparison.Ordinal);
         Assert.Contains("another DocumentDB container is already using the data directory", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DataVolumeSharedOnTheDefaultImageDescribesThatImagesActualBehaviour()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        // Promising that the container refuses the second start is only honest on an image that
+        // actually holds the lock, so the expectation follows the default's own version.
+        var interlocked = Version.Parse(DocumentDBVersions.Latest) >=
+            DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion;
+
+        if (interlocked)
+        {
+            Assert.Contains("another DocumentDB container is already using the data directory", exception.Message, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("another DocumentDB container is already using the data directory", exception.Message, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -698,8 +733,8 @@ public class AddDocumentDBTests
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.Services.AddSingleton(sink);
         appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
-        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
-        appBuilder.AddDocumentDB("standby").WithDataVolume(name: "shared-data").WithExplicitStart();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data").WithExplicitStart();
 
         using var app = appBuilder.Build();
         var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
@@ -710,6 +745,8 @@ public class AddDocumentDBTests
         var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
         Assert.Contains("'primary' and DocumentDB resource 'standby'", message, StringComparison.Ordinal);
         Assert.Contains("volume 'shared-data'", message, StringComparison.Ordinal);
+        Assert.Contains("exclusive lock", message, StringComparison.Ordinal);
+        Assert.Contains("WithExplicitStart()", message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -719,7 +756,7 @@ public class AddDocumentDBTests
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.Services.AddSingleton(sink);
         appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
-        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(targetPath: "/pgdata");
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(InterlockedTag).WithDataVolume(targetPath: "/pgdata");
 
         using var app = appBuilder.Build();
         var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
@@ -740,6 +777,7 @@ public class AddDocumentDBTests
         appBuilder.Services.AddSingleton(sink);
         appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
         appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
             .WithDataVolume(name: "pgdata", targetPath: "/pgdata")
             .WithVolume("declared-image-volume", "/data");
 
@@ -749,6 +787,225 @@ public class AddDocumentDBTests
         await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
 
         Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+
+    [Fact]
+    public async Task TheDefaultImageWarnsAboutADeclaredVolumeOnlyIfItDeclaresOne()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        // Asserted against the default's own version rather than a hard-coded expectation, so this
+        // keeps holding when DocumentDBVersions.Latest crosses the floor.
+        var declaresVolume = Version.Parse(DocumentDBVersions.Latest) >=
+            DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion;
+
+        Assert.Equal(declaresVolume, sink.LogEntries.Any(e => e.Level == LogLevel.Warning));
+    }
+
+    [Theory]
+    [InlineData("pg17-0.114.0")]
+    [InlineData("pg17-0.113.0")]
+    public async Task CustomDataTargetPathDoesNotWarnOnPre116Tags(string tag)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(tag).WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathDoesNotWarnOnACustomImage()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("contoso/documentdb-fork", "pg17-0.116.0")
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathDoesNotWarnOnAnUnrecognisedTag()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag("latest").WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SharedDataVolumeOnPre116ImagesThrowsEvenWithExplicitStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+
+        // 0.114.0 has no data-directory lock, so an explicitly started peer is not a safety net:
+        // if both ever run, nothing refuses the second one.
+        appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby").WithImageTag("pg17-0.114.0").WithDataVolume(name: "shared-data").WithExplicitStart();
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("corrupt it silently", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SharedDataVolumeWithACustomImagePeerThrowsEvenWithExplicitStart()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("fork")
+            .WithImage("contoso/documentdb-fork", "pg17-0.116.0")
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnExplicitlyStartedPeerDoesNotHideALaterHardConflict()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+
+        // Order matters: the warning-only peer is scanned first, and must not end the scan before
+        // the always-on peer that shares the same volume is seen.
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("manual").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data").WithExplicitStart();
+        appBuilder.AddDocumentDB("always-on").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedWithModelAsync(app, resource));
+
+        Assert.Contains("'primary' and DocumentDB resource 'always-on'", exception.Message, StringComparison.Ordinal);
+
+        // A hard conflict is not softened by also having a warning-only one.
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task StorageSharedWithAPeersInitDataIsNotADataDirectoryConflict()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton(sink);
+        appBuilder.Services.AddSingleton<ILoggerProvider>(sp => new CapturingLoggerProvider(sp.GetRequiredService<CapturingLoggerSink>()));
+
+        // The peer reads the same host directory as seed scripts and TLS material. That is a
+        // read-only input mount on a different container path, not a second cluster on the files.
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataBindMount("./shared");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "secondary-data")
+            .WithInitData("./shared")
+            .WithTlsCertificate("./shared/tls.crt", "./shared/tls.key");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        await PublishBeforeResourceStartedWithModelAsync(app, resource);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SharedStorageOnDifferentDataPathsIsStillADataDirectoryConflict()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "shared-data", targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource));
+
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WithDataVolumeReadOnlyMessageNamesTheRequestedTargetPath()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(
+            () => documentDB.WithDataVolume(isReadOnly: true, targetPath: "/pgdata/"));
+
+        Assert.Equal("isReadOnly", exception.ParamName);
+        Assert.Contains("ownership of '/pgdata'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("permissions of directory \"/pgdata\"", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("/data\"", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WithDataVolumeRejectsAnInvalidTargetPathBeforeComplainingAboutReadOnly()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(
+            () => documentDB.WithDataVolume(isReadOnly: true, targetPath: "relative/path"));
+
+        Assert.Equal("targetPath", exception.ParamName);
     }
 
     [Fact]
