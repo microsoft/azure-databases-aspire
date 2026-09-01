@@ -407,7 +407,7 @@ internal static class DocumentDBEndToEndSupport
             "--since",
             since.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
             containerId);
-
+ 
         if (exitCode != 0)
         {
             throw new InvalidOperationException(
@@ -419,6 +419,39 @@ internal static class DocumentDBEndToEndSupport
 
     internal static string NormalizeContainerLogs(string logs) =>
         AnsiEscapeSequenceRegex.Replace(logs, string.Empty);
+
+    /// <summary>
+    /// When the container runtime started this container, used to tell the current run's
+    /// PostgreSQL log lines from the ones replayed out of a persisted data directory.
+    /// </summary>
+    public static async Task<DateTimeOffset> GetContainerStartedAtAsync(string containerId)
+    {
+        var (exitCode, output) = await RunDockerAsync("inspect", containerId, "--format", "{{.State.StartedAt}}");
+
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Could not read the start time of container '{containerId}' (exit code {exitCode}).");
+        }
+
+        var value = output.Trim();
+
+        return TryParseContainerStartedAt(value, out var startedAt)
+            ? startedAt
+            : throw new InvalidOperationException(
+                $"Container '{containerId}' reported an unparseable start time '{value}'.");
+    }
+
+    /// <summary>
+    /// Parses a container runtime start timestamp, which carries more fractional digits than a
+    /// <see cref="DateTime"/> keeps (Docker emits nanoseconds).
+    /// </summary>
+    internal static bool TryParseContainerStartedAt(string value, out DateTimeOffset startedAt) =>
+        DateTimeOffset.TryParse(
+            value,
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+            out startedAt);
 
     internal static string CombineStandardOutputAndError(string standardOutput, string standardError)
     {

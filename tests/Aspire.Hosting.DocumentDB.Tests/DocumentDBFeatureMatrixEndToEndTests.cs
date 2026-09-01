@@ -42,12 +42,11 @@ public class DocumentDBFeatureMatrixEndToEndTests
         RegexOptions.CultureInvariant);
 
     /// <summary>
-    /// PostgreSQL's own words when the data directory's <c>st_uid</c> does not match the
-    /// postmaster's effective uid. <c>/data</c> is the mount target
-    /// <see cref="DocumentDBBuilderExtensions.WithDataBindMount"/> uses, and the value it also
-    /// puts in <c>DATA_PATH</c>.
+    /// The container path <see cref="DocumentDBBuilderExtensions.WithDataBindMount"/> mounts the
+    /// host directory at, and the value it puts in <c>DATA_PATH</c>. PostgreSQL names it when it
+    /// rejects the directory's owner.
     /// </summary>
-    private const string StaleOwnershipLogFragment = "data directory \"/data\" has wrong ownership";
+    private const string MountedDataPath = "/data";
 
     // ------------------------------------------------------------------
     // Credentials, multiple databases, database naming
@@ -160,7 +159,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
-    public async Task DataBindMountWritesToTheHostPathAndSurvivesARestartWhereTheRuntimeSupportsIt()
+    public async Task DataBindMountWritesToTheHostPathAndSurvivesARestartExceptOnDockerDesktop()
     {
         RequireDocker();
 
@@ -171,6 +170,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.DataBindMountScenario),
             (AppHost.BindMountPathEnvironmentVariable, bindMountPath));
+
+        // Asked of the daemon, not of the host OS: only Docker Desktop is allowed to fail the
+        // restart below, and a Linux host can be either.
+        var runtime = await DocumentDBContainerRuntime.DescribeAsync();
 
         try
         {
@@ -198,11 +201,18 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
                 var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
                 var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+                var containerStartedAt = await GetContainerStartedAtAsync(containerId);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
 
-                var outcome = await WaitForRestartOutcomeAsync(connectionString!, containerId, cts.Token);
+                var (outcome, containerLog) = await WaitForRestartOutcomeAsync(
+                    connectionString!, containerId, containerStartedAt, cts.Token);
 
-                if (outcome == RestartOutcome.Reachable)
+                // Reachable is required everywhere; the refusal is tolerated only on the runtime
+                // that provably cannot avoid it. Anywhere else this throws with the diagnosis and
+                // the container's own log.
+                DocumentDBBindMountRestart.AssertOutcomeIsAllowed(outcome, runtime, containerLog);
+
+                if (outcome == BindMountRestartOutcome.Reachable)
                 {
                     var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
 
@@ -230,44 +240,45 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
-    private enum RestartOutcome
+    /// <summary>
+    /// The restart policy above only relaxes for Docker Desktop, so the identification must come
+    /// from the daemon whenever there is one. If this ever fell back to the host OS on a machine
+    /// with a working Docker, a Linux developer box running Docker Desktop would be held to the
+    /// strict rule and a macOS host running a native-semantics runtime would not.
+    /// </summary>
+    [Fact]
+    public async Task TheContainerRuntimeIdentifiesItselfToTheRestartPolicy()
     {
-        /// <summary>The restarted container served the persisted data directory.</summary>
-        Reachable,
+        RequireDocker();
 
-        /// <summary>PostgreSQL refused the data directory because its owner was not the postmaster's.</summary>
-        RefusedForStaleOwnership,
+        var runtime = await DocumentDBContainerRuntime.DescribeAsync();
+
+        Assert.True(
+            runtime.DaemonAnswered,
+            $"Docker is available, so the runtime must be identified from 'docker info' rather than " +
+            $"from the host OS, but the description fell back: {runtime}.");
+        Assert.False(string.IsNullOrWhiteSpace(runtime.OperatingSystem));
+        Assert.Equal(DocumentDBContainerRuntime.IsDockerDesktop(runtime.OperatingSystem), runtime.IsDockerDesktop);
     }
 
     /// <summary>
     /// Watches a restarted DocumentDB container until it either serves the bind-mounted data
-    /// directory or says, in PostgreSQL's own words, that it could not take it over.
+    /// directory or shows this run refusing it over its ownership.
     /// </summary>
     /// <remarks>
-    /// PostgreSQL refuses to start unless the data directory's owner is already the postmaster's
-    /// effective uid, and the container establishes that by running <c>chown</c> on
-    /// <c>DATA_PATH</c> milliseconds before starting it. Docker Desktop's macOS and Windows file
-    /// sharing applies that <c>chown</c> asynchronously, so the postmaster reads the previous
-    /// owner and aborts with <c>data directory "/data" has wrong ownership</c>; a first run hides
-    /// it behind the seconds <c>initdb</c> spends between the two steps, which is why only the
-    /// restart fails. Nothing in the application model can order that runtime's <c>chown</c>, and
-    /// the DocumentDB image documents and tests persistence with a named volume rather than a host
-    /// bind mount, so that refusal is the honest outcome on such a runtime rather than a defect
-    /// this package can fix.
-    /// <para>
     /// The outcome is observed rather than predicted. Probing the runtime's <c>chown</c>
     /// visibility ahead of time and branching on the answer was tried first and is not reliable:
-    /// the same probe reports the ownership change eagerly on some runs and lazily on others, so
-    /// the branch — and therefore which assertions ran — became a coin toss. Both outcomes here
-    /// are asserted, whichever arrives first; a container that neither serves the data nor names
-    /// that failure fails the test with its own log attached, instead of the three-minute Mongo
-    /// connect timeout naming neither the data directory nor the ownership check that this suite
-    /// used to report.
-    /// </para>
+    /// the same probe reported the ownership change eagerly on some runs and lazily on others, so
+    /// which assertions ran became a coin toss. Both signals are polled here and the first to
+    /// arrive decides; the caller then holds the outcome to the standard its runtime is held to.
+    /// A container that neither serves the data nor names that failure fails the test with its own
+    /// log attached, instead of the three-minute Mongo connect timeout naming neither the data
+    /// directory nor the ownership check that this suite used to report.
     /// </remarks>
-    private static async Task<RestartOutcome> WaitForRestartOutcomeAsync(
+    private static async Task<(BindMountRestartOutcome Outcome, string ContainerLog)> WaitForRestartOutcomeAsync(
         string connectionString,
         string containerId,
+        DateTimeOffset containerStartedAt,
         CancellationToken cancellationToken)
     {
         // Short timeouts: this polls two signals in turn, so a slow-starting server must not
@@ -279,10 +290,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
         {
             logs = await GetContainerLogsAsync(containerId);
 
-            if (logs.Contains(StaleOwnershipLogFragment, StringComparison.Ordinal))
+            if (DocumentDBBindMountRestart.IndicatesStaleOwnershipRefusal(logs, MountedDataPath, containerStartedAt))
             {
-                Assert.Contains("pg_ctl: could not start server", logs, StringComparison.Ordinal);
-                return RestartOutcome.RefusedForStaleOwnership;
+                return (BindMountRestartOutcome.RefusedForStaleOwnership, logs);
             }
 
             try
@@ -290,7 +300,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 await database.RunCommandAsync(
                     (Command<BsonDocument>)"{ ping: 1 }",
                     cancellationToken: cancellationToken);
-                return RestartOutcome.Reachable;
+                return (BindMountRestartOutcome.Reachable, logs);
             }
             catch (TimeoutException)
             {
