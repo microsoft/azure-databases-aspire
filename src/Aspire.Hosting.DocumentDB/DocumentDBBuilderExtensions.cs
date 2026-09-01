@@ -29,7 +29,8 @@ public static class DocumentDBBuilderExtensions
 
     private const string UserEnvVarName = "USERNAME";
     private const string PasswordEnvVarName = "PASSWORD";
-    private const string LogLevelEnvVarName = "LOG_LEVEL";
+    private const string LogLevelEnvVarName = "DOCUMENTDB_LOG_LEVEL";
+    private const string LegacyLogLevelEnvVarName = "LOG_LEVEL";
     private const string InitDataEnvVarName = "INIT_DATA";
     private const string InitDataPathEnvVarName = "INIT_DATA_PATH";
     private const string SkipInitDataEnvVarName = "SKIP_INIT_DATA";
@@ -564,6 +565,10 @@ public static class DocumentDBBuilderExtensions
     /// <summary>
     /// Configures the DocumentDB Local container log level.
     /// </summary>
+    /// <remarks>
+    /// Sets both the gateway's canonical <c>DOCUMENTDB_LOG_LEVEL</c> variable and the legacy
+    /// container <c>LOG_LEVEL</c> variable for compatibility across DocumentDB Local versions.
+    /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <param name="logLevel">The log level to configure.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
@@ -573,7 +578,9 @@ public static class DocumentDBBuilderExtensions
 
         return builder.WithEnvironment(context =>
         {
-            context.EnvironmentVariables[LogLevelEnvVarName] = logLevel.ToEnvironmentValue();
+            var value = logLevel.ToEnvironmentValue();
+            context.EnvironmentVariables[LogLevelEnvVarName] = value;
+            context.EnvironmentVariables[LegacyLogLevelEnvVarName] = value;
         });
     }
 

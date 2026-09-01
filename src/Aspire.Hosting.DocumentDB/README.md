@@ -74,7 +74,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithHostPort(port)` | Bind to a fixed host port (default: random) |
 | `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume |
 | `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
-| `.WithLogLevel(level)` | Set the container `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
+| `.WithLogLevel(level)` | Set canonical `DOCUMENTDB_LOG_LEVEL` and legacy `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
 | `.WithInitData(source)` | Bind-mount initialization scripts to `/init_doc_db.d` and disable built-in sample data |
 | `.WithoutSampleData()` | Disable the built-in sample data initialization |
 | `.WithoutExtendedRum()` | Disable the `extended_rum` index access method (DocumentDB v0.111.0+) |
