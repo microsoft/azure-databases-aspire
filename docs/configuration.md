@@ -184,7 +184,7 @@ by default. On a fresh container, `WithoutUserCreation()` must be paired with
 `WithoutSampleData()` so the default initialization does not require the
 skipped credentials.
 
-For curated images 0.113.0 and later, including 0.116.0, built-in sample
+For images from 0.113.0 onward, including 0.116.0, built-in sample
 initialization does not run unless requested. A fresh container can therefore
 remain running with `CREATE_USER=false` when no initialization requiring those
 credentials is requested. The generated connection strings still will not

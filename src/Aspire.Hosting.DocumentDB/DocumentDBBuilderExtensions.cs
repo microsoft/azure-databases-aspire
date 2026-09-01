@@ -655,7 +655,7 @@ public static class DocumentDBBuilderExtensions
     /// <see cref="WithoutSampleData"/> so the default initialization does not require the skipped
     /// credentials.
     /// <para>
-    /// For curated images <c>0.113.0</c> and later, including <c>0.116.0</c>, built-in sample
+    /// For images from <c>0.113.0</c> onward, including <c>0.116.0</c>, built-in sample
     /// initialization does not run unless requested. A fresh container can therefore remain
     /// running with user creation disabled when no initialization requiring those credentials is
     /// requested. The generated connection strings still will not authenticate unless the user
