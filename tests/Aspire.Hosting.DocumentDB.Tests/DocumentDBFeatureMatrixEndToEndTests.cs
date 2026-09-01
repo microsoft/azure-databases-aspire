@@ -31,7 +31,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Trait("Category", "Integration")]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
-    private const string CandidateVersion = "0.116.0";
+    private const string ReleasedVersion = DocumentDBVersions.V0_116_0;
 
     // ------------------------------------------------------------------
     // Credentials, multiple databases, database naming
@@ -227,7 +227,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             using (var scenario = new EnvironmentScope(
                        (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
-                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17))))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
@@ -240,7 +240,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 Assert.NotNull(existing);
 
                 await collection.InsertOneAsync(
-                    new BsonDocument { ["_id"] = "post-upgrade", ["version"] = CandidateVersion },
+                    new BsonDocument { ["_id"] = "post-upgrade", ["version"] = ReleasedVersion },
                     cancellationToken: cts.Token);
                 Assert.Equal(
                     2,
@@ -277,7 +277,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                        (AppHost.ScenarioEnvironmentVariable, AppHost.InitDataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
                        (AppHost.InitDataPathEnvironmentVariable, initDataPath),
-                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17))))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
@@ -306,7 +306,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                        (AppHost.ScenarioEnvironmentVariable, AppHost.InitDataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
                        (AppHost.InitDataPathEnvironmentVariable, initDataPath),
-                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17))))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
@@ -393,10 +393,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
-        var candidateTag = CandidateTag(postgresVersion);
+        var releasedTag = ReleasedTag(postgresVersion);
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, scenarioName),
-            (AppHost.ImageTagEnvironmentVariable, candidateTag));
+            (AppHost.ImageTagEnvironmentVariable, releasedTag));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -404,7 +404,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
         var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
         var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
-        Assert.Equal(candidateTag, image.Tag);
+        Assert.Equal(releasedTag, image.Tag);
 
         await app.StartAsync(cts.Token);
 
@@ -447,7 +447,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachTheCurrentContainer()
+    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachThe0114ControlContainer()
     {
         RequireDocker();
 
@@ -456,7 +456,8 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.ObservableConfigScenario),
-            (AppHost.OtelEndpointEnvironmentVariable, otelEndpoint));
+            (AppHost.OtelEndpointEnvironmentVariable, otelEndpoint),
+            (AppHost.ImageTagEnvironmentVariable, "pg17-0.114.0"));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -492,7 +493,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.ObservableConfigScenario),
             (AppHost.OtelOutputPathEnvironmentVariable, otelOutputPath),
-            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         try
         {
@@ -614,15 +615,15 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task CurrentPostgresEndpointHonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
+    public async Task PostgresEndpointOn0114HonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
     {
-        await AssertPostgresExtrasAsync(imageTag: null, assertLz4: false);
+        await AssertPostgresExtrasAsync("pg17-0.114.0", assertLz4: false);
     }
 
     [Fact]
     public async Task PostgresEndpointOn0116UsesLz4ToastCompression()
     {
-        await AssertPostgresExtrasAsync(CandidateTag(17), assertLz4: true);
+        await AssertPostgresExtrasAsync(ReleasedTag(17), assertLz4: true);
     }
 
     private static async Task AssertPostgresExtrasAsync(string? imageTag, bool assertLz4)
@@ -692,7 +693,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var cts = CreateEndToEndTimeoutSource();
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.ReservedUserNameScenario),
-            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -787,7 +788,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         return app;
     }
 
-    private static string CandidateTag(int postgresVersion) => $"pg{postgresVersion}-{CandidateVersion}";
+    private static string ReleasedTag(int postgresVersion) => $"pg{postgresVersion}-{ReleasedVersion}";
 
     private static async Task WaitForDocumentAsync(
         IMongoDatabase database,

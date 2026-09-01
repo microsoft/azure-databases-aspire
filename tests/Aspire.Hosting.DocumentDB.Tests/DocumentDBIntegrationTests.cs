@@ -189,7 +189,7 @@ public class DocumentDBIntegrationTests
         // legacy docdb_admin).
         //
         // The AppHost (Aspire.Hosting.DocumentDB.PostgresEndToEndApp) pins the image to
-        // pg17-0.114.0 so this release-gating test runs against a deterministic, known-good
+        // pg17-0.116.0 so this release-gating test runs against a deterministic, known-good
         // tag rather than floating on DocumentDBVersions.Latest. Bump both together when
         // adopting a new DocumentDB version.
         if (!RequiresDockerAttribute.IsSupported)
@@ -263,7 +263,7 @@ public class DocumentDBIntegrationTests
 
         throw new InvalidOperationException(
             "PostgreSQL did not become reachable / did not authenticate the Aspire-resolved credentials in time. " +
-            "The AppHost pins pg17-0.114.0, which honours USERNAME/PASSWORD on the PostgreSQL admin role. " +
+            "The AppHost pins pg17-0.116.0, which honours USERNAME/PASSWORD on the PostgreSQL admin role. " +
             "A '28P01: password authentication failed' here therefore means the pinned tag was overridden with " +
             "an image older than v0.112-0 (WithPostgresEndpoint() should have blocked startup in that case) or " +
             "that the upstream entrypoint changed how it provisions the admin role.",

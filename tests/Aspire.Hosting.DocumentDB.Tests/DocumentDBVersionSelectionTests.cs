@@ -33,6 +33,7 @@ public class DocumentDBVersionSelectionTests
     [InlineData(DocumentDBVersion.V0_112_0, "pg17-0.112.0")]
     [InlineData(DocumentDBVersion.V0_113_0, "pg17-0.113.0")]
     [InlineData(DocumentDBVersion.V0_114_0, "pg17-0.114.0")]
+    [InlineData(DocumentDBVersion.V0_116_0, "pg17-0.116.0")]
     public void WithDocumentDBVersionAloneSetsExpectedTag(DocumentDBVersion version, string expectedTag)
     {
         var appBuilder = DistributedApplication.CreateBuilder();

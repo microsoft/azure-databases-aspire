@@ -53,7 +53,7 @@ public class Program
     /// <summary>WithPostgresVersion(Pg16).</summary>
     public const string Pg16Scenario = "pg16";
 
-    /// <summary>Default PostgreSQL 17 backend with an explicit candidate image.</summary>
+    /// <summary>Default PostgreSQL 17 backend with the explicit released image.</summary>
     public const string Pg17Scenario = "pg17";
 
     /// <summary>WithPostgresVersion(Pg18).</summary>
@@ -177,7 +177,7 @@ public class Program
 
                 if (collector is null)
                 {
-                    // Retain current-image environment propagation coverage without coupling the
+                    // Retain 0.114 control-image environment propagation coverage without coupling the
                     // 0.116 OTLP test to a PostgreSQL owner role that the image does not create.
                     documentDB.WithOwner("aspireowner");
                 }
