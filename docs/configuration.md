@@ -118,6 +118,8 @@ var server = builder.AddDocumentDB("documentdb")
 
 By default, this helper mounts data at `/data` inside the container (matching the container default) and sets `DATA_PATH` accordingly.
 
+> **A bind mount only carries a PostgreSQL data directory on a container runtime that applies ownership changes to the mounted host path immediately.** PostgreSQL refuses to start unless the data directory is already owned by the user starting the postmaster, and the container entrypoint establishes that by running `chown` on `DATA_PATH` milliseconds before starting it. Docker Desktop on macOS and Windows applies that `chown` asynchronously, so the postmaster reads the previous owner and aborts with `FATAL: data directory "/data" has wrong ownership`. The first run hides this behind the seconds `initdb` spends between the two steps, so the container comes up once and then fails **every** restart, with the data intact on the host but unreadable. Nothing in the application model can order that runtime's `chown`. Use [`WithDataVolume`](#withdatavolume) there — a named volume lives inside the runtime's own filesystem and is unaffected. See [Bind-mounted data fails to restart on Docker Desktop](troubleshooting.md#bind-mounted-data-fails-to-restart-on-docker-desktop).
+
 > The credential caveat under [WithDataVolume](#withdatavolume) applies here too: supply explicit `userName`/`password` parameters, or the generated password will stop matching the role stored in the mounted directory on the next run.
 
 ## WithLogLevel

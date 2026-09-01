@@ -60,7 +60,7 @@ Then inject `IMongoClient` wherever you need it. The connection string is resolv
 | `.AddDatabase(name, databaseName?)` | Add a database on the server |
 | `.WithHostPort(port)` | Bind to a specific host port |
 | `.WithDataVolume(name?, isReadOnly?, targetPath?)` | Persist data with a Docker volume |
-| `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount |
+| `.WithDataBindMount(source, isReadOnly?)` | Persist data with a host directory mount (does not restart on Docker Desktop — see [troubleshooting](docs/troubleshooting.md#bind-mounted-data-fails-to-restart-on-docker-desktop)) |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allowInsecureTls?)` | Allow self-signed certificates (default: enabled) |
 | `.WithDocumentDBVersion(version)` | Pin a curated DocumentDB version (default: latest known to this build) |

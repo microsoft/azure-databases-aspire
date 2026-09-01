@@ -162,6 +162,25 @@ var server = builder.AddDocumentDB("documentdb", userName: userName, password: p
                     .WithDataBindMount("./data/documentdb");
 ```
 
+On Docker Desktop for macOS or Windows, prefer `WithDataVolume()` — see [Bind-mounted data fails to restart on Docker Desktop](#bind-mounted-data-fails-to-restart-on-docker-desktop).
+
+### Bind-mounted data fails to restart on Docker Desktop
+
+**Symptom:** With `WithDataBindMount()`, the first run works. Every later run leaves the DocumentDB resource unreachable — connections time out or the TLS handshake ends with `Received an unexpected EOF or 0 bytes from the transport stream` — and the container log contains:
+
+```text
+pg_ctl: could not start server
+[POSTGRES] FATAL:  data directory "/data" has wrong ownership
+[POSTGRES] HINT:  The server must be started by the user that owns the data directory.
+```
+
+**Cause:** PostgreSQL refuses to start unless the data directory's owner is the user starting the postmaster. The DocumentDB container establishes that by running `chown` on `DATA_PATH` and starting the postmaster a few milliseconds later. Docker Desktop's macOS and Windows file sharing applies `chown` on a bind mount asynchronously: for about a second afterwards the container still sees the previous owner, so the postmaster reads a stale owner and aborts. The first run is unaffected because `initdb` runs for several seconds in between. A restart has no `initdb`, so it fails every time. Named volumes do not go through that file-sharing layer, and Linux bind mounts are ordinary mounts, so neither is affected.
+
+**Solutions:**
+1. **Use `WithDataVolume()`** instead. It is the persistence mechanism the DocumentDB image documents and tests, and it is unaffected by this.
+2. **Need the files on the host?** Copy them out of the volume when you need them (`docker run --rm -v <volume>:/data -v "$PWD":/out alpine tar -C /data -cf /out/data.tar .`) rather than running the database directly on a bind mount.
+3. **On Linux**, `WithDataBindMount()` restarts normally; nothing needs to change.
+
 ### Authentication fails on the second run after adding a data volume
 
 **Symptom:** The first run works. Every later run fails with `MongoAuthenticationException: Unable to authenticate using sasl protocol mechanism SCRAM-SHA-256` and an inner `Command saslContinue failed: Invalid key`. Removing the volume "fixes" it — and loses the data.
@@ -237,5 +256,6 @@ DocumentDB container logs can help diagnose startup and runtime issues:
 
 - **Health readiness is gateway readiness.** The built-in authenticated MongoDB health check does
   not prove that DocumentDB `0.116.0` one-shot initialization scripts have completed.
+- **`WithDataBindMount()` does not restart on Docker Desktop.** Docker Desktop for macOS and Windows applies ownership changes to bind-mounted host paths asynchronously, and PostgreSQL reads the stale owner and refuses the data directory. Use `WithDataVolume()` on those hosts — see [Bind-mounted data fails to restart on Docker Desktop](#bind-mounted-data-fails-to-restart-on-docker-desktop).
 - **No built-in backup/restore.** For development data, use `WithDataVolume()` for persistence. For important data, use `mongodump` / `mongorestore` manually.
 - **Single server only.** The extension does not support replica sets or sharded clusters. It runs a single DocumentDB container intended for local development.
