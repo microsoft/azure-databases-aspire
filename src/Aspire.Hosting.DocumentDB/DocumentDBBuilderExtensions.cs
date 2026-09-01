@@ -650,16 +650,24 @@ public static class DocumentDBBuilderExtensions
     /// upstream <c>CREATE_USER=false</c> environment variable.
     /// </summary>
     /// <remarks>
-    /// A fresh container can start without creating the configured user when no initialization
-    /// requiring those credentials is requested, but the generated connection strings will not
-    /// authenticate unless the user already exists in persisted storage
-    /// (<see cref="WithDataVolume"/> / <see cref="WithDataBindMount"/>).
+    /// For curated images <c>0.112.0</c> and older, built-in sample initialization is enabled by
+    /// default. On a fresh container, this method must be paired with
+    /// <see cref="WithoutSampleData"/> so the default initialization does not require the skipped
+    /// credentials.
     /// <para>
-    /// The container's built-in sample initialization and custom scripts mounted through
-    /// <see cref="WithInitData"/> authenticate using the configured credentials. If initialization
-    /// is requested and the user does not already exist, initialization fails and the container
-    /// exits. <see cref="WithoutSampleData"/> disables only the built-in sample data; it does not
-    /// disable custom initialization scripts.
+    /// For curated images <c>0.113.0</c> and later, including <c>0.116.0</c>, built-in sample
+    /// initialization does not run unless requested. A fresh container can therefore remain
+    /// running with user creation disabled when no initialization requiring those credentials is
+    /// requested. The generated connection strings still will not authenticate unless the user
+    /// already exists, typically in persisted storage created through <see cref="WithDataVolume"/>
+    /// or <see cref="WithDataBindMount"/>.
+    /// </para>
+    /// <para>
+    /// On every version, requested built-in sample initialization and custom scripts mounted
+    /// through <see cref="WithInitData"/> authenticate using the configured credentials. If the
+    /// skipped user does not already exist, that initialization can fail and cause the container
+    /// to exit. <see cref="WithoutSampleData"/> disables only the built-in sample data; it does
+    /// not disable custom initialization scripts.
     /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
