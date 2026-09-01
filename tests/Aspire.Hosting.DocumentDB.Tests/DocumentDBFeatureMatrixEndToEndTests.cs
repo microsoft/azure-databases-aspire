@@ -474,11 +474,49 @@ public class DocumentDBFeatureMatrixEndToEndTests
         Assert.Equal("7000", environment["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
         Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
         Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
+        Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
         Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
         Assert.Equal("aspireowner", environment["OWNER"]);
 
         var logs = await WaitForContainerLogAsync(containerId, "Using owner: aspireowner", cts.Token);
         Assert.Contains("Using owner: aspireowner", logs, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DebugLogLevelIsAppliedBy0116Gateway()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.DebugLogLevelScenario),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+
+        Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+
+        var logs = await WaitForContainerLogAsync(
+            containerId,
+            "PeriodReaderThreadExportingDueToTimer",
+            cts.Token);
+        var normalizedLogs = System.Text.RegularExpressions.Regex.Replace(
+            logs,
+            "\u001B\\[[0-?]*[ -/]*[@-~]",
+            string.Empty);
+        Assert.Contains("DEBUG opentelemetry_sdk:", normalizedLogs, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -519,6 +557,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
             Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
             Assert.False(environment.ContainsKey("CONFIG_DIR"));
+            Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
             Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
 
             var metrics = await WaitForFileContainingAsync(

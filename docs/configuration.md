@@ -122,7 +122,10 @@ By default, this helper mounts data at `/data` inside the container (matching th
 
 ## WithLogLevel
 
-Sets the container `LOG_LEVEL` environment variable to control DocumentDB Local log verbosity.
+Sets both the gateway's canonical `DOCUMENTDB_LOG_LEVEL` environment variable and the legacy
+container `LOG_LEVEL` variable to control DocumentDB Local log verbosity across image versions.
+Both variables receive the same lowercase value, including `quiet`, preserving the existing API
+behavior while supporting the gateway contract introduced in DocumentDB `0.116.0`.
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
@@ -561,7 +564,8 @@ The extension passes these environment variables to the DocumentDB container:
 | `USERNAME` | The configured username | Container creates this user on startup |
 | `PASSWORD` | The configured password | Password for the created user |
 | `DATA_PATH` | Path inside the container for the mounted data directory | Only set when using `WithDataVolume` or `WithDataBindMount`; otherwise the container uses its default `/data` |
-| `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Set by `WithLogLevel(...)` |
+| `DOCUMENTDB_LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Canonical gateway variable set by `WithLogLevel(...)` (DocumentDB `0.116.0`+) |
+| `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Legacy container variable also set by `WithLogLevel(...)` for backward compatibility |
 | `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `CERT_PATH` | Container path of the mounted certificate file | Set by `WithTlsCertificate(...)` |

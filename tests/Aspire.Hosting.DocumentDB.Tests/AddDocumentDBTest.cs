@@ -601,7 +601,7 @@ public class AddDocumentDBTests
     [InlineData(DocumentDBLogLevel.Info, "info")]
     [InlineData(DocumentDBLogLevel.Debug, "debug")]
     [InlineData(DocumentDBLogLevel.Trace, "trace")]
-    public async Task WithLogLevelAddsEnvironmentVariable(DocumentDBLogLevel logLevel, string expectedValue)
+    public async Task WithLogLevelAddsCanonicalAndLegacyEnvironmentVariables(DocumentDBLogLevel logLevel, string expectedValue)
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
@@ -614,6 +614,7 @@ public class AddDocumentDBTests
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
 
+        Assert.Equal(expectedValue, env["DOCUMENTDB_LOG_LEVEL"]);
         Assert.Equal(expectedValue, env["LOG_LEVEL"]);
     }
 
@@ -1225,6 +1226,7 @@ public class AddDocumentDBTests
 
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
+        Assert.Equal("debug", manifest["env"]?["DOCUMENTDB_LOG_LEVEL"]?.GetValue<string>());
         Assert.Equal("debug", manifest["env"]?["LOG_LEVEL"]?.GetValue<string>());
         Assert.Equal("/init_doc_db.d", manifest["env"]?["INIT_DATA_PATH"]?.GetValue<string>());
         Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
