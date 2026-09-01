@@ -558,20 +558,38 @@ mongodb://<username>:<password>@<host>:<port>[/<database>]?authSource=admin&auth
 
 ### Credential encoding
 
-The user name and password are percent-encoded (RFC 3986) before they are placed in the URI, so
-arbitrary parameter values are safe to use. Characters such as `:`, `@`, `/`, `?`, `#`, `%`, spaces
-and non-ASCII text are escaped, which prevents them from being read as URI delimiters or as extra
-connection options. MongoDB and PostgreSQL clients decode the userinfo component, so they still
-receive the original value.
+The user name and password are percent-encoded before they are placed in the URI, so characters such
+as `:`, `@`, `/`, `?`, `#`, `%`, `&`, spaces and non-ASCII text cannot be read as URI delimiters or
+as extra connection options. MongoDB and PostgreSQL clients decode the userinfo component, so they
+receive the original value back.
 
+- **Whenever Aspire resolves the reference, encoding is RFC 3986** (`Uri.EscapeDataString`), so
+  arbitrary credential values round-trip exactly. This covers `aspire run`, values injected through
+  `WithReference(...)`, and the health checks this integration registers.
 - Credentials made only of unreserved characters (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`) are
   emitted verbatim. That includes the default `admin` user name and the auto-generated password, so
   simple setups see no change.
 - Encoding applies only to the connection strings. The container's `USERNAME` and `PASSWORD`
   environment variables keep the raw values, because that is what the entrypoint expects.
-- Encoding is resolved late, so no secret is read while the model is built. In a published manifest
-  the connection string references an `annotated.string` companion resource
-  (`<parameter>-uri-encoded`, `"filter": "uri"`) instead of inlining a value.
+- Encoding is resolved late, so no secret is read while the application model is built.
+
+#### Publishing: the encoding is the publisher's
+
+A published manifest does not inline the encoded value. The connection string instead references an
+`annotated.string` companion resource (`<parameter>-uri-encoded`, `"filter": "uri"`) whose value
+points back at the original parameter, and the *downstream publisher* implements the `uri` filter.
+The escaping used at deployment time is therefore that publisher's, and this integration cannot
+guarantee every publisher matches the RFC 3986 escaping described above.
+
+> [!IMPORTANT]
+> The Azure Developer CLI (`azd`) currently implements the `uri` filter for Container Apps with Go's
+> `url.QueryEscape`, which is *query* escaping: a literal space becomes `+`, not `%20`. MongoDB and
+> libpq decode userinfo per RFC 3986, where `+` is a literal plus sign and is **not** converted back
+> into a space. A credential containing a space is therefore not guaranteed to survive an `azd`
+> deployment, even though it resolves correctly under `aspire run`. Delimiters (`:`, `@`, `/`, `?`,
+> `#`, `%`, `&`, `=`) and non-ASCII text are escaped compatibly by both, so the literal space is the
+> known divergence. If you publish with `azd`, avoid spaces in `userName` / `password` — the
+> auto-generated password is already free of them.
 
 ## Defaults summary
 

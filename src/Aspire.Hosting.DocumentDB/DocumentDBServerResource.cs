@@ -108,7 +108,10 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// <see cref="ReferenceExpression.ValueExpression"/> keeps the plain <c>{parameter.value}</c>
     /// placeholders. When the model is published, Aspire projects each formatted parameter onto an
     /// <c>annotated.string</c> companion resource (<c>{parameter}-uri-encoded</c>) that carries the
-    /// <c>uri</c> filter, so no secret is inlined into the manifest.
+    /// <c>uri</c> filter, so no secret is inlined into the manifest. The publisher consuming that
+    /// manifest implements the filter, so the escaping applied at deployment time is its own; see
+    /// <see href="https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#credential-encoding">the
+    /// credential-encoding documentation</see> for the known divergences.
     /// </para>
     /// <para>
     /// Values consisting only of RFC 3986 unreserved characters (<c>A-Z a-z 0-9 - . _ ~</c>) are
