@@ -210,6 +210,90 @@ public class DocumentDBStorageBehaviorTests
     }
 
     /// <summary>
+    /// The container runtime resolves <c>.</c>, <c>..</c> and repeated separators in a mount
+    /// target before the container is created, so an alias such as <c>/foo/../data</c> lands on
+    /// the data directory, a second mount on any spelling of it is a duplicate the daemon refuses
+    /// outright, and a path that collapses to <c>/</c> is not a mount target at all.
+    /// </summary>
+    /// <remarks>
+    /// This is the runtime fact the model-level storage guard canonicalizes container paths for.
+    /// Comparing targets as written would let every one of these configurations past a guard that
+    /// only trims trailing slashes, and land it on the container the daemon then decides about.
+    /// <c>docker create</c> is enough: the destination is fixed while the container is created, so
+    /// the entrypoint never has to run for any of it to be observable.
+    /// </remarks>
+    [Fact]
+    public async Task TheRuntimeResolvesDotSegmentsInMountTargetsBeforeCreatingTheContainer()
+    {
+        RequireDocker();
+        await EnsureImageAsync(s_candidateImage);
+
+        var aliasVolume = UniqueName("alias-vol");
+        var otherVolume = UniqueName("other-vol");
+        var aliasContainer = UniqueName("alias");
+        var duplicateContainer = UniqueName("duplicate");
+        var rootContainer = UniqueName("root");
+
+        try
+        {
+            var (aliasVolumeExit, _) = await RunDockerAsync("volume", "create", aliasVolume);
+            Assert.Equal(0, aliasVolumeExit);
+
+            var (otherVolumeExit, _) = await RunDockerAsync("volume", "create", otherVolume);
+            Assert.Equal(0, otherVolumeExit);
+
+            var (createExit, _) = await RunDockerAsync(
+                "create", "--name", aliasContainer, "-v", $"{aliasVolume}://foo/./bar/../../data/", s_candidateImage);
+            Assert.Equal(0, createExit);
+
+            var (mountsExit, mountsJson) = await RunDockerAsync(
+                "inspect", aliasContainer, "--format", "{{json .Mounts}}");
+            Assert.Equal(0, mountsExit);
+
+            using var document = JsonDocument.Parse(mountsJson);
+            var mount = document.RootElement
+                .EnumerateArray()
+                .Single(entry => entry.GetProperty("Name").GetString() == aliasVolume);
+
+            Assert.Equal("/data", mount.GetProperty("Destination").GetString());
+
+            // Two spellings of one destination collide once they are resolved, and the daemon
+            // refuses the whole container rather than picking a winner.
+            var (duplicateExit, duplicateOutput, duplicateError) = await RunDockerWithTimeoutAsync(
+                ContainerCreateTimeout,
+                "create", "--name", duplicateContainer,
+                "-v", $"{aliasVolume}:/data",
+                "-v", $"{otherVolume}:/foo/../data",
+                s_candidateImage);
+
+            Assert.NotEqual(0, duplicateExit);
+            Assert.Contains(
+                "Duplicate mount point: /data",
+                CombineStandardOutputAndError(duplicateOutput, duplicateError),
+                StringComparison.Ordinal);
+
+            // '/data/..' is the container root once resolved, and the root cannot be mounted over.
+            var (rootExit, rootOutput, rootError) = await RunDockerWithTimeoutAsync(
+                ContainerCreateTimeout,
+                "create", "--name", rootContainer, "-v", $"{aliasVolume}:/data/..", s_candidateImage);
+
+            Assert.NotEqual(0, rootExit);
+            Assert.Contains(
+                "destination can't be '/'",
+                CombineStandardOutputAndError(rootOutput, rootError),
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            await RunDockerAsync("rm", "-f", "-v", aliasContainer);
+            await RunDockerAsync("rm", "-f", "-v", duplicateContainer);
+            await RunDockerAsync("rm", "-f", "-v", rootContainer);
+            await RemoveVolumeAsync(aliasVolume);
+            await RemoveVolumeAsync(otherVolume);
+        }
+    }
+
+    /// <summary>
     /// A data directory that holds anything other than a PostgreSQL cluster is refused, not
     /// cleaned: the container leaves the contents alone, never starts PostgreSQL, and exits behind
     /// the same misleading 60-second banner. One stray dot-file — a <c>.gitkeep</c> committed to
@@ -432,4 +516,5 @@ public class DocumentDBStorageBehaviorTests
 
     private static readonly TimeSpan LogWaitTimeout = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan ContainerExitTimeout = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan ContainerCreateTimeout = TimeSpan.FromMinutes(1);
 }

@@ -80,7 +80,7 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `name` | `string?` | Auto-generated | Docker volume name. When `null`, a name is generated from the application and resource names. |
 | `isReadOnly` | `bool` | `false` | Unsupported. Passing `true` throws an `ArgumentException` — see [Storage requirements](#storage-requirements). |
-| `targetPath` | `string?` | `/data` | Path inside the container where the volume is mounted when this helper is used. Must be an absolute container path below `/`. |
+| `targetPath` | `string?` | `/data` | Path inside the container where the volume is mounted when this helper is used. Must be an absolute container path below `/`. Repeated separators, `.`, and `..` are resolved the way the container runtime resolves them, so `/data/`, `//data`, and `/foo/../data` are the same path; one that resolves to the container root (`/data/..`) or reaches above it (`/../data`) is rejected. |
 
 This method mounts the volume at `targetPath` (which defaults to `/data`, matching the container default) and sets the `DATA_PATH` environment variable to match so DocumentDB writes to the mounted directory.
 
@@ -140,6 +140,25 @@ configuration cannot work, the integration fails it while the application model 
 at resource start, rather than letting the container fail confusingly a minute later. Rules that
 arrived in a specific image version are marked as such; everything unmarked applies to every image
 this package supports.
+
+### How the data directory is identified
+
+The rules below apply to the directory the container will really write to, which is the effective
+value of `DATA_PATH` at start. `DATA_PATH` is an ordinary environment variable: `WithDataVolume()`
+and `WithDataBindMount(...)` set it to the path they mount on, and a raw
+`WithEnvironment("DATA_PATH", ...)` — a literal, a parameter, or a value computed in an environment
+callback — participates on the same "last call wins" terms as every other Aspire environment
+configuration. Set it after a storage helper and it wins; set it before and the helper wins. When
+nothing sets it, the container's own `/data` default applies.
+
+Container paths are compared the way the container runtime resolves them: repeated separators
+collapse, and `.` and `..` segments are resolved before the mount is created. `/data`, `/data/`,
+`//data` and `/foo/../data` are one directory, so an alias cannot slip past any rule below. A path
+that resolves to the container root (`/data/..`) or reaches above it (`/../data`) is rejected — the
+runtime refuses `destination can't be '/'`, and neither is a directory that can hold a cluster.
+
+Resolving `DATA_PATH` does not resolve anything else: the password and every other environment
+value are left alone.
 
 ### The data directory must be writable
 
@@ -693,7 +712,7 @@ The extension passes these environment variables to the DocumentDB container:
 |---|---|---|
 | `USERNAME` | The configured username | Container creates this user on startup |
 | `PASSWORD` | The configured password | Password for the created user |
-| `DATA_PATH` | Path inside the container for the mounted data directory | Only set when using `WithDataVolume` or `WithDataBindMount`; otherwise the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
+| `DATA_PATH` | Path inside the container for the mounted data directory | Set by `WithDataVolume` and `WithDataBindMount`; can also be set directly with `WithEnvironment("DATA_PATH", ...)`, in which case the last caller wins and the storage guards follow it. When nothing sets it the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
 | `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Set by `WithLogLevel(...)` |
 | `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |
