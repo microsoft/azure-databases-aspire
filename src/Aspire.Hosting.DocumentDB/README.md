@@ -81,7 +81,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithoutUserCreation()` | Skip automatic user creation on container startup |
 | `.WithTlsCertificate(certPath, keyPath)` | Mount a custom TLS certificate and key into the container |
 | `.WithTelemetry(enabled?)` | **Obsolete.** No-op against gateway v0.112-0+; use `.WithOpenTelemetryMetrics(...)` instead. Kept for binary compatibility (`ASPIREDOCDB0001`). |
-| `.WithOpenTelemetryMetrics(endpoint?, enabled?, exportInterval?, timeout?, serviceName?, serviceVersion?)` | Enable OpenTelemetry metrics export from the gateway via OTLP/gRPC (container v0.112-0+) |
+| `.WithOpenTelemetryMetrics(endpoint?, enabled?, exportInterval?, timeout?, serviceName?, serviceVersion?)` | Enable OpenTelemetry metrics export from the gateway via OTLP/gRPC (container v0.112-0+). On v0.116-0 and later it also wraps the container entrypoint so the `OTEL_*` variables stay authoritative for the settings you supply; the wrapper is carried in `entrypoint`/`args` so published manifests stay deployable. |
 | `.WithOwner(owner)` | Set the existing PostgreSQL owner role used for DocumentDB operations |
 | `.UseTls(useTls?)` | Enable/disable TLS (default: enabled) |
 | `.AllowInsecureTls(allow?)` | Allow self-signed certs (default: enabled) |

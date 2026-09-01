@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Net.Sockets;
+using System.Text.Json.Nodes;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Eventing;
 using Aspire.Hosting.Utils;
@@ -20,6 +21,16 @@ public class AddDocumentDBTests
     // claims the data directory with an exclusive lock. Pinned explicitly so these tests describe
     // that image's behaviour regardless of which version the package currently defaults to.
     private const string InterlockedTag = "pg17-0.116.0";
+    private const string GatewayConfigurationShell = "/bin/bash";
+    private const string GatewayConfigurationShellArgumentZero = "--";
+    private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
+
+    /// <summary>
+    /// The metrics object the wrapper always removes whole: this package owns the metrics signal,
+    /// and any surviving key - including one a later gateway release adds - would re-pin a setting
+    /// ahead of the documented environment precedence.
+    /// </summary>
+    private const string MetricsBlockFilter = "del(.TelemetryOptions.Metrics";
 
     [Fact]
     public void CombineStandardOutputAndErrorPreservesStreamBoundary()
@@ -1389,145 +1400,717 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsInjectsEnvironmentAuthoritativeConfigurationOnce()
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForGatewayTelemetryImages()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithOpenTelemetryMetrics(endpoint: "http://first:4317")
             .WithOpenTelemetryMetrics(serviceName: "documentdb-local");
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(
-            containerResource.Annotations
-                .OfType<ContainerFileSystemCallbackAnnotation>()
-                .Where(annotation =>
-                    annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-        var file = Assert.IsType<ContainerFile>(Assert.Single(entries));
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
 
+        var args = await BuildContainerArgsAsync(containerResource);
+        Assert.Equal(3, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+
+        var script = Assert.IsType<string>(args[1]);
+        Assert.Contains($"exec {GatewayEntrypointScriptPath} \"$@\"", script, StringComparison.Ordinal);
+
+        // The caller-visible CONFIG_DIR contract is unchanged: the wrapper reads it, it is not
+        // written into the resource environment.
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         Assert.False(env.ContainsKey("CONFIG_DIR"));
-        Assert.Equal("SetupConfiguration.json", file.Name);
-        Assert.Contains("\"BlockedRolePrefixes\"", file.Contents, StringComparison.Ordinal);
-        Assert.DoesNotContain("\"TelemetryOptions\"", file.Contents, StringComparison.Ordinal);
-        Assert.Equal(
-            UnixFileMode.UserRead |
-            UnixFileMode.UserWrite |
-            UnixFileMode.GroupRead |
-            UnixFileMode.OtherRead,
-            file.Mode);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsDoesNotReplaceCustomConfigDirectory()
+    public async Task WithOpenTelemetryMetricsResolvesTheConfigurationDirectoryLikeTheImageEntrypoint()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithEnvironment("CONFIG_DIR", "/custom/documentdb/config")
+            .WithEnvironment("GATEWAY_HOME", "/opt/documentdb/gateway")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var containerResource = SingleServerResource(app);
+
+        // Caller-supplied values reach the container untouched; the wrapper consumes them at
+        // runtime rather than second-guessing them at build time.
         var env = await BuildEnvironmentVariablesAsync(containerResource);
-
         Assert.Equal("/custom/documentdb/config", env["CONFIG_DIR"]);
+        Assert.Equal("/opt/documentdb/gateway", env["GATEWAY_HOME"]);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+
+        // 1. An explicit CONFIG_DIR wins.
+        Assert.Contains("c=\"$CONFIG_DIR\"", script, StringComparison.Ordinal);
+
+        // 2. Otherwise the packaged layout, detected exactly the way the image entrypoint detects
+        //    it (both scripts present, not merely the directory).
+        Assert.Contains(
+            "if [ -f \"/usr/share/documentdb/scripts/start_oss_server.sh\" ] && " +
+            "[ -f \"/usr/share/documentdb/scripts/utils.sh\" ]; then c=\"/etc/documentdb/gateway\";",
+            script,
+            StringComparison.Ordinal);
+
+        // 3. Otherwise $GATEWAY_HOME/pg_documentdb_gw, with the upstream GATEWAY_HOME default.
+        Assert.Contains("g=\"$GATEWAY_HOME\"", script, StringComparison.Ordinal);
+        Assert.Contains("if [ -z \"$g\" ]; then g=\"/home/documentdb/gateway\"; fi;", script, StringComparison.Ordinal);
+        Assert.Contains("c=\"$g/pg_documentdb_gw\"", script, StringComparison.Ordinal);
+
+        Assert.Contains("s=\"$c/SetupConfiguration.json\"", script, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsAppliesCompatibilityConfigurationToPrivateMirrors()
+    public async Task WithOpenTelemetryMetricsRemovesTheWholeMetricsBlockButKeepsTheSharedIdentity()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // The metrics object goes whole, so the shipped OtlpEndpoint cannot beat
+        // OTEL_EXPORTER_OTLP_ENDPOINT and quietly export into the container itself, and no
+        // individual key is enumerated that a future gateway field could slip past.
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Metrics.", script, StringComparison.Ordinal);
+
+        // The shared identity and the shipped (disabled) tracing block survive untouched.
+        Assert.DoesNotContain(".TelemetryOptions.ServiceName", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.ServiceVersion", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Tracing", script, StringComparison.Ordinal);
+
+        // The caller did not ask for an identity, so none is invented for them either.
+        var env = await BuildEnvironmentVariablesAsync(SingleServerResource(app));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_NAME"));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_VERSION"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsLeavesTheGenericEndpointFallbackReachable()
+    {
+        // The stock file ships Metrics.OtlpEndpoint = http://localhost:4317. Keeping it would beat
+        // both OTEL_EXPORTER_OTLP_METRICS_ENDPOINT and OTEL_EXPORTER_OTLP_ENDPOINT and export
+        // metrics into the DocumentDB container itself, which is the silent loss this wrapper
+        // exists to prevent.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        var script = await GetWrapperScriptAsync(containerResource);
+
+        // The object goes whole, so no key inside it - present or future - can survive to beat
+        // the environment.
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Metrics.", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("http://otel-collector:4317", env["OTEL_EXPORTER_OTLP_ENDPOINT"]);
+        Assert.False(env.ContainsKey("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRemovesTheSharedIdentityOnlyWhenItsOverrideIsSupplied()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(
+                endpoint: "http://otel-collector:4317",
+                exportInterval: TimeSpan.FromSeconds(5),
+                timeout: TimeSpan.FromSeconds(7),
+                serviceName: "custom-service",
+                serviceVersion: "9.9.9");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains(
+            $"jq '{MetricsBlockFilter}, .TelemetryOptions.ServiceName, .TelemetryOptions.ServiceVersion)'",
+            script,
+            StringComparison.Ordinal);
+
+        // Tracing is never this package's to configure, even when the identity is overridden.
+        Assert.DoesNotContain(".TelemetryOptions.Tracing", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAccumulatesSuppliedOverridesAcrossCalls()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(serviceName: "custom-service")
+            .WithOpenTelemetryMetrics(endpoint: "http://otel-collector:4317");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // The environment variables merge across calls, so the identity keys they have to beat do
+        // too - and only those the caller actually supplied.
+        Assert.Contains(
+            $"jq '{MetricsBlockFilter}, .TelemetryOptions.ServiceName)'",
+            script,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.ServiceVersion", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForPrivateMirrors()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithImageRegistry("registry.example.com")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(
-            containerResource.Annotations
-                .OfType<ContainerFileSystemCallbackAnnotation>()
-                .Where(annotation =>
-                    annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-        Assert.IsType<ContainerFile>(Assert.Single(entries));
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsDoesNotInjectCompatibilityConfigurationFor0114()
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForVersionsAfterTheAffectedFloor()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.117.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenTheTagIsSelectedAfterTheCall()
+    {
+        // WithOpenTelemetryMetrics() cannot see the final image, so the decision has to be
+        // deferred; the alternative silently drops the override for this ordering.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics()
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
+            .WithImageTag("pg17-0.116.0");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointFor0114()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-        var env = await BuildEnvironmentVariablesAsync(containerResource);
-
-        Assert.Empty(entries);
-        Assert.False(env.ContainsKey("OTEL_SERVICE_NAME"));
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsDoesNotInjectCompatibilityConfigurationForCustomImages()
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForTheDefaultImage()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForCustomImages()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithImage("contoso/documentdb-local", "pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-
-        Assert.Empty(entries);
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsPreserves0116DefaultServiceNameForDefaultImage()
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForUnrecognizedTags()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("latest")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenDisabled()
+    {
+        // A caller-supplied configuration file can enable metrics from JSON, which would beat
+        // OTEL_METRICS_ENABLED=false. Explicitly disabling metrics has to win.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDisabledStillSanitizesACallerSuppliedConfiguration()
+    {
+        // The scenario the disabled-case wrapper exists for: the caller points CONFIG_DIR at a
+        // file that could enable metrics from JSON, and enabled: false has to beat it.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("CONFIG_DIR", "/custom/documentdb/config")
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.Contains("c=\"$CONFIG_DIR\"", script, StringComparison.Ordinal);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+        Assert.Equal("/custom/documentdb/config", env["CONFIG_DIR"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenTheLastCallDisablesMetrics()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics()
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenTheLastCallEnablesMetrics()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(enabled: false)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["OTEL_METRICS_ENABLED"]);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsKeepsCallerSuppliedContainerArgumentsBehindTheWrapper(bool argumentsFirst)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithImageTag("pg17-0.116.0");
+
+        if (argumentsFirst)
+        {
+            documentDB.WithArgs("--log-level", "trace").WithOpenTelemetryMetrics();
+        }
+        else
+        {
+            documentDB.WithOpenTelemetryMetrics().WithArgs("--log-level", "trace");
+        }
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(5, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--log-level", args[3]);
+        Assert.Equal("trace", args[4]);
+    }
+
+    [Theory]
+    [InlineData("/custom/entrypoint.sh")]
+    [InlineData("/bin/bash")]
+    public async Task WithOpenTelemetryMetricsRejectsAnyCallerSuppliedEntrypoint(string entrypoint)
+    {
+        // Even /bin/bash is a caller-owned entrypoint: its arguments are the caller's, so
+        // accepting it would splice the wrapper arguments into someone else's command line.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEntrypoint(entrypoint)
+            .WithArgs("-c", "echo hi")
+            .WithOpenTelemetryMetrics();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains(entrypoint, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsToleratesRepeatedLifecycleEvents()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        await RaiseBeforeStartAsync(app);
+        await RaiseBeforeStartAsync(app);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsArgumentsResolvedWithoutTheWrapperEntrypoint()
+    {
+        // The arguments only mean anything to the wrapper's own entrypoint. If they are resolved
+        // while something else owns the container command, they would be spliced into it.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
         using var app = appBuilder.Build();
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(documentDB.Resource));
 
-        Assert.Equal("documentdb_gateway", env["OTEL_SERVICE_NAME"]);
+        Assert.Contains("<image default>", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsPreservesCallerProvided0116ServiceNameForDefaultImage()
+    public async Task WithOpenTelemetryMetricsRejectsArgumentsWhenTheEntrypointIsReplacedLaterInTheSameStartup()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        // A BeforeStartEvent subscriber registered after ours runs after ours, so the entrypoint
+        // check in the event handler cannot see the replacement. The argument callback runs after
+        // every subscriber, which is why it re-checks.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        Assert.Equal("/late/entrypoint.sh", SingleServerResource(app).Entrypoint);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("/late/entrypoint.sh", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenTheEntrypointIsReplacedLaterInTheSameStartup()
+    {
+        // End to end through the real publishing pipeline: no manifest may be written with the
+        // wrapper's arguments attached to somebody else's entrypoint. The publisher reports the
+        // failed step rather than letting the exception escape RunAsync, which is what makes
+        // 'aspire publish' exit non-zero.
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+            {
+                documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+                return Task.CompletedTask;
+            });
+        });
+
+        Assert.Contains("publish-manifest' failed", log, StringComparison.Ordinal);
+        Assert.Contains("/late/entrypoint.sh", log, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsAnEntrypointReplacedAfterTheWrapperTookOwnership()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        SingleServerResource(app).Entrypoint = "/custom/entrypoint.sh";
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains("/custom/entrypoint.sh", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("pg17-0.114.0")]
+    [InlineData("latest")]
+    public async Task WithOpenTelemetryMetricsRejectsAnImageDowngradedAfterTheWrapperWasInstalled(string tag)
+    {
+        // The wrapper cannot be uninstalled once the entrypoint carries it: skipping the
+        // arguments would leave /bin/bash with nothing to run, which starts no container at all.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+
+        documentDB.WithImageTag(tag);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains(tag, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsACustomImageSwappedInAfterTheWrapperWasInstalled()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+
+        documentDB.WithImage("contoso/documentdb-local", "pg17-0.116.0");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("pg17-0.116.0")]
+    [InlineData("pg17-0.114.0")]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedOfficialImage(string supersededTag)
+    {
+        // ContainerImageAnnotation makes tag and digest mutually exclusive, so a digest pin leaves
+        // no tag to classify from and the DocumentDB version behind it is unknowable. Both stale
+        // directions matter: pg17-0.116.0 would have been wrapped and pg17-0.114.0 would have been
+        // skipped, and either guess is silently wrong.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(supersededTag)
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics();
+
+        var image = documentDB.Resource.Annotations.OfType<ContainerImageAnnotation>().Last();
+        Assert.Null(image.Tag);
+        Assert.Equal("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", image.SHA256);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsClassifiesByTagWhenATagSupersedesAnEarlierDigest()
+    {
+        // The other direction of the same exclusivity: a later WithImageTag drops the digest, so
+        // the version is knowable again and the wrapper must apply rather than keep failing.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        var image = documentDB.Resource.Annotations.OfType<ContainerImageAnnotation>().Last();
+        Assert.Null(image.SHA256);
+        Assert.Equal("pg17-0.116.0", image.Tag);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedOfficialImageWhenDisabled()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedOfficialImageWhenResolvingArguments()
+    {
+        // The argument callback resolves independently of the lifecycle event, so it has to reach
+        // the same conclusion rather than quietly emitting an unwrapped command line.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(documentDB.Resource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsADigestPinnedCustomImage()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("contoso/documentdb-local", "pg17-0.116.0")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapperScriptSurvivesPublisherArgumentProcessing()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(serviceName: "custom-service");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // azd evaluates '{...}' inside every container argument as a manifest binding expression
+        // before rendering it, so a shell '${VAR}' or '${VAR:-default}' is at best passed through
+        // by accident and at worst a hard publish failure.
+        Assert.DoesNotContain('{', script);
+        Assert.DoesNotContain('}', script);
+
+        // A newline turns the rendered YAML scalar into a block scalar, which does not survive the
+        // per-argument templating publishers use.
+        Assert.DoesNotContain('\n', script);
+        Assert.DoesNotContain('\r', script);
+
+        Assert.StartsWith("set -e;", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDoesNotInventAServiceNameOn0116()
+    {
+        // The shipped TelemetryOptions.ServiceName is left in place instead, so the gateway keeps
+        // the identity its own configuration specifies.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var env = await BuildEnvironmentVariablesAsync(SingleServerResource(app));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_NAME"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsLeavesAnEnvironmentOnlyServiceNameSubordinateToTheConfigurationFile()
+    {
+        // WithEnvironment is not a WithOpenTelemetryMetrics override, so the JSON identity is not
+        // removed and continues to win inside the gateway. The variable is still propagated.
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithEnvironment("OTEL_SERVICE_NAME", "caller-service")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var containerResource = SingleServerResource(app);
         var env = await BuildEnvironmentVariablesAsync(containerResource);
-
         Assert.Equal("caller-service", env["OTEL_SERVICE_NAME"]);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.DoesNotContain(".TelemetryOptions.ServiceName", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1755,54 +2338,103 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsRejects0116PublishMode()
+    public async Task WithOpenTelemetryMetricsPublishesADeployableManifestFor0116()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
-        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithOpenTelemetryMetrics();
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithOpenTelemetryMetrics(
+                    endpoint: "http://otel-collector:4317",
+                    exportInterval: TimeSpan.FromSeconds(30))
+                .WithImageTag("pg17-0.116.0"));
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => ManifestUtils.GetManifest(documentDB.Resource));
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
 
-        Assert.Contains("v0.116.0", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("SetupConfiguration.json", exception.Message, StringComparison.Ordinal);
+        // The published resource still names the official image; the compatibility override is
+        // carried entirely by manifest fields every publisher understands.
+        Assert.Equal(
+            "ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0",
+            resource!["image"]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+
+        var args = Assert.IsType<JsonArray>(resource["args"]);
+        Assert.Equal(3, args.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+
+        var script = args[1]?.GetValue<string>();
+        Assert.NotNull(script);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script!, StringComparison.Ordinal);
+        Assert.Contains($"exec {GatewayEntrypointScriptPath} \"$@\"", script!, StringComparison.Ordinal);
+
+        Assert.Equal("true", resource["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal("http://otel-collector:4317", resource["env"]?["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]?.GetValue<string>());
+        Assert.Equal("30000", resource["env"]?["OTEL_METRIC_EXPORT_INTERVAL"]?.GetValue<string>());
+        Assert.Null(resource["env"]?["OTEL_SERVICE_NAME"]);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsAllows0116PublishModeWhenDisabled()
+    public async Task WithOpenTelemetryMetricsPublishesAWrappedManifestWhenDisabled()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
-        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithOpenTelemetryMetrics()
-            .WithOpenTelemetryMetrics(enabled: false);
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithOpenTelemetryMetrics()
+                .WithOpenTelemetryMetrics(enabled: false));
 
-        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
 
-        Assert.Equal("false", manifest["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal("false", resource!["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
 
-        using var app = appBuilder.Build();
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-
-        Assert.Empty(entries);
+        // Disabling has to survive a configuration file that enables metrics from JSON, so the
+        // wrapper is published for the disabled case too.
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+        var args = Assert.IsType<JsonArray>(resource["args"]);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", args[1]!.GetValue<string>(), StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsRejects0116PublishModeWhenFinalCallEnablesMetrics()
+    public async Task WithOpenTelemetryMetricsPublishesAWrappedManifestForTheDefaultImage()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
-        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithOpenTelemetryMetrics(enabled: false)
-            .WithOpenTelemetryMetrics();
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB").WithOpenTelemetryMetrics());
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => ManifestUtils.GetManifest(documentDB.Resource));
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
 
-        Assert.Contains("v0.116.0", exception.Message, StringComparison.Ordinal);
+        Assert.Equal("true", resource!["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+        Assert.Equal(3, Assert.IsType<JsonArray>(resource["args"]).Count);
     }
 
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAnUnwrappedManifestForCustomImages()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage("contoso/documentdb-local", "pg17-0.116.0")
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Null(resource!["entrypoint"]);
+        Assert.Null(resource["args"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishForADigestPinnedOfficialImage()
+    {
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ManifestUtils.PublishManifestAsync(appBuilder =>
+                appBuilder.AddDocumentDB("DocumentDB")
+                    .WithImageTag("pg17-0.114.0")
+                    .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                    .WithOpenTelemetryMetrics()));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+    }
 
     [Fact]
     public async Task WithOwnerAddsEnvironmentVariable()
@@ -2626,19 +3258,67 @@ public class AddDocumentDBTests
         return environmentVariables;
     }
 
-    private static async Task<IReadOnlyList<ContainerFileSystemItem>> InvokeContainerFileCallbackAsync(
-        ContainerFileSystemCallbackAnnotation annotation,
-        DocumentDBServerResource resource,
-        IServiceProvider services)
-    {
-        var entries = await annotation.Callback(
-            new ContainerFileSystemCallbackContext
-            {
-                Model = resource,
-                Services = services,
-            },
-            CancellationToken.None);
+    /// <summary>
+    /// Creates a publish-mode builder for tests that raise <see cref="BeforeStartEvent"/>.
+    /// </summary>
+    /// <remarks>
+    /// Raising that event on a run-mode builder also runs Aspire's built-in DCP subscriber, which
+    /// requires a DCP installation these model-level tests deliberately do not have. The gateway
+    /// compatibility wrapper resolves identically in both modes, and the Docker suite covers what
+    /// run mode actually launches.
+    /// </remarks>
+    private static IDistributedApplicationBuilder CreateLifecycleTestBuilder() =>
+        DistributedApplication.CreateBuilder(["Publishing:Publisher=manifest", "Publishing:OutputPath=./"]);
 
-        return entries.ToList();
+    /// <summary>
+    /// Builds the application and raises <see cref="BeforeStartEvent"/>, which is the point at
+    /// which the OpenTelemetry gateway compatibility wrapper resolves the resource's final image.
+    /// Both the orchestrator and the manifest publisher raise it before they read the resource.
+    /// </summary>
+    private static async Task<DistributedApplication> BuildAndRaiseBeforeStartAsync(
+        IDistributedApplicationBuilder appBuilder)
+    {
+        var app = appBuilder.Build();
+
+        try
+        {
+            await RaiseBeforeStartAsync(app);
+        }
+        catch
+        {
+            app.Dispose();
+            throw;
+        }
+
+        return app;
+    }
+
+    private static async Task RaiseBeforeStartAsync(DistributedApplication app)
+    {
+        var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        await eventing.PublishAsync(new BeforeStartEvent(app.Services, model), CancellationToken.None);
+    }
+
+    private static DocumentDBServerResource SingleServerResource(DistributedApplication app) =>
+        Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+    private static async Task<IReadOnlyList<object>> BuildContainerArgsAsync(DocumentDBServerResource resource)
+    {
+        var args = new List<object>();
+
+        foreach (var annotation in resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>())
+        {
+            await annotation.Callback(new CommandLineArgsCallbackContext(args, resource, CancellationToken.None));
+        }
+
+        return args;
+    }
+
+    private static async Task<string> GetWrapperScriptAsync(DocumentDBServerResource resource)
+    {
+        var args = await BuildContainerArgsAsync(resource);
+        Assert.Equal(3, args.Count);
+        return Assert.IsType<string>(args[1]);
     }
 }
