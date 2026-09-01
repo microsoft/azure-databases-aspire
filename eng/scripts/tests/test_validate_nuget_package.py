@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import re
 import shutil
 import sys
 import unittest
@@ -14,6 +15,42 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = REPO_ROOT / "eng" / "scripts" / "validate-nuget-package.py"
+PUBLISH_GUARD = "if: github.event_name == 'push' && github.ref_type == 'tag'"
+KNOWN_PUBLISHING_STEPS = {"Push to NuGet", "Create GitHub Release"}
+PUBLISHING_COMMANDS = (
+    re.compile(r"\bdotnet\s+nuget\s+push\b"),
+    re.compile(r"\bgh\s+release\s+(?:create|edit|delete|upload)\b"),
+)
+
+
+def parse_workflow_steps(workflow: str) -> list[tuple[str, str]]:
+    steps = []
+    for step in workflow.split("      - name: ")[1:]:
+        name, body = step.split("\n", 1)
+        steps.append((name, body))
+    return steps
+
+
+def assert_publish_steps_guarded(workflow: str) -> list[tuple[str, str]]:
+    steps = parse_workflow_steps(workflow)
+    validation_indexes = [
+        index for index, (name, _) in enumerate(steps) if name == "Validate packed package"
+    ]
+    if len(validation_indexes) != 1:
+        raise AssertionError(
+            "Expected exactly one 'Validate packed package' step before publishing steps."
+        )
+
+    guard_line = f"        {PUBLISH_GUARD}"
+    for name, body in steps[validation_indexes[0] + 1 :]:
+        is_publishing = name in KNOWN_PUBLISHING_STEPS or any(
+            pattern.search(body) for pattern in PUBLISHING_COMMANDS
+        )
+        if is_publishing and body.splitlines().count(guard_line) != 1:
+            raise AssertionError(
+                f"Publishing step {name!r} must contain exactly this guard: {PUBLISH_GUARD}"
+            )
+    return steps
 
 
 def _load_script():
@@ -123,12 +160,7 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         cls.workflow = (REPO_ROOT / ".github" / "workflows" / "nuget-publish.yml").read_text(
             encoding="utf-8"
         )
-        cls.step_names = []
-        cls.steps = {}
-        for step in cls.workflow.split("      - name: ")[1:]:
-            name, body = step.split("\n", 1)
-            cls.step_names.append(name)
-            cls.steps[name] = body
+        cls.steps = parse_workflow_steps(cls.workflow)
 
     def test_tag_trigger_only_matches_package_style_tags(self):
         self.assertIn("- 'v[0-9]+.[0-9]+.[0-9]+'", self.workflow)
@@ -143,18 +175,66 @@ class NuGetPublishWorkflowTests(unittest.TestCase):
         self.assertLess(validation, nuget_push)
 
     def test_manual_dispatch_cannot_publish_or_create_a_release(self):
-        publish_guard = "if: github.event_name == 'push' && github.ref_type == 'tag'"
-        guard_line = f"        {publish_guard}"
+        steps = assert_publish_steps_guarded(self.workflow)
 
         for step_name in ("Push to NuGet", "Create GitHub Release"):
             with self.subTest(step=step_name):
-                self.assertIn(step_name, self.steps)
-                self.assertEqual(1, self.steps[step_name].splitlines().count(guard_line))
+                matching_steps = [body for name, body in steps if name == step_name]
+                self.assertTrue(matching_steps)
+                for body in matching_steps:
+                    self.assertEqual(
+                        1, body.splitlines().count(f"        {PUBLISH_GUARD}")
+                    )
 
-        upload_index = self.step_names.index("Upload artifact")
-        for step_name in self.step_names[upload_index + 1 :]:
-            with self.subTest(release_step=step_name):
-                self.assertEqual(1, self.steps[step_name].splitlines().count(guard_line))
+    def test_unguarded_nuget_push_before_artifact_upload_fails(self):
+        workflow = """jobs:
+  publish:
+    steps:
+      - name: Validate packed package
+        run: validate
+      - name: Early package publication
+        run: dotnet nuget push ./artifacts/*.nupkg
+      - name: Upload artifact
+        uses: actions/upload-artifact@sha
+"""
+
+        with self.assertRaisesRegex(AssertionError, "Early package publication"):
+            assert_publish_steps_guarded(workflow)
+
+    def test_duplicate_name_unguarded_release_step_fails(self):
+        workflow = f"""jobs:
+  publish:
+    steps:
+      - name: Validate packed package
+        run: validate
+      - name: Create GitHub Release
+        {PUBLISH_GUARD}
+        run: gh release create v1.2.3
+      - name: Create GitHub Release
+        run: gh release create v1.2.4
+"""
+
+        steps = parse_workflow_steps(workflow)
+        self.assertEqual(
+            ["Validate packed package", "Create GitHub Release", "Create GitHub Release"],
+            [name for name, _ in steps],
+        )
+        with self.assertRaisesRegex(AssertionError, "Create GitHub Release"):
+            assert_publish_steps_guarded(workflow)
+
+    def test_harmless_post_validation_steps_do_not_require_publish_guard(self):
+        workflow = """jobs:
+  publish:
+    steps:
+      - name: Validate packed package
+        run: validate
+      - name: Upload artifact
+        uses: actions/upload-artifact@sha
+      - name: Write job summary
+        run: echo "Validation complete" >> "$GITHUB_STEP_SUMMARY"
+"""
+
+        assert_publish_steps_guarded(workflow)
 
 
 if __name__ == "__main__":
