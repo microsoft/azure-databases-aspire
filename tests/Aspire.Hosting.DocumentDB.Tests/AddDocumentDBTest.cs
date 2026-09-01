@@ -34,6 +34,16 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public void NormalizeContainerLogsRemovesAnsiEscapeSequences()
+    {
+        var logs = "\u001B[2m2026-09-01T20:00:00Z\u001B[0m \u001B[34mDEBUG\u001B[0m documentdb_api.insert";
+
+        Assert.Equal(
+            "2026-09-01T20:00:00Z DEBUG documentdb_api.insert",
+            DocumentDBEndToEndSupport.NormalizeContainerLogs(logs));
+    }
+
+    [Fact]
     public void AddDocumentDBAddsHealthCheckAnnotationToResource()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
