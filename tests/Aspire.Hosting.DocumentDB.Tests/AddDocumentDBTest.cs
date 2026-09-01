@@ -22,12 +22,11 @@ public class AddDocumentDBTests
     private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
 
     /// <summary>
-    /// The metrics keys the wrapper always removes: this package owns the metrics signal, and any
-    /// surviving key would re-pin a setting ahead of the documented environment precedence.
+    /// The metrics object the wrapper always removes whole: this package owns the metrics signal,
+    /// and any surviving key - including one a later gateway release adds - would re-pin a setting
+    /// ahead of the documented environment precedence.
     /// </summary>
-    private const string MetricsBlockFilter =
-        "del(.TelemetryOptions.Metrics.Enabled, .TelemetryOptions.Metrics.OtlpEndpoint, " +
-        ".TelemetryOptions.Metrics.ExportIntervalMs, .TelemetryOptions.Metrics.ExportTimeoutMs";
+    private const string MetricsBlockFilter = "del(.TelemetryOptions.Metrics";
 
     [Fact]
     public void CombineStandardOutputAndErrorPreservesStreamBoundary()
@@ -859,9 +858,11 @@ public class AddDocumentDBTests
 
         var script = await GetWrapperScriptAsync(SingleServerResource(app));
 
-        // The whole metrics block goes, so the shipped OtlpEndpoint cannot beat
-        // OTEL_EXPORTER_OTLP_ENDPOINT and quietly export into the container itself.
+        // The metrics object goes whole, so the shipped OtlpEndpoint cannot beat
+        // OTEL_EXPORTER_OTLP_ENDPOINT and quietly export into the container itself, and no
+        // individual key is enumerated that a future gateway field could slip past.
         Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Metrics.", script, StringComparison.Ordinal);
 
         // The shared identity and the shipped (disabled) tracing block survive untouched.
         Assert.DoesNotContain(".TelemetryOptions.ServiceName", script, StringComparison.Ordinal);
@@ -892,9 +893,10 @@ public class AddDocumentDBTests
         var containerResource = SingleServerResource(app);
         var script = await GetWrapperScriptAsync(containerResource);
 
-        Assert.Contains(".TelemetryOptions.Metrics.OtlpEndpoint", script, StringComparison.Ordinal);
-        Assert.Contains(".TelemetryOptions.Metrics.ExportIntervalMs", script, StringComparison.Ordinal);
-        Assert.Contains(".TelemetryOptions.Metrics.ExportTimeoutMs", script, StringComparison.Ordinal);
+        // The object goes whole, so no key inside it - present or future - can survive to beat
+        // the environment.
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Metrics.", script, StringComparison.Ordinal);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         Assert.Equal("http://otel-collector:4317", env["OTEL_EXPORTER_OTLP_ENDPOINT"]);

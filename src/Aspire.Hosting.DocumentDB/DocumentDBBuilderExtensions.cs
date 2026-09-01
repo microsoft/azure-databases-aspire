@@ -112,13 +112,15 @@ public static class DocumentDBBuilderExtensions
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The whole <c>TelemetryOptions.Metrics</c> block is removed because this API owns the
-    /// metrics signal end to end. Leaving any of it behind would re-pin that setting ahead of the
-    /// documented environment precedence - notably the shipped
-    /// <c>OtlpEndpoint: http://localhost:4317</c>, which would beat
+    /// The <c>TelemetryOptions.Metrics</c> object is removed whole, not key by key, because this
+    /// API owns the metrics signal end to end. Any surviving key re-pins that setting ahead of
+    /// the documented environment precedence - the shipped
+    /// <c>OtlpEndpoint: http://localhost:4317</c> would beat
     /// <c>OTEL_EXPORTER_OTLP_METRICS_ENDPOINT</c> and <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> and
-    /// export metrics into the container itself. Removing them costs nothing on the stock image:
-    /// the values it ships are the gateway's own compiled-in defaults.
+    /// export metrics into the container itself - and enumerating the keys individually would
+    /// silently leave any field a later gateway release adds authoritative over the environment.
+    /// Removing the object costs nothing on the stock image: the values it ships are the
+    /// gateway's own compiled-in defaults.
     /// </para>
     /// <para>
     /// The identity keys are different: they are shared with tracing, and the shipped
@@ -130,13 +132,7 @@ public static class DocumentDBBuilderExtensions
     private static string BuildOpenTelemetryGatewayConfigurationFilter(
         OpenTelemetryGatewayConfigurationAnnotation configuration)
     {
-        var paths = new List<string>
-        {
-            ".TelemetryOptions.Metrics.Enabled",
-            ".TelemetryOptions.Metrics.OtlpEndpoint",
-            ".TelemetryOptions.Metrics.ExportIntervalMs",
-            ".TelemetryOptions.Metrics.ExportTimeoutMs",
-        };
+        var paths = new List<string> { ".TelemetryOptions.Metrics" };
 
         if (configuration.ServiceNameConfigured)
         {
@@ -837,10 +833,11 @@ public static class DocumentDBBuilderExtensions
     /// <para>
     /// The wrapper is applied for <c>enabled: false</c> as well, because a caller-supplied
     /// configuration file can turn metrics on from JSON and an explicit
-    /// <c>enabled: false</c> has to win. The whole <c>TelemetryOptions.Metrics</c> block is
-    /// removed, since this API owns that signal and any surviving key would re-pin a setting
-    /// ahead of the environment precedence documented below - including the
-    /// <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> fallback. The shared identity keys are removed only
+    /// <c>enabled: false</c> has to win. The <c>TelemetryOptions.Metrics</c> object is removed
+    /// whole, since this API owns that signal and any surviving key - including one a later
+    /// gateway release adds - would re-pin a setting ahead of the environment precedence
+    /// documented below, such as the <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> fallback. The shared
+    /// identity keys are removed only
     /// when the corresponding parameter was explicitly supplied on some call, and
     /// <c>TelemetryOptions.Tracing</c> is never touched, so the stock image keeps its shipped
     /// service identity and its disabled tracing.

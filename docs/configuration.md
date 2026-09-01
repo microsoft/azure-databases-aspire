@@ -291,20 +291,19 @@ container would otherwise have used, removes the keys the environment has to win
 
 | JSON key | Removed |
 |---|---|
-| `TelemetryOptions.Metrics.Enabled` | always |
-| `TelemetryOptions.Metrics.OtlpEndpoint` | always |
-| `TelemetryOptions.Metrics.ExportIntervalMs` | always |
-| `TelemetryOptions.Metrics.ExportTimeoutMs` | always |
+| `TelemetryOptions.Metrics` (the whole object, every key inside it) | always |
 | `TelemetryOptions.ServiceName` | only when `serviceName` was supplied |
 | `TelemetryOptions.ServiceVersion` | only when `serviceVersion` was supplied |
 | `TelemetryOptions.Tracing` (and everything else) | never |
 
-The whole `TelemetryOptions.Metrics` block goes because this method owns the metrics signal end to
-end. Any surviving key would re-pin that setting ahead of the environment precedence documented
-above — in particular the shipped `OtlpEndpoint: http://localhost:4317` would beat both
+The `TelemetryOptions.Metrics` object is removed whole — not key by key — because this method owns
+the metrics signal end to end. Any surviving key would re-pin that setting ahead of the environment
+precedence documented above: the shipped `OtlpEndpoint: http://localhost:4317` would beat both
 `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and `OTEL_EXPORTER_OTLP_ENDPOINT` and export metrics into the
-DocumentDB container itself. Removing them costs nothing on the stock image: the values it ships
-are byte-identical to the gateway's own compiled-in defaults.
+DocumentDB container itself, and enumerating today's keys individually would silently leave any
+field a future gateway release adds authoritative over the environment. Removing the object costs
+nothing on the stock image: the values it ships are byte-identical to the gateway's own compiled-in
+defaults.
 
 The identity keys are treated differently because the gateway shares one OpenTelemetry `Resource`
 across signals and the shipped `ServiceName` is *not* the gateway's compiled-in default, so
@@ -320,7 +319,8 @@ its shipped identity and its disabled tracing. No default identity is injected o
 
 **`enabled: false` is wrapped too.** A configuration file can switch metrics on from JSON, which
 would beat `OTEL_METRICS_ENABLED=false`. Disabling metrics therefore installs the same wrapper and
-removes `TelemetryOptions.Metrics.Enabled`, so an explicit `enabled: false` actually disables them.
+removes the `TelemetryOptions.Metrics` object, so an explicit `enabled: false` actually disables
+them.
 
 **Publishing.** The wrapper is expressed entirely as the container `entrypoint` and `args`, the
 only file-shaped mechanisms that round-trip through the Aspire manifest. Consequently:

@@ -135,9 +135,8 @@ entrypoint.
    explicit `endpoint:`. The gateway default (`http://localhost:4317`) resolves to the DocumentDB
    container itself.
 2. Check the gateway startup line in the container logs. It prints the resolved configuration; on
-   `0.116.0` and later a working setup shows `metrics: Some(MetricsOptions { enabled: None ... })`
-   inside `telemetry_options`, meaning the JSON no longer pins the flag and the environment
-   decides.
+   `0.116.0` and later a working setup shows `metrics: None` inside `telemetry_options`, meaning
+   the JSON no longer pins anything about metrics and the environment decides.
 3. `aspire-documentdb -- ...` on the first lines of the container log means the wrapper could not
    read the gateway configuration or could not find `jq`. The wrapper only ever applies to the
    official `documentdb/documentdb-local` image path, so this means a mirror or re-tag reuses that

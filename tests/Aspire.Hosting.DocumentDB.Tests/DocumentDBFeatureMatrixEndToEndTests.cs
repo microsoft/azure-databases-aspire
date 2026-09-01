@@ -530,10 +530,8 @@ public class DocumentDBFeatureMatrixEndToEndTests
             Assert.Equal(3, command.Length);
             Assert.Equal("-c", command[0]);
             Assert.Equal("--", command[2]);
-            Assert.Contains(
-                "del(.TelemetryOptions.Metrics.Enabled, .TelemetryOptions.Metrics.OtlpEndpoint",
-                command[1],
-                StringComparison.Ordinal);
+            Assert.Contains("del(.TelemetryOptions.Metrics", command[1], StringComparison.Ordinal);
+            Assert.DoesNotContain(".TelemetryOptions.Metrics.", command[1], StringComparison.Ordinal);
 
             // Without the wrapper the shipped SetupConfiguration.json would still pin metrics off,
             // and the gateway would report telemetry_options carrying a Metrics section.
@@ -541,13 +539,11 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 containerId,
                 "Starting server with configuration",
                 cts.Token);
-            // Every metrics key this scenario overrides is gone from the JSON, so the
-            // OTEL_* variables decide; the identity keys go with them because the scenario
-            // supplies serviceName and serviceVersion explicitly.
+            // The metrics object is gone from the JSON entirely, so the OTEL_* variables decide;
+            // the identity keys go with it because the scenario supplies serviceName and
+            // serviceVersion explicitly.
             Assert.Contains(
-                "service_name: None, service_version: None, " +
-                "metrics: Some(MetricsOptions { enabled: None, otlp_endpoint: None, " +
-                "export_interval_ms: None, export_timeout_ms: None })",
+                "service_name: None, service_version: None, metrics: None",
                 gatewayLogs,
                 StringComparison.Ordinal);
 
@@ -694,10 +690,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
             // The published entrypoint has to leave the gateway with no JSON metrics pin, while
             // the tracing block this package does not manage stays exactly as shipped.
-            Assert.Contains(
-                "metrics: Some(MetricsOptions { enabled: None",
-                logs,
-                StringComparison.Ordinal);
+            Assert.Contains("metrics: None", logs, StringComparison.Ordinal);
             Assert.Contains("tracing: Some(TracingOptions { enabled: Some(false)", logs, StringComparison.Ordinal);
 
             // Identity is only taken from the caller when the caller asked for it; otherwise the
@@ -866,8 +859,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
             // survives because no serviceName override was supplied.
             Assert.Contains("service_name: Some(\"aspire-custom-config\")", logs, StringComparison.Ordinal);
 
-            // ...and the Enabled: true it declared has been removed, so the environment decides.
-            Assert.Contains("metrics: Some(MetricsOptions { enabled: None", logs, StringComparison.Ordinal);
+            // ...and the Metrics object that declared Enabled: true is gone, so the environment
+            // decides.
+            Assert.Contains("metrics: None", logs, StringComparison.Ordinal);
 
             await WaitForContainerLogAsync(containerName, "Gateway is ready", cts.Token);
 
