@@ -530,7 +530,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
             Assert.Equal(3, command.Length);
             Assert.Equal("-c", command[0]);
             Assert.Equal("--", command[2]);
-            Assert.Contains("del(.TelemetryOptions.Metrics", command[1], StringComparison.Ordinal);
+            Assert.Contains(
+                "del(.TelemetryOptions.Metrics.Enabled, .TelemetryOptions.Metrics.OtlpEndpoint",
+                command[1],
+                StringComparison.Ordinal);
 
             // Without the wrapper the shipped SetupConfiguration.json would still pin metrics off,
             // and the gateway would report telemetry_options carrying a Metrics section.
@@ -538,8 +541,13 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 containerId,
                 "Starting server with configuration",
                 cts.Token);
+            // Every metrics key this scenario overrides is gone from the JSON, so the
+            // OTEL_* variables decide; the identity keys go with them because the scenario
+            // supplies serviceName and serviceVersion explicitly.
             Assert.Contains(
-                "service_name: None, service_version: None, metrics: None",
+                "service_name: None, service_version: None, " +
+                "metrics: Some(MetricsOptions { enabled: None, otlp_endpoint: None, " +
+                "export_interval_ms: None, export_timeout_ms: None })",
                 gatewayLogs,
                 StringComparison.Ordinal);
 
@@ -555,23 +563,60 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
-    [Fact]
-    public async Task ThePublishedManifestForOpenTelemetryMetricsRunsTheCandidateImage()
+    [Theory]
+    // No serviceName override: the shipped TelemetryOptions.ServiceName must survive.
+    [InlineData(null, "documentdb_gateway")]
+    // Explicit serviceName override: the shared JSON identity is removed so the variable wins.
+    [InlineData("aspire-documentdb-publish", "aspire-documentdb-publish")]
+    public async Task ThePublishedManifestForOpenTelemetryMetricsExportsMetricsFromTheCandidateImage(
+        string? serviceName,
+        string expectedServiceName)
     {
         // The manifest is what azd deploys. Running exactly what it names - image, entrypoint,
-        // args and environment - is the only assertion that proves the published artifact is
-        // deployable rather than merely well-formed.
+        // args and environment - against a real collector is the only assertion that proves the
+        // published artifact is deployable and that metrics actually leave the gateway. If the
+        // wrapper were dropped, the shipped SetupConfiguration.json would keep metrics off and no
+        // metric would ever arrive, so this fails rather than passing vacuously.
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
 
+        var suffix = Guid.NewGuid().ToString("N");
+        var networkName = $"aspire-documentdb-otel-{suffix}";
+        var collectorName = $"otel-collector-{suffix}";
+        var containerName = $"aspire-documentdb-publish-{suffix}";
+        var outputPath = Path.Combine(AppContext.BaseDirectory, "published-otel", suffix);
+        var metricsPath = Path.Combine(outputPath, "metrics.json");
+        var password = "Aspire-Publish-Pass1";
+
+        // The collector is addressed by container name on a user-defined network, so the endpoint
+        // baked into the manifest is the one the deployed container actually resolves.
+        var collectorEndpoint = $"http://{collectorName}:4317";
+
         var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
-            appBuilder.AddDocumentDB("documentdb")
-                .WithOpenTelemetryMetrics(
-                    endpoint: "http://127.0.0.1:4317",
+        {
+            var documentDB = appBuilder.AddDocumentDB("documentdb");
+
+            if (serviceName is null)
+            {
+                // No typed endpoint either: this half also proves the generic
+                // OTEL_EXPORTER_OTLP_ENDPOINT fallback still reaches the gateway, which it cannot
+                // if the shipped Metrics.OtlpEndpoint survives in the configuration file.
+                documentDB
+                    .WithEnvironment("OTEL_EXPORTER_OTLP_ENDPOINT", collectorEndpoint)
+                    .WithEnvironment("OTEL_METRIC_EXPORT_INTERVAL", "1000")
+                    .WithOpenTelemetryMetrics();
+            }
+            else
+            {
+                documentDB.WithOpenTelemetryMetrics(
+                    endpoint: collectorEndpoint,
                     exportInterval: TimeSpan.FromSeconds(1),
-                    serviceName: "aspire-documentdb-publish")
-                .WithImageTag(CandidateTag(17)));
+                    serviceName: serviceName);
+            }
+
+            documentDB.WithImageTag(CandidateTag(17));
+        });
 
         var resource = manifest["resources"]?["documentdb"];
         Assert.NotNull(resource);
@@ -582,15 +627,20 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var entrypoint = resource["entrypoint"]?.GetValue<string>();
         Assert.False(string.IsNullOrEmpty(entrypoint));
 
-        var containerName = $"aspire-documentdb-publish-{Guid.NewGuid():N}";
-        var password = "Aspire-Publish-Pass1";
+        var environment = Assert.IsType<JsonObject>(resource["env"]);
+        Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal(
+            collectorEndpoint,
+            environment[serviceName is null ? "OTEL_EXPORTER_OTLP_ENDPOINT" : "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]
+                ?.GetValue<string>());
 
         var dockerArguments = new List<string>
         {
-            "run", "--detach", "--name", containerName, "--entrypoint", entrypoint!,
+            "run", "--detach", "--name", containerName, "--network", networkName,
+            "--entrypoint", entrypoint!,
         };
 
-        foreach (var (name, value) in Assert.IsType<JsonObject>(resource["env"]))
+        foreach (var (name, value) in environment)
         {
             var text = value?.GetValue<string>() ?? string.Empty;
 
@@ -611,34 +661,243 @@ public class DocumentDBFeatureMatrixEndToEndTests
             dockerArguments.Add(argument!.GetValue<string>());
         }
 
-        // Pull explicitly: 'docker run' would pull implicitly, but this image is multiple
-        // gigabytes and the default per-command budget is sized for fast control-plane calls.
-        var (pullExitCode, pullOutput) = await RunDockerAsync(TimeSpan.FromMinutes(10), "pull", image!);
-        Assert.True(pullExitCode == 0, $"docker pull failed with exit code {pullExitCode}: {pullOutput}");
+        var collectorConfigPath = CreateOtelCollectorConfigurationFile(outputPath);
+
+        // Pull explicitly: 'docker run' would pull implicitly, but these images are large and the
+        // default per-command budget is sized for fast control-plane calls.
+        await PullImageAsync(image!);
+        await PullImageAsync(OtelCollectorImage);
+
+        var (networkExitCode, networkOutput) = await RunDockerAsync("network", "create", networkName);
+        Assert.True(networkExitCode == 0, $"docker network create failed: {networkOutput}");
+
+        string[] documentDBVolumes = [];
+        var removed = false;
 
         try
         {
+            var (collectorExitCode, collectorOutput) = await RunDockerAsync(
+                "run", "--detach", "--name", collectorName, "--network", networkName,
+                "--user", "0:0",
+                "--volume", $"{collectorConfigPath}:/etc/otelcol-contrib/config.yaml:ro",
+                "--volume", $"{outputPath}:/var/lib/otel",
+                OtelCollectorImage,
+                "--config=/etc/otelcol-contrib/config.yaml");
+            Assert.True(collectorExitCode == 0, $"docker run (collector) failed: {collectorOutput}");
+
             var (exitCode, output) = await RunDockerAsync([.. dockerArguments]);
             Assert.True(exitCode == 0, $"docker run failed with exit code {exitCode}: {output}");
 
+            documentDBVolumes = await GetContainerVolumeNamesAsync(containerName);
+
             var logs = await WaitForContainerLogAsync(containerName, "Starting server with configuration", cts.Token);
 
-            // The published entrypoint has to leave the gateway with no JSON telemetry pin, so the
-            // OTEL_* environment variables the manifest carries are the ones that take effect.
+            // The published entrypoint has to leave the gateway with no JSON metrics pin, while
+            // the tracing block this package does not manage stays exactly as shipped.
             Assert.Contains(
-                "service_name: None, service_version: None, metrics: None",
+                "metrics: Some(MetricsOptions { enabled: None",
+                logs,
+                StringComparison.Ordinal);
+            Assert.Contains("tracing: Some(TracingOptions { enabled: Some(false)", logs, StringComparison.Ordinal);
+
+            // Identity is only taken from the caller when the caller asked for it; otherwise the
+            // configuration file keeps the value it shipped with.
+            Assert.Contains(
+                serviceName is null
+                    ? "service_name: Some(\"documentdb_gateway\")"
+                    : "service_name: None",
                 logs,
                 StringComparison.Ordinal);
 
-            // Tracing is not managed by this package and must keep its shipped default.
-            Assert.Contains("tracing: Some(TracingOptions { enabled: Some(false)", logs, StringComparison.Ordinal);
+            // gateway.starts is emitted once the gateway is ready, so it needs no database
+            // traffic and cannot be produced by anything other than a live metrics pipeline.
+            var metrics = await WaitForFileContainingAsync(metricsPath, "gateway.starts", cts.Token);
+            Assert.Contains(expectedServiceName, metrics, StringComparison.Ordinal);
 
-            var running = await WaitForContainerLogAsync(containerName, "Gateway is ready", cts.Token);
-            Assert.Contains("Gateway is ready", running, StringComparison.Ordinal);
+            if (serviceName is null)
+            {
+                Assert.DoesNotContain("aspire-documentdb-publish", metrics, StringComparison.Ordinal);
+            }
+
+            // Teardown is asserted on the success path only: an assertion inside finally would
+            // replace whatever the test was actually diagnosing.
+            await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+            removed = true;
+            await AssertVolumesRemovedAsync(documentDBVolumes);
         }
         finally
         {
-            await RunDockerAsync("rm", "--force", containerName);
+            try
+            {
+                if (!removed)
+                {
+                    await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+                }
+            }
+            finally
+            {
+                TryDeleteDirectory(outputPath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task DisabledOpenTelemetryMetricsBeatAConfigurationFileThatEnablesThem()
+    {
+        // The gateway resolves telemetry as JSON > environment, so a configuration file the caller
+        // points CONFIG_DIR at can switch metrics on and OTEL_METRICS_ENABLED=false alone would
+        // lose. The wrapper therefore has to be installed for the disabled case too.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var networkName = $"aspire-documentdb-otel-{suffix}";
+        var collectorName = $"otel-collector-{suffix}";
+        var containerName = $"aspire-documentdb-disabled-{suffix}";
+        var outputPath = Path.Combine(AppContext.BaseDirectory, "published-otel", suffix);
+        var configPath = Path.Combine(outputPath, "config");
+        var metricsPath = Path.Combine(outputPath, "metrics.json");
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("documentdb")
+                .WithEnvironment("CONFIG_DIR", "/custom-config")
+                .WithOpenTelemetryMetrics(enabled: false)
+                .WithImageTag(CandidateTag(17)));
+
+        var resource = manifest["resources"]?["documentdb"];
+        Assert.NotNull(resource);
+
+        var image = resource!["image"]?.GetValue<string>();
+        var entrypoint = resource["entrypoint"]?.GetValue<string>();
+        Assert.False(string.IsNullOrEmpty(entrypoint));
+
+        var environment = Assert.IsType<JsonObject>(resource["env"]);
+        Assert.Equal("false", environment["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal("/custom-config", environment["CONFIG_DIR"]?.GetValue<string>());
+
+        var collectorConfigPath = CreateOtelCollectorConfigurationFile(outputPath);
+        Directory.CreateDirectory(configPath);
+        await File.WriteAllTextAsync(
+            Path.Combine(configPath, "SetupConfiguration.json"),
+            $$"""
+            {
+              "NodeHostName": "localhost",
+              "BlockedRolePrefixes": ["documentdb", "citus", "pg", "internal_role"],
+              "PostgresPort": 9712,
+              "GatewayListenPort": 10260,
+              "HostConfigurationWatchIntervalMs": 1000,
+              "CertificateOptions": { "CertType": "PemAutoGenerated" },
+              "UseLocalHost": false,
+              "TelemetryOptions": {
+                "ServiceName": "aspire-custom-config",
+                "Metrics": {
+                  "Enabled": true,
+                  "OtlpEndpoint": "http://{{collectorName}}:4317",
+                  "ExportIntervalMs": 1000
+                },
+                "Tracing": {
+                  "Enabled": false,
+                  "OtlpEndpoint": "http://localhost:4317",
+                  "SamplerRatio": 1.0,
+                  "ExportTimeoutMs": 10000
+                }
+              }
+            }
+            """,
+            cts.Token);
+
+        var dockerArguments = new List<string>
+        {
+            "run", "--detach", "--name", containerName, "--network", networkName,
+            "--volume", $"{configPath}:/custom-config:ro",
+            "--entrypoint", entrypoint!,
+        };
+
+        foreach (var (name, value) in environment)
+        {
+            var text = value?.GetValue<string>() ?? string.Empty;
+
+            if (string.Equals(name, "PASSWORD", StringComparison.Ordinal))
+            {
+                text = "Aspire-Disabled-Pass1";
+            }
+
+            Assert.DoesNotContain('{', text);
+            dockerArguments.Add("--env");
+            dockerArguments.Add($"{name}={text}");
+        }
+
+        dockerArguments.Add(image!);
+
+        foreach (var argument in Assert.IsType<JsonArray>(resource["args"]))
+        {
+            dockerArguments.Add(argument!.GetValue<string>());
+        }
+
+        await PullImageAsync(image!);
+        await PullImageAsync(OtelCollectorImage);
+
+        var (networkExitCode, networkOutput) = await RunDockerAsync("network", "create", networkName);
+        Assert.True(networkExitCode == 0, $"docker network create failed: {networkOutput}");
+
+        string[] documentDBVolumes = [];
+        var removed = false;
+
+        try
+        {
+            var (collectorExitCode, collectorOutput) = await RunDockerAsync(
+                "run", "--detach", "--name", collectorName, "--network", networkName,
+                "--user", "0:0",
+                "--volume", $"{collectorConfigPath}:/etc/otelcol-contrib/config.yaml:ro",
+                "--volume", $"{outputPath}:/var/lib/otel",
+                OtelCollectorImage,
+                "--config=/etc/otelcol-contrib/config.yaml");
+            Assert.True(collectorExitCode == 0, $"docker run (collector) failed: {collectorOutput}");
+
+            var (exitCode, output) = await RunDockerAsync([.. dockerArguments]);
+            Assert.True(exitCode == 0, $"docker run failed with exit code {exitCode}: {output}");
+
+            documentDBVolumes = await GetContainerVolumeNamesAsync(containerName);
+
+            var logs = await WaitForContainerLogAsync(containerName, "Starting server with configuration", cts.Token);
+
+            // The caller's file really is the source the wrapper derived from: its service name
+            // survives because no serviceName override was supplied.
+            Assert.Contains("service_name: Some(\"aspire-custom-config\")", logs, StringComparison.Ordinal);
+
+            // ...and the Enabled: true it declared has been removed, so the environment decides.
+            Assert.Contains("metrics: Some(MetricsOptions { enabled: None", logs, StringComparison.Ordinal);
+
+            await WaitForContainerLogAsync(containerName, "Gateway is ready", cts.Token);
+
+            // Well past the 1s export interval the file exporter has still written nothing:
+            // metrics really are off.
+            await Task.Delay(TimeSpan.FromSeconds(20), cts.Token);
+            Assert.False(
+                File.Exists(metricsPath) &&
+                (await File.ReadAllTextAsync(metricsPath, cts.Token)).Contains("gateway.starts", StringComparison.Ordinal),
+                "Metrics were exported even though WithOpenTelemetryMetrics(enabled: false) was configured.");
+
+            // Teardown is asserted on the success path only: an assertion inside finally would
+            // replace whatever the test was actually diagnosing.
+            await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+            removed = true;
+            await AssertVolumesRemovedAsync(documentDBVolumes);
+        }
+        finally
+        {
+            try
+            {
+                if (!removed)
+                {
+                    await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+                }
+            }
+            finally
+            {
+                TryDeleteDirectory(outputPath);
+            }
         }
     }
 
@@ -863,6 +1122,78 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    private const string OtelCollectorImage = "otel/opentelemetry-collector-contrib:0.130.1";
+
+    /// <summary>
+    /// Removes the containers and the user-defined network a collector-backed scenario created.
+    /// <c>--volumes</c> matters: the DocumentDB image declares <c>/data</c> as a <c>VOLUME</c>, so
+    /// a plain <c>rm</c> strands one anonymous volume per run.
+    /// </summary>
+    private static async Task RemoveDockerResourcesAsync(string networkName, params string[] containerNames)
+    {
+        foreach (var containerName in containerNames)
+        {
+            await RunDockerAsync("rm", "--force", "--volumes", containerName);
+        }
+
+        await RunDockerAsync("network", "rm", networkName);
+    }
+
+    private static async Task AssertVolumesRemovedAsync(string[] volumes)
+    {
+        foreach (var volume in volumes)
+        {
+            var (exitCode, _) = await RunDockerAsync("volume", "inspect", volume);
+            Assert.True(
+                exitCode != 0,
+                $"Anonymous volume '{volume}' outlived the container it was created for.");
+        }
+    }
+
+    private static async Task PullImageAsync(string image)
+    {
+        var (exitCode, output) = await RunDockerAsync(TimeSpan.FromMinutes(10), "pull", image);
+        Assert.True(exitCode == 0, $"docker pull {image} failed with exit code {exitCode}: {output}");
+    }
+
+    /// <summary>
+    /// Names of the volumes Docker created for a container, which for this image is the anonymous
+    /// volume backing the declared <c>/data</c> mount point.
+    /// </summary>
+    private static async Task<string[]> GetContainerVolumeNamesAsync(string containerId)
+    {
+        var (exitCode, output) = await RunDockerAsync(
+            "inspect", containerId, "--format", "{{range .Mounts}}{{println .Name}}{{end}}");
+
+        Assert.Equal(0, exitCode);
+
+        return [.. output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
+    }
+
+    private static string CreateOtelCollectorConfigurationFile(string outputPath)
+    {
+        Directory.CreateDirectory(outputPath);
+
+        var configPath = Path.Combine(outputPath, "otel-collector.yaml");
+        File.WriteAllText(configPath, """
+            receivers:
+              otlp:
+                protocols:
+                  grpc:
+                    endpoint: 0.0.0.0:4317
+            exporters:
+              file:
+                path: /var/lib/otel/metrics.json
+            service:
+              pipelines:
+                metrics:
+                  receivers: [otlp]
+                  exporters: [file]
+            """);
+
+        return configPath;
+    }
 
     private static async Task<string[]> GetContainerConfigListAsync(string containerId, string field)
     {

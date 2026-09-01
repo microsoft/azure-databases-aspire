@@ -17,7 +17,16 @@ public static class DocumentDBBuilderExtensions
 {
     private sealed class OpenTelemetryGatewayConfigurationAnnotation : IResourceAnnotation
     {
-        public bool MetricsEnabled { get; set; }
+        public bool ServiceNameConfigured { get; set; }
+        public bool ServiceVersionConfigured { get; set; }
+        public bool EntrypointOwned { get; set; }
+    }
+
+    private enum GatewayConfigurationRequirement
+    {
+        NotConfigured,
+        NotApplicable,
+        Required,
     }
 
     // default internal port is 10260.
@@ -49,27 +58,98 @@ public static class DocumentDBBuilderExtensions
 
     private const string DefaultMountedDataPath = "/data";
     private const string InitDataMountPath = "/init_doc_db.d";
-    private const string GatewayConfigurationDirectory = "/home/documentdb/gateway/pg_documentdb_gw";
+    private const string DefaultGatewayHome = "/home/documentdb/gateway";
+    private const string PackagedGatewayConfigurationDirectory = "/etc/documentdb/gateway";
+    private const string PackagedLayoutProbeScript = "/usr/share/documentdb/scripts/start_oss_server.sh";
+    private const string PackagedLayoutProbeUtils = "/usr/share/documentdb/scripts/utils.sh";
     private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
     private const string GatewayConfigurationShell = "/bin/bash";
     private const string GatewayConfigurationShellArgumentZero = "--";
-    private const string DefaultOpenTelemetryServiceName = "documentdb_gateway";
 
-    // Single-line and brace-free on purpose. Publishers post-process container arguments: azd
-    // evaluates '{...}' in every argument as a manifest binding expression before rendering, so a
-    // shell '${VAR:-default}' is either passed through by luck or rejected outright, and a newline
-    // turns the rendered YAML scalar into a block scalar.
-    private static readonly string OpenTelemetryGatewayConfigurationScript =
+    /// <summary>
+    /// Builds the wrapper script that makes the OpenTelemetry environment variables this package
+    /// writes authoritative over the gateway's <c>SetupConfiguration.json</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The configuration directory is resolved exactly the way the image's own entrypoint resolves
+    /// it: an explicit <c>CONFIG_DIR</c> first, then the packaged layout at
+    /// <c>/etc/documentdb/gateway</c> when the scripts that layout is keyed on are present, then
+    /// <c>$GATEWAY_HOME/pg_documentdb_gw</c> with the upstream <c>GATEWAY_HOME</c> default. Any
+    /// other resolution would sanitize a file the gateway does not read.
+    /// </para>
+    /// <para>
+    /// Single-line and brace-free on purpose. Publishers post-process container arguments: azd
+    /// evaluates <c>{...}</c> in every argument as a manifest binding expression, so a shell
+    /// <c>${VAR:-default}</c> is either passed through by luck or rejected outright, and a newline
+    /// turns the rendered YAML scalar into a block scalar.
+    /// </para>
+    /// </remarks>
+    private static string BuildOpenTelemetryGatewayConfigurationScript(
+        OpenTelemetryGatewayConfigurationAnnotation configuration) =>
         "set -e; " +
         "c=\"$CONFIG_DIR\"; " +
-        $"if [ -z \"$c\" ]; then c={GatewayConfigurationDirectory}; fi; " +
+        "if [ -z \"$c\" ]; then " +
+            $"if [ -f \"{PackagedLayoutProbeScript}\" ] && [ -f \"{PackagedLayoutProbeUtils}\" ]; then " +
+                $"c=\"{PackagedGatewayConfigurationDirectory}\"; " +
+            "else " +
+                "g=\"$GATEWAY_HOME\"; " +
+                $"if [ -z \"$g\" ]; then g=\"{DefaultGatewayHome}\"; fi; " +
+                "c=\"$g/pg_documentdb_gw\"; " +
+            "fi; " +
+        "fi; " +
         "s=\"$c/SetupConfiguration.json\"; " +
         "if [ ! -r \"$s\" ]; then echo \"aspire-documentdb -- gateway configuration $s is missing or unreadable\" >&2; exit 1; fi; " +
         "if ! command -v jq >/dev/null 2>&1; then echo \"aspire-documentdb -- jq is required to make the OpenTelemetry environment variables authoritative\" >&2; exit 1; fi; " +
         "o=\"$(mktemp -d)\"; " +
-        "jq 'del(.TelemetryOptions.Metrics, .TelemetryOptions.ServiceName, .TelemetryOptions.ServiceVersion)' \"$s\" >\"$o/SetupConfiguration.json\"; " +
+        $"jq '{BuildOpenTelemetryGatewayConfigurationFilter(configuration)}' \"$s\" >\"$o/SetupConfiguration.json\"; " +
         "export CONFIG_DIR=\"$o\"; " +
         $"exec {GatewayEntrypointScriptPath} \"$@\"";
+
+    /// <summary>
+    /// Builds the <c>jq</c> filter that removes exactly the <c>SetupConfiguration.json</c> keys
+    /// this package's environment variables have to win over, and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The whole <c>TelemetryOptions.Metrics</c> block is removed because this API owns the
+    /// metrics signal end to end. Leaving any of it behind would re-pin that setting ahead of the
+    /// documented environment precedence - notably the shipped
+    /// <c>OtlpEndpoint: http://localhost:4317</c>, which would beat
+    /// <c>OTEL_EXPORTER_OTLP_METRICS_ENDPOINT</c> and <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> and
+    /// export metrics into the container itself. Removing them costs nothing on the stock image:
+    /// the values it ships are the gateway's own compiled-in defaults.
+    /// </para>
+    /// <para>
+    /// The identity keys are different: they are shared with tracing, and the shipped
+    /// <c>ServiceName</c> is not the gateway's compiled-in default, so removing it would silently
+    /// rename every signal. They are removed only when the caller explicitly supplied the
+    /// corresponding parameter. <c>TelemetryOptions.Tracing</c> is never touched.
+    /// </para>
+    /// </remarks>
+    private static string BuildOpenTelemetryGatewayConfigurationFilter(
+        OpenTelemetryGatewayConfigurationAnnotation configuration)
+    {
+        var paths = new List<string>
+        {
+            ".TelemetryOptions.Metrics.Enabled",
+            ".TelemetryOptions.Metrics.OtlpEndpoint",
+            ".TelemetryOptions.Metrics.ExportIntervalMs",
+            ".TelemetryOptions.Metrics.ExportTimeoutMs",
+        };
+
+        if (configuration.ServiceNameConfigured)
+        {
+            paths.Add(".TelemetryOptions.ServiceName");
+        }
+
+        if (configuration.ServiceVersionConfigured)
+        {
+            paths.Add(".TelemetryOptions.ServiceVersion");
+        }
+
+        return $"del({string.Join(", ", paths)})";
+    }
 
     /// <summary>
     /// Adds a DocumentDB resource to the application model. A container is used for local development.
@@ -744,23 +824,44 @@ public static class DocumentDBBuilderExtensions
     /// flips it to <c>true</c> unless <paramref name="enabled"/> is explicitly set to <c>false</c>.
     /// </para>
     /// <para>
-    /// Starting with DocumentDB v0.116-0, the gateway reads telemetry settings from
-    /// <c>SetupConfiguration.json</c> in preference to the standard OpenTelemetry environment
-    /// variables, and the shipped file pins metrics off. When metrics are enabled on an official
-    /// <c>documentdb-local</c> image of that version or later, this method therefore wraps the
-    /// container entrypoint so the container starts from a copy of that configuration with the
-    /// metrics, service-name and service-version keys removed, leaving the environment variables
-    /// documented below authoritative. Tracing keeps the upstream default (off) because this
-    /// package does not configure it. A caller-supplied <c>CONFIG_DIR</c> is honoured as the
-    /// source of that copy.
+    /// Starting with DocumentDB v0.116-0, the gateway resolves telemetry settings as
+    /// <em>JSON &gt; environment variable &gt; default</em>, reading them from
+    /// <c>SetupConfiguration.json</c>, and the shipped file pins metrics off. Whenever this method
+    /// is called against an official <c>documentdb-local</c> image of that version or later, it
+    /// therefore wraps the container entrypoint so the container starts from a copy of that
+    /// configuration with the shadowing keys removed. The copy is derived from the same directory
+    /// the image's own entrypoint would read: an explicit <c>CONFIG_DIR</c>, else the packaged
+    /// <c>/etc/documentdb/gateway</c> layout when present, else
+    /// <c>$GATEWAY_HOME/pg_documentdb_gw</c>.
+    /// </para>
+    /// <para>
+    /// The wrapper is applied for <c>enabled: false</c> as well, because a caller-supplied
+    /// configuration file can turn metrics on from JSON and an explicit
+    /// <c>enabled: false</c> has to win. The whole <c>TelemetryOptions.Metrics</c> block is
+    /// removed, since this API owns that signal and any surviving key would re-pin a setting
+    /// ahead of the environment precedence documented below - including the
+    /// <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> fallback. The shared identity keys are removed only
+    /// when the corresponding parameter was explicitly supplied on some call, and
+    /// <c>TelemetryOptions.Tracing</c> is never touched, so the stock image keeps its shipped
+    /// service identity and its disabled tracing.
+    /// </para>
+    /// <para>
+    /// Because the gateway builds one OpenTelemetry <c>Resource</c> for all signals, supplying
+    /// <paramref name="serviceName"/> or <paramref name="serviceVersion"/> removes the shared
+    /// JSON identity and therefore changes the identity of exported traces too, not only metrics.
+    /// Omit them to keep the identity the configuration file specifies.
     /// </para>
     /// <para>
     /// The wrapper is expressed purely as the container <c>entrypoint</c> and <c>args</c>, both of
     /// which round-trip through the Aspire manifest, so publish mode, <c>azd</c> and direct run
-    /// mode all execute the same thing. Explicitly disabled metrics, custom images and tags
-    /// outside the <c>pg{NN}-X.Y.Z</c> grammar are left completely untouched. The wrapper needs
-    /// <c>bash</c> and <c>jq</c>, which the official image provides; it fails the container start
-    /// with a diagnostic rather than starting without metrics if either is missing.
+    /// mode all execute the same thing. Custom images and tags outside the <c>pg{NN}-X.Y.Z</c>
+    /// grammar are left completely untouched; private mirrors of the official image are not,
+    /// because only the registry differs. Pinning the official image by digest throws, because the
+    /// digest makes the version opaque and both applying and skipping the wrapper on a guess are
+    /// silently wrong. Supplying your own container entrypoint on the same resource also throws,
+    /// because the two cannot both own the container command. The wrapper needs <c>bash</c> and
+    /// <c>jq</c>, which the official image provides; it fails the container start with a
+    /// diagnostic rather than starting without the override if either is missing.
     /// </para>
     /// <para>
     /// Merge semantics across multiple calls on the same builder:
@@ -810,11 +911,14 @@ public static class DocumentDBBuilderExtensions
     /// (milliseconds, integer). Must be non-negative.
     /// </param>
     /// <param name="serviceName">
-    /// Logical service name attached to the metrics. When provided, sets <c>OTEL_SERVICE_NAME</c>.
+    /// Logical service name attached to the telemetry. When provided, sets
+    /// <c>OTEL_SERVICE_NAME</c> and, on affected images, removes the shared
+    /// <c>TelemetryOptions.ServiceName</c> so this value wins for every signal.
     /// </param>
     /// <param name="serviceVersion">
-    /// Logical service version attached to the metrics. When provided, sets
-    /// <c>OTEL_SERVICE_VERSION</c>.
+    /// Logical service version attached to the telemetry. When provided, sets
+    /// <c>OTEL_SERVICE_VERSION</c> and, on affected images, removes the shared
+    /// <c>TelemetryOptions.ServiceVersion</c> so this value wins for every signal.
     /// </param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="builder"/> is <see langword="null"/>.</exception>
@@ -869,7 +973,10 @@ public static class DocumentDBBuilderExtensions
             ArgumentOutOfRangeException.ThrowIfLessThan(to, TimeSpan.Zero, nameof(timeout));
         }
 
-        EnsureOpenTelemetryGatewayConfiguration(builder, enabled);
+        EnsureOpenTelemetryGatewayConfiguration(
+            builder,
+            serviceName is not null,
+            serviceVersion is not null);
 
         return builder.WithEnvironment(context =>
         {
@@ -896,12 +1003,6 @@ public static class DocumentDBBuilderExtensions
             {
                 context.EnvironmentVariables[OtelServiceNameEnvVarName] = serviceName;
             }
-            else if (context.Resource is DocumentDBServerResource serviceNameResource &&
-                     RequiresOpenTelemetryGatewayConfiguration(serviceNameResource) &&
-                     !context.EnvironmentVariables.ContainsKey(OtelServiceNameEnvVarName))
-            {
-                context.EnvironmentVariables[OtelServiceNameEnvVarName] = DefaultOpenTelemetryServiceName;
-            }
 
             if (serviceVersion is not null)
             {
@@ -920,8 +1021,13 @@ public static class DocumentDBBuilderExtensions
     /// because only <c>entrypoint</c> and <c>args</c> round-trip through the Aspire manifest, so
     /// the same mechanism is emitted verbatim for run mode, the manifest/azd path, and every
     /// other publisher. The wrapper derives a copy of the configuration the container would have
-    /// used, deletes only the keys that shadow the metrics environment variables, points
+    /// used, deletes only the keys this package's environment variables have to win over, points
     /// <c>CONFIG_DIR</c> at the copy, and execs the image's own entrypoint.
+    /// </para>
+    /// <para>
+    /// It is wired whenever the API is called at all, not only when metrics end up enabled: a
+    /// caller-supplied configuration file can enable metrics from JSON, and
+    /// <c>enabled: false</c> has to beat that.
     /// </para>
     /// <para>
     /// Both halves of the wrapper are resolved lazily against the resource's final image, because
@@ -933,95 +1039,171 @@ public static class DocumentDBBuilderExtensions
     /// </remarks>
     private static void EnsureOpenTelemetryGatewayConfiguration(
         IResourceBuilder<DocumentDBServerResource> builder,
-        bool metricsEnabled)
+        bool serviceNameConfigured,
+        bool serviceVersionConfigured)
     {
         var configuration = builder.Resource.Annotations
             .OfType<OpenTelemetryGatewayConfigurationAnnotation>()
             .SingleOrDefault();
 
-        if (configuration is not null)
+        var firstCall = configuration is null;
+        configuration ??= new OpenTelemetryGatewayConfigurationAnnotation();
+
+        // The set of explicitly supplied identity parameters accumulates across calls, matching
+        // how the environment variables those parameters write merge.
+        configuration.ServiceNameConfigured |= serviceNameConfigured;
+        configuration.ServiceVersionConfigured |= serviceVersionConfigured;
+
+        if (!firstCall)
         {
-            configuration.MetricsEnabled = metricsEnabled;
             return;
         }
 
-        configuration = new OpenTelemetryGatewayConfigurationAnnotation
-        {
-            MetricsEnabled = metricsEnabled,
-        };
         builder.Resource.Annotations.Add(configuration);
 
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
         {
-            if (!RequiresOpenTelemetryGatewayConfiguration(builder.Resource))
+            if (ResolveOpenTelemetryGatewayConfigurationRequirement(builder.Resource) !=
+                GatewayConfigurationRequirement.Required)
             {
                 return Task.CompletedTask;
             }
 
-            if (builder.Resource.Entrypoint is { } entrypoint &&
-                !string.Equals(entrypoint, GatewayConfigurationShell, StringComparison.Ordinal))
+            if (configuration.EntrypointOwned)
+            {
+                // A later event must find the entrypoint this wrapper installed. Anything else
+                // means the resource was re-pointed after the wrapper took ownership.
+                if (!string.Equals(builder.Resource.Entrypoint, GatewayConfigurationShell, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"DocumentDB resource '{builder.Resource.Name}' replaced the container " +
+                        $"entrypoint installed by WithOpenTelemetryMetrics() with " +
+                        $"'{builder.Resource.Entrypoint ?? "<none>"}'. The OpenTelemetry " +
+                        $"environment variables would be silently ignored on DocumentDB " +
+                        $"v{FirstGatewayTelemetryConfigurationVersion} and later.");
+                }
+
+                return Task.CompletedTask;
+            }
+
+            if (builder.Resource.Entrypoint is { } callerEntrypoint)
             {
                 throw new InvalidOperationException(
-                    $"DocumentDB resource '{builder.Resource.Name}' overrides the container " +
-                    $"entrypoint with '{entrypoint}', but WithOpenTelemetryMetrics() has to own " +
-                    $"the entrypoint on DocumentDB v{FirstGatewayTelemetryConfigurationVersion} " +
-                    $"and later. Those images ship a SetupConfiguration.json whose telemetry " +
-                    $"values take precedence over OTEL_* environment variables, so the metrics " +
-                    $"settings would be silently ignored. Recovery: drop the custom entrypoint, " +
-                    $"or drop WithOpenTelemetryMetrics() and enable metrics inside your own " +
+                    $"DocumentDB resource '{builder.Resource.Name}' sets the container " +
+                    $"entrypoint to '{callerEntrypoint}', but WithOpenTelemetryMetrics() has " +
+                    $"to own the entrypoint on DocumentDB " +
+                    $"v{FirstGatewayTelemetryConfigurationVersion} and later. Those images " +
+                    $"ship a SetupConfiguration.json whose telemetry values take precedence " +
+                    $"over OTEL_* environment variables, so the metrics settings would be " +
+                    $"silently ignored. Recovery: drop the custom entrypoint, or drop " +
+                    $"WithOpenTelemetryMetrics() and configure telemetry from your own " +
                     $"entrypoint.");
             }
 
             builder.Resource.Entrypoint = GatewayConfigurationShell;
+            configuration.EntrypointOwned = true;
             return Task.CompletedTask;
         });
 
         builder.WithArgs(context =>
         {
-            if (!RequiresOpenTelemetryGatewayConfiguration(builder.Resource))
+            if (ResolveOpenTelemetryGatewayConfigurationRequirement(builder.Resource) !=
+                GatewayConfigurationRequirement.Required)
             {
                 return;
             }
 
             context.Args.Insert(0, GatewayConfigurationShellArgumentZero);
-            context.Args.Insert(0, OpenTelemetryGatewayConfigurationScript);
+            context.Args.Insert(0, BuildOpenTelemetryGatewayConfigurationScript(configuration));
             context.Args.Insert(0, "-c");
         });
     }
 
     /// <summary>
-    /// Returns <see langword="true"/> when metrics are enabled on <paramref name="resource"/> and
-    /// its effective image is an official <c>documentdb-local</c> image whose
-    /// <c>SetupConfiguration.json</c> pins telemetry values ahead of the environment.
+    /// Classifies whether <paramref name="resource"/> needs the gateway configuration wrapper.
     /// </summary>
     /// <remarks>
-    /// The range is open-ended from <see cref="FirstGatewayTelemetryConfigurationVersion"/>: the
-    /// JSON-over-environment precedence arrived in that release, it is the newest published
-    /// DocumentDB version, and nothing upstream retracts it. Tags outside the strict
-    /// <c>pg{NN}-X.Y.Z</c> grammar and images other than the official one are exempt, so forks and
-    /// custom images keep the stock behaviour. Private mirrors of the official image are not
-    /// exempt, because only the registry differs.
+    /// <para>
+    /// The affected range is open-ended from
+    /// <see cref="FirstGatewayTelemetryConfigurationVersion"/>: the JSON-over-environment
+    /// precedence arrived in that release, it is the newest published DocumentDB version, and
+    /// nothing upstream retracts it. Tags outside the strict <c>pg{NN}-X.Y.Z</c> grammar and
+    /// images other than the official one are exempt, so forks and custom images keep the stock
+    /// behaviour. Private mirrors of the official image are not exempt, because only the registry
+    /// differs.
+    /// </para>
+    /// <para>
+    /// A digest pin on the official image makes the version opaque - the runtime resolves the
+    /// image from the digest and ignores the tag, so a tag left over from an earlier call says
+    /// nothing about what will actually run. Guessing in either direction is silently wrong, so
+    /// this throws instead.
+    /// </para>
     /// </remarks>
-    private static bool RequiresOpenTelemetryGatewayConfiguration(DocumentDBServerResource resource)
+    /// <exception cref="InvalidOperationException">
+    /// The official image is pinned by digest while the metrics API is configured.
+    /// </exception>
+    private static GatewayConfigurationRequirement ResolveOpenTelemetryGatewayConfigurationRequirement(
+        DocumentDBServerResource resource)
     {
         var configuration = resource.Annotations
             .OfType<OpenTelemetryGatewayConfigurationAnnotation>()
             .SingleOrDefault();
 
-        if (configuration?.MetricsEnabled != true)
+        if (configuration is null)
         {
-            return false;
+            return GatewayConfigurationRequirement.NotConfigured;
         }
 
         var image = resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
         if (image is null ||
-            !string.Equals(image.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal) ||
-            !DocumentDBContainerImageTags.TryParseDocumentDBTag(image.Tag, out _, out var version))
+            !string.Equals(image.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
         {
-            return false;
+            return NotRequired(configuration, resource, image?.Tag);
         }
 
-        return version >= FirstGatewayTelemetryConfigurationVersion;
+        if (!string.IsNullOrEmpty(image.SHA256))
+        {
+            throw new InvalidOperationException(
+                $"DocumentDB resource '{resource.Name}' pins " +
+                $"{DocumentDBContainerImageTags.Image} by digest '{image.SHA256}', so its " +
+                $"DocumentDB version cannot be determined and the tag " +
+                $"'{image.Tag ?? "<none>"}' is not what the runtime resolves. " +
+                $"WithOpenTelemetryMetrics() needs the version because DocumentDB " +
+                $"v{FirstGatewayTelemetryConfigurationVersion} and later give " +
+                $"SetupConfiguration.json precedence over the OTEL_* environment variables, and " +
+                $"applying or skipping the compatibility wrapper on a guess is silently wrong " +
+                $"either way. Recovery: select the image by tag instead of by digest, or drop " +
+                $"WithOpenTelemetryMetrics() and configure telemetry inside the image the digest " +
+                $"names.");
+        }
+
+        if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(image.Tag, out _, out var version))
+        {
+            return NotRequired(configuration, resource, image.Tag);
+        }
+
+        return version >= FirstGatewayTelemetryConfigurationVersion
+            ? GatewayConfigurationRequirement.Required
+            : NotRequired(configuration, resource, image.Tag);
+
+        // The wrapper cannot be uninstalled once the entrypoint carries it: an image swapped in
+        // after installation would leave /bin/bash with no arguments, which starts nothing.
+        static GatewayConfigurationRequirement NotRequired(
+            OpenTelemetryGatewayConfigurationAnnotation configuration,
+            DocumentDBServerResource resource,
+            string? tag)
+        {
+            if (configuration.EntrypointOwned)
+            {
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{resource.Name}' changed to an image " +
+                    $"('{tag ?? "<none>"}') that does not need the WithOpenTelemetryMetrics() " +
+                    $"compatibility wrapper after that wrapper had already taken over the " +
+                    $"container entrypoint. Select the image before configuring metrics.");
+            }
+
+            return GatewayConfigurationRequirement.NotApplicable;
+        }
     }
 
 

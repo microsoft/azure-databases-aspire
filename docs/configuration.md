@@ -268,21 +268,62 @@ and do not interact.
 ### Gateway configuration compatibility from `0.116.0`
 
 Starting with DocumentDB `0.116.0`, the gateway resolves telemetry settings as
-*JSON > environment variable > default*, and the stock `SetupConfiguration.json` shipped in the
-image pins `TelemetryOptions.Metrics.Enabled` to `false` and `TelemetryOptions.ServiceName` to
-`documentdb_gateway`. Those JSON values would win over `OTEL_METRICS_ENABLED` and the other
-variables documented above, so setting the environment alone can no longer turn metrics on.
+*JSON > environment variable > default*, reading them from `SetupConfiguration.json`. The file
+shipped in the image pins `TelemetryOptions.Metrics.Enabled` to `false` and
+`TelemetryOptions.ServiceName` to `documentdb_gateway`, so setting the environment alone can no
+longer decide whether metrics run.
 
-When metrics are enabled on an official `documentdb-local` image of `0.116.0` or later, this
-method therefore wraps the container entrypoint. The wrapper reads the configuration the
-container would otherwise have used (honouring a caller-supplied `CONFIG_DIR`), deletes only the
-`TelemetryOptions.Metrics`, `TelemetryOptions.ServiceName` and `TelemetryOptions.ServiceVersion`
-keys with `jq`, points `CONFIG_DIR` at that copy, and then execs the image's own entrypoint.
-`TelemetryOptions.Tracing` is left exactly as upstream ships it, because this package does not
-configure tracing.
+Whenever this method is called against an official `documentdb-local` image of `0.116.0` or later,
+it therefore wraps the container entrypoint. The wrapper reads the configuration file the
+container would otherwise have used, removes the keys the environment has to win over, points
+`CONFIG_DIR` at the sanitized copy, and execs the image's own entrypoint.
 
-The wrapper is expressed entirely as the container `entrypoint` and `args`, which are the only
-file-shaped mechanisms that round-trip through the Aspire manifest. Consequently:
+**Which directory the wrapper reads.** Exactly the one the image entrypoint would have read:
+
+1. `CONFIG_DIR`, when the caller set it.
+2. Otherwise `/etc/documentdb/gateway`, when the packaged layout is present (detected the same way
+   the image entrypoint detects it: both `/usr/share/documentdb/scripts/start_oss_server.sh` and
+   `/usr/share/documentdb/scripts/utils.sh` exist).
+3. Otherwise `$GATEWAY_HOME/pg_documentdb_gw`, defaulting `GATEWAY_HOME` to
+   `/home/documentdb/gateway` as upstream does.
+
+**Which keys are removed.**
+
+| JSON key | Removed |
+|---|---|
+| `TelemetryOptions.Metrics.Enabled` | always |
+| `TelemetryOptions.Metrics.OtlpEndpoint` | always |
+| `TelemetryOptions.Metrics.ExportIntervalMs` | always |
+| `TelemetryOptions.Metrics.ExportTimeoutMs` | always |
+| `TelemetryOptions.ServiceName` | only when `serviceName` was supplied |
+| `TelemetryOptions.ServiceVersion` | only when `serviceVersion` was supplied |
+| `TelemetryOptions.Tracing` (and everything else) | never |
+
+The whole `TelemetryOptions.Metrics` block goes because this method owns the metrics signal end to
+end. Any surviving key would re-pin that setting ahead of the environment precedence documented
+above — in particular the shipped `OtlpEndpoint: http://localhost:4317` would beat both
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and `OTEL_EXPORTER_OTLP_ENDPOINT` and export metrics into the
+DocumentDB container itself. Removing them costs nothing on the stock image: the values it ships
+are byte-identical to the gateway's own compiled-in defaults.
+
+The identity keys are treated differently because the gateway shares one OpenTelemetry `Resource`
+across signals and the shipped `ServiceName` is *not* the gateway's compiled-in default, so
+removing it would silently rename traces too. Everything the caller did not override survives, so
+a configuration file you point `CONFIG_DIR` at keeps its other values and the stock image keeps
+its shipped identity and its disabled tracing. No default identity is injected on your behalf.
+
+> **Explicit identity is cross-signal.** The gateway builds one OpenTelemetry `Resource` for all
+> signals, so supplying `serviceName` or `serviceVersion` removes the shared JSON identity and
+> changes the identity of exported traces too, not only metrics. Omit them to keep the identity
+> the configuration file specifies. Setting `OTEL_SERVICE_NAME` through `WithEnvironment(...)` is
+> *not* an override: the JSON key is left in place and continues to win inside the gateway.
+
+**`enabled: false` is wrapped too.** A configuration file can switch metrics on from JSON, which
+would beat `OTEL_METRICS_ENABLED=false`. Disabling metrics therefore installs the same wrapper and
+removes `TelemetryOptions.Metrics.Enabled`, so an explicit `enabled: false` actually disables them.
+
+**Publishing.** The wrapper is expressed entirely as the container `entrypoint` and `args`, the
+only file-shaped mechanisms that round-trip through the Aspire manifest. Consequently:
 
 - `aspire publish` and `azd` emit a manifest that still names the official image and carries the
   wrapper in `entrypoint`/`args`, so published apps deploy and export metrics.
@@ -291,16 +332,24 @@ file-shaped mechanisms that round-trip through the Aspire manifest. Consequently
   `.WithOpenTelemetryMetrics().WithDocumentDBVersion(...)` and
   `.WithOpenTelemetryMetrics().WithImageTag(...)` behave the same as the reverse order.
 
-Nothing is wrapped when metrics are explicitly disabled, when the image is not the official
-`documentdb/documentdb-local` image, or when the tag is outside the `pgNN-X.Y.Z` grammar. A
-private registry mirror that keeps the official image path and tag is wrapped, because only the
-registry differs.
+**What is left alone, and what fails loudly.** Custom images and tags outside the `pgNN-X.Y.Z`
+grammar are untouched. A private registry mirror that keeps the official image path and tag is
+wrapped, because only the registry differs. Four situations throw instead of guessing:
+
+- Pinning the official image by digest (`WithImageSHA256`). The digest supersedes the tag — Aspire
+  clears it — so the DocumentDB version is unknowable, and both applying and skipping the wrapper
+  would be silently wrong. Select the image by tag, or drop `WithOpenTelemetryMetrics(...)` and
+  configure telemetry inside the image the digest names.
+- Supplying your own container entrypoint on the same resource, including `/bin/bash`: the two
+  cannot both own the container command.
+- Replacing the wrapper's entrypoint after it has been installed.
+- Selecting an image that does not need the wrapper *after* the wrapper has taken over the
+  entrypoint. The wrapper cannot be uninstalled at that point, and dropping its arguments would
+  leave `/bin/bash` with nothing to run. Select the image before configuring metrics.
 
 The wrapper needs `bash` and `jq`, both of which the official image provides. If either is
 missing, or the configuration file cannot be read, the container fails to start with a diagnostic
-rather than starting silently without metrics. Supplying your own `entrypoint` on the same
-resource is rejected with an `InvalidOperationException`, because the two cannot both own the
-container command.
+rather than starting silently without the override.
 
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or

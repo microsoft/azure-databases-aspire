@@ -108,12 +108,26 @@ Common causes:
 
 ### The container command looks wrapped in `/bin/bash -c ...`
 
-Expected on DocumentDB `0.116.0` and later when `WithOpenTelemetryMetrics(...)` enables metrics.
-Those images resolve telemetry as *JSON > environment > default* and ship a
-`SetupConfiguration.json` that pins metrics off, so the integration wraps the entrypoint to
-remove the metrics-shadowing keys before the image's own entrypoint runs. The wrapper is carried
-in the container `entrypoint`/`args`, so it survives `aspire publish` and `azd`. See
-[WithOpenTelemetryMetrics](configuration.md#withopentelemetrymetrics).
+Expected on DocumentDB `0.116.0` and later whenever `WithOpenTelemetryMetrics(...)` is called,
+including with `enabled: false`. Those images resolve telemetry as *JSON > environment > default*
+and ship a `SetupConfiguration.json` that pins metrics off, so the integration wraps the entrypoint
+to remove the keys your settings have to win over before the image's own entrypoint runs. The
+wrapper is carried in the container `entrypoint`/`args`, so it survives `aspire publish` and `azd`.
+See [WithOpenTelemetryMetrics](configuration.md#withopentelemetrymetrics).
+
+### `WithOpenTelemetryMetrics()` throws about a digest
+
+Pinning the official image with `WithImageSHA256(...)` supersedes the tag, so the DocumentDB
+version cannot be determined. Applying the compatibility wrapper and skipping it are both silently
+wrong, so this fails instead. Select the image by tag, or drop `WithOpenTelemetryMetrics(...)` and
+configure telemetry inside the image the digest names.
+
+### `WithOpenTelemetryMetrics()` throws about the entrypoint
+
+The wrapper has to own the container command, so any entrypoint you set on the same resource —
+`/bin/bash` included, because its arguments would be yours — is rejected. Drop the custom
+entrypoint, or drop `WithOpenTelemetryMetrics(...)` and configure telemetry from your own
+entrypoint.
 
 ### No metrics arrive at the collector
 
@@ -121,13 +135,22 @@ in the container `entrypoint`/`args`, so it survives `aspire publish` and `azd`.
    explicit `endpoint:`. The gateway default (`http://localhost:4317`) resolves to the DocumentDB
    container itself.
 2. Check the gateway startup line in the container logs. It prints the resolved configuration; on
-   `0.116.0` and later a working setup shows `metrics: None` inside `telemetry_options`, meaning
-   the JSON no longer overrides the environment.
+   `0.116.0` and later a working setup shows `metrics: Some(MetricsOptions { enabled: None ... })`
+   inside `telemetry_options`, meaning the JSON no longer pins the flag and the environment
+   decides.
 3. `aspire-documentdb -- ...` on the first lines of the container log means the wrapper could not
    read the gateway configuration or could not find `jq`. The wrapper only ever applies to the
    official `documentdb/documentdb-local` image path, so this means a mirror or re-tag reuses that
    path with contents that are not the official image. Publish it under your own image name so the
    wrapper is skipped, then configure telemetry inside that image.
+
+### The service name is not the one I set
+
+`OTEL_SERVICE_NAME` set through `WithEnvironment(...)` is not an override, so the JSON
+`TelemetryOptions.ServiceName` is left in place and still wins inside the gateway. Pass
+`serviceName:` to `WithOpenTelemetryMetrics(...)` instead — that removes the JSON key. Note that
+the gateway shares one OpenTelemetry `Resource` across signals, so this changes the identity of
+traces as well as metrics.
 
 ## Port conflicts
 
