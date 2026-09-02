@@ -610,11 +610,12 @@ only file-shaped mechanisms that round-trip through the Aspire manifest. Consequ
 **What is left alone, and what fails loudly.** Custom images and tags outside the `pgNN-X.Y.Z`
 grammar are untouched, as is any resource built from your own Dockerfile — including one whose
 image annotation names the official image and a recognised tag, and one pinned by digest, because
-for a build neither is what runs. A private registry mirror that keeps the official image path and
-tag is wrapped, because only the registry differs — however the reference spells the boundary
-between registry and repository, see
-[How the image is recognised](#how-the-image-is-recognised). Four situations throw instead of
-guessing:
+for a build neither is what runs. A private registry mirror is wrapped when it is the curated
+repository directly beneath a registry host — only the host differs — however the reference spells
+the boundary between the two annotation fields; a mirror that adds a namespace path, such as
+`contoso.azurecr.io/mirrors/documentdb/documentdb-local`, is a different repository and is left
+alone. See [How the image is recognised](#how-the-image-is-recognised). Four situations throw
+instead of guessing:
 
 - Pinning the official image by digest (`WithImageSHA256`). The digest supersedes the tag — Aspire
   clears it — so the DocumentDB version is unknowable, and both applying and skipping the wrapper
@@ -800,13 +801,14 @@ builder.AddProject<Projects.Worker>("worker")
 > - **Run mode only.** Manifest generation (`azd publish`, `--publisher
 >   manifest`) does not start the container, so the guard does not fire and
 >   the manifest is produced regardless of tag.
-> - **Curated image only.** A custom image (any reference whose repository
->   is not `documentdb/documentdb-local`, e.g. a fork via
->   `.WithImage("myorg/build", "pg17-0.110.0")`) is exempt with a one-time
->   warning. The container registry does not factor into the carve-out — a
->   private mirror of the curated image is still guarded — and the registry may
->   be written into either annotation field, because the composed reference is
->   what is judged. See
+> - **Curated image only.** A custom image (any reference that is not the
+>   curated repository under a registry host, e.g. a fork via
+>   `.WithImage("myorg/build", "pg17-0.110.0")` or a mirror path such as
+>   `.WithImageRegistry("contoso.azurecr.io/mirrors")`) is exempt with a
+>   one-time warning. Which registry **host** the image comes from does not
+>   factor into the carve-out — a private mirror of the curated image is still
+>   guarded — and it may be written into either annotation field, because the
+>   composed reference is what is judged. See
 >   [How the image is recognised](#how-the-image-is-recognised).
 > - **Unknown tag patterns** (`:latest`, `:nightly`, `pg17-0.112.0-rc.1`,
 >   custom non-`pg{NN}-X.Y.Z` strings) bypass the version check with a
@@ -875,9 +877,19 @@ builder.AddDocumentDB("documentdb")
 
 ### How the image is recognised
 
-`ContainerImageAnnotation` models a reference as a registry prefix plus a repository, and Aspire
-joins the two with a single separator — it never re-splits them. Where you put that boundary is
-therefore up to you, and all of these resolve to the same official image:
+`ContainerImageAnnotation` has a registry field and an image field, but Aspire joins them with a
+single separator and validates neither — it never re-splits them, and it never checks that the
+registry is a registry. Where you put the boundary is therefore not evidence about anything, so
+recognition works on the **composed reference**: two spellings that compose the same string always
+classify the same way.
+
+Exactly one prefix may stand in front of the repository, and only one of two kinds:
+
+- the curated registry `ghcr.io/documentdb`; or
+- a single registry **host** — a DNS name, an IPv4 or bracketed IPv6 literal, or `localhost`, each
+  with an optional port — and nothing after it.
+
+What remains must be `documentdb/documentdb-local` exactly. So all of these are the official image:
 
 ```csharp
 builder.AddDocumentDB("documentdb");                                   // ghcr.io/documentdb + documentdb/documentdb-local
@@ -891,20 +903,28 @@ builder.AddDocumentDB("documentdb")
        .WithImageRegistry("ghcr.io");                                  // the boundary moved one segment
 ```
 
-Recognition is done on the composed reference, so every spelling of one image is classified the
-same way. The repository identity stays exact — `documentdb/documentdb-local`, segment for
-segment — and only the prefix in front of it may vary, which is what keeps a **private mirror**
-covered: `contoso.azurecr.io/documentdb/documentdb-local` and `localhost:5000/documentdb/documentdb-local`
-are the curated image behind a different registry, whether you write the registry in
+A **private mirror** is a registry host and that exact repository beneath it — nothing in between.
+`contoso.azurecr.io/documentdb/documentdb-local` and `localhost:5000/documentdb/documentdb-local`
+are the curated image behind a different registry, whether you write the host in
 `WithImageRegistry(...)` or inline.
 
-A leading path that is not a registry is part of the repository, so it names a different image and
-keeps the custom-image treatment. `evil/documentdb/documentdb-local` has no registry in front of it
-(a first segment is a registry host only when it contains a `.` or a `:`, or is `localhost`), and
-`ghcr.io/evil/documentdb/documentdb-local` has a path segment that is not part of the curated
-registry. Writing the full reference into the image *without* clearing the registry is also not the
-official image: Aspire composes `ghcr.io/documentdb/ghcr.io/documentdb/documentdb/documentdb-local`,
-which resolves to nothing.
+A namespace, project or mirror path in front of the repository names a **different** repository and
+keeps the custom-image treatment — in every spelling, because the composed reference is the same:
+
+| Not the official image | Composed reference |
+|---|---|
+| `.WithImageRegistry("ghcr.io/evil")` + `documentdb/documentdb-local` | `ghcr.io/evil/documentdb/documentdb-local` |
+| `.WithImage("ghcr.io/evil/documentdb/documentdb-local")` | `ghcr.io/evil/documentdb/documentdb-local` |
+| `.WithImageRegistry("contoso.azurecr.io/mirrors")` + `documentdb/documentdb-local` | `contoso.azurecr.io/mirrors/documentdb/documentdb-local` |
+| `.WithImageRegistry("harbor.corp.local/library")` + `documentdb/documentdb-local` | `harbor.corp.local/library/documentdb/documentdb-local` |
+| `.WithImage("evil/documentdb/documentdb-local")` | `evil/documentdb/documentdb-local` |
+
+A bare name is a host only when it carries a port, following the container reference grammar:
+`myregistry:5000/documentdb/documentdb-local` is a mirror, `myregistry/documentdb/documentdb-local`
+is not. Writing the full reference into the image *without* clearing the registry is not the
+official image either: Aspire composes
+`ghcr.io/documentdb/ghcr.io/documentdb/documentdb/documentdb-local`, which resolves to nothing, as
+does any reference with a doubled, leading or trailing separator.
 
 A digest is read whether it arrives through `WithImageSHA256(...)` or inline as
 `repository@sha256:...`, and a `:` is a tag only in the last path segment, so a registry port is

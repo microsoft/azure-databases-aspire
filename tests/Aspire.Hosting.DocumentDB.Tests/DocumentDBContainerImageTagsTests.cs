@@ -115,35 +115,54 @@ public class DocumentDBContainerImageTagsTests
     }
 
     /// <summary>
-    /// The registry/repository boundary is the caller's to move, so what has to be judged is the
-    /// reference Aspire composes, not <c>ContainerImageAnnotation.Image</c> on its own.
+    /// Where the caller puts the boundary between registry and repository is not evidence about
+    /// anything — Aspire joins the two fields and validates neither — so the composed reference is
+    /// judged, and exactly one prefix may stand in front of the repository: the curated registry,
+    /// or a single registry host.
     /// </summary>
     [Theory]
-    // The canonical spelling, and every rearrangement of it that resolves to the same image.
+    // The canonical spelling, and every rearrangement of it that composes the same reference.
     [InlineData("ghcr.io/documentdb", "documentdb/documentdb-local", true)]
     [InlineData(null, "ghcr.io/documentdb/documentdb/documentdb-local", true)]
     [InlineData("", "ghcr.io/documentdb/documentdb/documentdb-local", true)]
     [InlineData("ghcr.io", "documentdb/documentdb/documentdb-local", true)]
-    // Registry hosts are case-insensitive.
-    [InlineData(null, "GHCR.IO/documentdb/documentdb/documentdb-local", true)]
-    // Private mirrors: only the registry differs, in either spelling.
+    [InlineData("ghcr.io/documentdb/documentdb", "documentdb-local", true)]
+    // Registry hosts and the curated namespace are case-insensitive.
+    [InlineData(null, "GHCR.IO/DocumentDB/documentdb/documentdb-local", true)]
+    // A private mirror is a registry host and the exact repository beneath it, in either spelling.
     [InlineData("contoso.azurecr.io", "documentdb/documentdb-local", true)]
     [InlineData(null, "contoso.azurecr.io/documentdb/documentdb-local", true)]
+    [InlineData("harbor.corp.local", "documentdb/documentdb-local", true)]
+    [InlineData("localhost:5000", "documentdb/documentdb-local", true)]
     [InlineData(null, "localhost:5000/documentdb/documentdb-local", true)]
     [InlineData(null, "localhost/documentdb/documentdb-local", true)]
+    [InlineData(null, "127.0.0.1:5000/documentdb/documentdb-local", true)]
+    [InlineData(null, "[::1]:5000/documentdb/documentdb-local", true)]
+    [InlineData(null, "[fe80::1]/documentdb/documentdb-local", true)]
+    // A bare name is a host only when it carries a port; otherwise it is a path segment.
+    [InlineData("myregistry:5000", "documentdb/documentdb-local", true)]
+    [InlineData("myregistry", "documentdb/documentdb-local", false)]
+    [InlineData(null, "myregistry/documentdb/documentdb-local", false)]
+    // No prefix at all.
     [InlineData(null, "documentdb/documentdb-local", true)]
-    // A registry field is a prefix by construction, whether or not it looks like a host.
-    [InlineData("myregistry", "documentdb/documentdb-local", true)]
-    // ghcr.io/documentdb/documentdb-local is what WithImageRegistry("ghcr.io") composes, so it
-    // is the same private-mirror shape and not an "official" claim about that exact path.
+    // ghcr.io + the exact repository. This is one segment short of the path this package
+    // publishes, but it is the reference WithImageRegistry("ghcr.io") composes and it follows
+    // from the host rule, so it classifies as a mirror. Harmless: the pull then fails.
     [InlineData(null, "ghcr.io/documentdb/documentdb-local", true)]
-    // ...and so is this, which composes the very same string from a different split. Judging the
-    // composed reference is what makes two spellings of one image classify alike.
     [InlineData("ghcr.io/documentdb", "documentdb-local", true)]
-    // A leading path that is not a registry is part of the repository.
+    // A namespace, project or mirror path in front of the repository is part of the repository,
+    // whether the caller wrote it into Registry or inline. Both spellings of each, because the
+    // composed reference is the same and has to classify the same.
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local", false)]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local", false)]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local", false)]
+    [InlineData(null, "contoso.azurecr.io/mirrors/documentdb/documentdb-local", false)]
+    [InlineData("harbor.corp.local/library", "documentdb/documentdb-local", false)]
+    [InlineData(null, "harbor.corp.local/library/documentdb/documentdb-local", false)]
+    [InlineData("localhost:5000/mirrors", "documentdb/documentdb-local", false)]
+    [InlineData(null, "localhost:5000/mirrors/documentdb/documentdb-local", false)]
     [InlineData("ghcr.io/documentdb", "evil/documentdb/documentdb-local", false)]
     [InlineData(null, "evil/documentdb/documentdb-local", false)]
-    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local", false)]
     [InlineData(null, "ghcr.io/documentdbX/documentdb/documentdb-local", false)]
     [InlineData(null, "x/documentdb/documentdb-local", false)]
     // Writing the registry into Image without clearing it composes a doubled, unresolvable
@@ -156,12 +175,40 @@ public class DocumentDBContainerImageTagsTests
     [InlineData("ghcr.io/documentdb", "documentdb/DocumentDB-Local", false)]
     // References the runtime cannot resolve are not the curated one either.
     [InlineData("ghcr.io/documentdb/", "/documentdb/documentdb-local/", false)]
+    [InlineData("ghcr.io/documentdb/", "documentdb/documentdb-local", false)]
     [InlineData("ghcr.io/documentdb", "documentdb/documentdb-local/", false)]
+    [InlineData("ghcr.io/documentdb", "", false)]
+    [InlineData(null, "", false)]
     public void NamesCuratedRepositoryJudgesTheComposedReference(string? registry, string image, bool expected)
     {
         Assert.Equal(
             expected,
             DocumentDBContainerImageTags.NamesCuratedRepository(registry, image, out _, out _));
+    }
+
+    /// <summary>
+    /// The same reference composed from different splits of the two annotation fields always
+    /// classifies the same, because only the composition is read.
+    /// </summary>
+    [Theory]
+    [InlineData("ghcr.io/documentdb/documentdb/documentdb-local", true)]
+    [InlineData("contoso.azurecr.io/documentdb/documentdb-local", true)]
+    [InlineData("ghcr.io/evil/documentdb/documentdb-local", false)]
+    [InlineData("contoso.azurecr.io/mirrors/documentdb/documentdb-local", false)]
+    [InlineData("harbor.corp.local/library/documentdb/documentdb-local", false)]
+    public void NamesCuratedRepositoryIsIndifferentToWhereTheSplitFalls(string reference, bool expected)
+    {
+        var segments = reference.Split('/');
+
+        for (var boundary = 0; boundary < segments.Length; boundary++)
+        {
+            var registry = boundary == 0 ? null : string.Join('/', segments[..boundary]);
+            var image = string.Join('/', segments[boundary..]);
+
+            Assert.Equal(
+                expected,
+                DocumentDBContainerImageTags.NamesCuratedRepository(registry, image, out _, out _));
+        }
     }
 
     [Theory]
@@ -171,6 +218,7 @@ public class DocumentDBContainerImageTagsTests
     // A registry port is not a tag: the ':' has to be in the last path segment.
     [InlineData(null, "localhost:5000/documentdb/documentdb-local", null, null)]
     [InlineData(null, "localhost:5000/documentdb/documentdb-local:pg17-0.116.0", "pg17-0.116.0", null)]
+    [InlineData(null, "[::1]:5000/documentdb/documentdb-local:pg17-0.116.0", "pg17-0.116.0", null)]
     // A digest brings its own ':' and is stored the way ContainerImageAnnotation.SHA256 is.
     [InlineData("ghcr.io/documentdb", "documentdb/documentdb-local@sha256:abc123", null, "abc123")]
     [InlineData(null, "ghcr.io/documentdb/documentdb/documentdb-local@sha256:abc123", null, "abc123")]

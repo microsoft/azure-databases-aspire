@@ -1249,15 +1249,21 @@ public class AddDocumentDBTests
     /// is a different image and keeps the custom-image treatment.
     /// </summary>
     [Theory]
-    [InlineData("evil/documentdb/documentdb-local")]
-    [InlineData("ghcr.io/evil/documentdb/documentdb-local")]
-    public async Task AnExtraPathSegmentIsNotTheOfficialImage(string image)
+    // Inline, and split across the two annotation fields: the composed reference is the same.
+    [InlineData(null, "evil/documentdb/documentdb-local")]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    [InlineData(null, "harbor.corp.local/library/documentdb/documentdb-local")]
+    [InlineData("harbor.corp.local/library", "documentdb/documentdb-local")]
+    public async Task AnExtraPathSegmentIsNotTheOfficialImage(string? registry, string image)
     {
         var sink = new CapturingLoggerSink();
         var appBuilder = CreateAppBuilder(sink);
         appBuilder.AddDocumentDB("DocumentDB")
             .WithImage(image, InterlockedTag)
-            .WithImageRegistry(null!)
+            .WithImageRegistry(registry!)
             .WithDataVolume(targetPath: "/pgdata");
 
         using var app = appBuilder.Build();
@@ -1311,6 +1317,85 @@ public class AddDocumentDBTests
         Assert.Equal(
             (await ManifestUtils.GetManifest(byDefault.Resource))["image"]?.GetValue<string>(),
             (await ManifestUtils.GetManifest(documentDB.Resource))["image"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// A namespace in front of the repository names a different image, so the pair keeps the
+    /// hard failure: nothing establishes that whatever runs there claims the directory.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    public async Task AnExtraPathSegmentDoesNotDowngradeASharedDataDirectory(string? registry, string image)
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "standby"));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the manifest shows why: what ships is the reference the caller actually composed, not
+    /// the official one.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local", "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("harbor.corp.local/library", "documentdb/documentdb-local", "harbor.corp.local/library/documentdb/documentdb-local")]
+    public async Task AnExtraPathSegmentPublishesItsOwnReference(string? registry, string image, string expected)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal($"{expected}:{InterlockedTag}", manifest["image"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// A true private mirror is a registry host and the exact repository beneath it, however the
+    /// caller splits the two fields.
+    /// </summary>
+    [Theory]
+    [InlineData("contoso.azurecr.io", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/documentdb/documentdb-local")]
+    [InlineData("localhost:5000", "documentdb/documentdb-local")]
+    [InlineData(null, "localhost:5000/documentdb/documentdb-local")]
+    public async Task ATrueMirrorIsAHostAndTheExactRepository(string? registry, string image)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.Contains(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
 
     /// <summary>
@@ -3948,10 +4033,14 @@ public class AddDocumentDBTests
     }
 
     [Theory]
-    // Only the registry differs, in every spelling of the boundary.
+    // A registry host and the exact repository beneath it, in every spelling of the boundary.
     [InlineData("contoso.azurecr.io/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "contoso.azurecr.io")]
     [InlineData("localhost:5000/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "localhost:5000")]
+    [InlineData("[::1]:5000/documentdb/documentdb-local", null)]
     [InlineData("documentdb/documentdb/documentdb-local", "ghcr.io")]
+    [InlineData("documentdb-local", "ghcr.io/documentdb/documentdb")]
     public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForQualifiedPrivateMirrors(
         string image,
         string? registry)
@@ -3968,9 +4057,17 @@ public class AddDocumentDBTests
     }
 
     [Theory]
-    // A leading path that is not a registry is part of the repository.
+    // A namespace, project or mirror path in front of the repository is part of the repository,
+    // whether the caller writes it inline or into the registry field.
     [InlineData("evil/documentdb/documentdb-local", null)]
     [InlineData("ghcr.io/evil/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "ghcr.io/evil")]
+    [InlineData("contoso.azurecr.io/mirrors/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "contoso.azurecr.io/mirrors")]
+    [InlineData("harbor.corp.local/library/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "harbor.corp.local/library")]
+    // A bare name is a host only when it carries a port.
+    [InlineData("documentdb/documentdb-local", "myregistry")]
     // Leaving the registry annotation in place composes a doubled, unresolvable reference.
     [InlineData("ghcr.io/documentdb/documentdb/documentdb-local", "ghcr.io/documentdb")]
     public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForLookalikeReferences(
@@ -4813,6 +4910,34 @@ public class AddDocumentDBTests
         Assert.Equal(3, resource["args"]?.AsArray().Count);
     }
 
+    /// <summary>
+    /// Through the real publishing pipeline, for a reference whose prefix carries a namespace:
+    /// the manifest ships the reference the caller composed, unwrapped, because that repository is
+    /// not one this package publishes.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local", "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    public async Task WithOpenTelemetryMetricsPublishesAnUnwrappedManifestForAnExtraPathSegment(
+        string? registry,
+        string image,
+        string expected)
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage(image, InterlockedTag)
+                .WithImageRegistry(registry!)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Equal($"{expected}:{InterlockedTag}", resource!["image"]?.GetValue<string>());
+        Assert.Null(resource["entrypoint"]);
+        Assert.Null(resource["args"]);
+    }
+
     [Fact]
     public async Task WithOpenTelemetryMetricsFailsPublishForADigestPinnedOfficialImage()
     {
@@ -5577,6 +5702,60 @@ public class AddDocumentDBTests
         var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
         Assert.Single(warnings);
         Assert.Contains("Dockerfile", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    [InlineData(null, "harbor.corp.local/library/documentdb/documentdb-local")]
+    [InlineData("harbor.corp.local/library", "documentdb/documentdb-local")]
+    public async Task WithPostgresEndpointGuardSkippedForAnExtraPathSegmentInEitherField(
+        string? registry,
+        string image)
+    {
+        // The version behind a repository this package does not publish is unknown, so the floor
+        // is not enforced against the tag -- in either spelling of the same reference.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, "pg17-0.110.0")
+            .WithImageRegistry(registry!)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("custom image", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    public async Task PgVariantFloorIsNotEnforcedForAnExtraPathSegment(string? registry, string image)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, "pg18-0.113.0")
+            .WithImageRegistry(registry!);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
 
     private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)
