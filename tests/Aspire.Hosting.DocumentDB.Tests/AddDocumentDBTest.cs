@@ -2715,6 +2715,10 @@ public class AddDocumentDBTests
         { ["--read-only=false"], "--read-only" },
         { ["--storage-opt", "overlay2.size=runtime-secret"], "--storage-opt" },
         { ["--storage-opt=overlay2.size=runtime-secret"], "--storage-opt" },
+        { ["--init-path", "/runtime-secret/podman-init"], "--init-path" },
+        { ["--init-path=/runtime-secret/podman-init"], "--init-path" },
+        { ["--http-proxy", "--secret=runtime-secret,type=mount,target=/tmp"], "--secret" },
+        { ["--http-proxy=false", "--image-volume=runtime-secret"], "--image-volume" },
     };
 
     [Theory]

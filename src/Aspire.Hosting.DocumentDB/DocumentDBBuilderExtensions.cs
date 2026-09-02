@@ -306,7 +306,7 @@ public static class DocumentDBBuilderExtensions
         new("http-proxy", null, ContainerRuntimeOptionValueArity.None),
         new("image-volume", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("init", null, ContainerRuntimeOptionValueArity.None),
-        new("init-path", null, ContainerRuntimeOptionValueArity.Required),
+        new("init-path", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("interactive", 'i', ContainerRuntimeOptionValueArity.None),
         new("ip", null, ContainerRuntimeOptionValueArity.Required),
         new("ip6", null, ContainerRuntimeOptionValueArity.Required),

@@ -370,7 +370,7 @@ instead of guessing:
 - Passing raw `--entrypoint`, `--rootfs`, `--mount`, `--volume`/`-v`, `--volume-driver`,
   `--tmpfs`, `--volumes-from`, `--read-only`, `--storage-opt`, or `--use-api-socket` options through
   `WithContainerRuntimeArgs(...)`. Podman-specific storage changes are covered too, including
-  `--secret`, `--image-volume`, `--chrootdirs`, `--ipc`, `--read-only-tmpfs`, and `--systemd`.
+  `--secret`, `--image-volume`, `--init-path`, `--chrootdirs`, `--ipc`, `--read-only-tmpfs`, and `--systemd`.
   Joining a pod through `--pod` or `--pod-id-file` is rejected because it can replace the
   `/dev/shm` backing through a shared IPC namespace. Those options bypass the resource model after
   the wrapper has been generated. Use

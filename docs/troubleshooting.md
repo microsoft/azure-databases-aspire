@@ -146,9 +146,9 @@ can put DATA_PATH storage back under a scratch root after the wrapper has select
 `--entrypoint` can replace `/bin/bash`, and Podman `--rootfs` or a bare positional operand can
 replace the model-selected image. `--read-only` and `--storage-opt` also change root filesystem
 behavior outside the model. Podman-specific `--secret`, `--image-volume`, `--chrootdirs`,
-`--ipc`, `--read-only-tmpfs`, and `--systemd` are therefore covered alongside Docker's mount
-grammar. `--pod` and `--pod-id-file` are rejected too because joining a pod can replace the
-`/dev/shm` backing through its shared IPC namespace.
+`--init-path`, `--ipc`, `--read-only-tmpfs`, and `--systemd` are therefore covered alongside
+Docker's mount grammar. `--pod` and `--pod-id-file` are rejected too because joining a pod can
+replace the `/dev/shm` backing through its shared IPC namespace.
 
 Protected `--env`/`-e`, `--env-merge`, and `--unsetenv` values are rejected too. So are
 `--env-file`, `--env-host`, and `--unsetenv-all`, whose complete environment effects cannot be
