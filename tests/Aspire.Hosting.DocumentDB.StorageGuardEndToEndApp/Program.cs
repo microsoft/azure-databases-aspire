@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using Aspire.Hosting;
+using Aspire.Hosting.ApplicationModel;
 
 namespace Aspire.Hosting.DocumentDB.StorageGuardEndToEndApp;
 
@@ -29,6 +30,24 @@ public class Program
     /// <summary>Two resources whose data directories are one directory.</summary>
     public const string SharedDataDirectoryScenario = "shared-data-directory";
 
+    /// <summary>
+    /// A command-line token whose value only arrives later, sitting where the entrypoint reads an
+    /// option name. It could resolve to <c>--data-path</c>.
+    /// </summary>
+    public const string DeferredDataPathArgumentScenario = "deferred-data-path-argument";
+
+    /// <summary>
+    /// A lifecycle hook — which Aspire runs *after* BeforeStartEvent — moves DATA_PATH onto a
+    /// read-only mount. The guard has to still be the last word on the environment.
+    /// </summary>
+    public const string LateDataPathOverrideScenario = "late-data-path-override";
+
+    /// <summary>
+    /// A usable configuration that the guard only warns about: the data mount does not cover the
+    /// path the image declares as a volume. The warning has to actually reach the operator.
+    /// </summary>
+    public const string DeclaredVolumeWarningScenario = "declared-volume-warning";
+
     public static async Task Main(string[] args)
     {
         var builder = DistributedApplication.CreateBuilder(args);
@@ -49,6 +68,35 @@ public class Program
             case SharedDataDirectoryScenario:
                 builder.AddDocumentDB("documentdb").WithDataVolume(name: "documentdb-shared-data");
                 builder.AddDocumentDB("documentdb-peer").WithDataVolume(name: "documentdb-shared-data");
+                break;
+
+            case DeferredDataPathArgumentScenario:
+                var flag = builder.AddParameter("documentdb-flag", "--data-path");
+                builder.AddDocumentDB("documentdb")
+                    .WithDataVolume()
+                    .WithArgs(flag, "/pgdata");
+                break;
+
+            case LateDataPathOverrideScenario:
+                var documentDB = builder.AddDocumentDB("documentdb")
+                    .WithDataVolume()
+                    .WithVolume("documentdb-late-read-only", "/pgdata", isReadOnly: true);
+
+                // Registered after AddDocumentDB, so it runs after the guard installs itself. The
+                // guard retakes the last position before the resource starts, so this is still seen.
+                builder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+                {
+                    documentDB.WithEnvironment("DATA_PATH", "/pgdata");
+                    return Task.CompletedTask;
+                });
+                break;
+
+            case DeclaredVolumeWarningScenario:
+                // Pinned to the first tag whose image declares /data as a volume, so the warning
+                // does not depend on which version the package currently defaults to.
+                builder.AddDocumentDB("documentdb")
+                    .WithImageTag("pg17-0.116.0")
+                    .WithDataVolume(targetPath: "/pgdata");
                 break;
 
             case ReadOnlyDataMountScenario:

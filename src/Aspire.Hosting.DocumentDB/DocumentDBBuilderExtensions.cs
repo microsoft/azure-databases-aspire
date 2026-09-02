@@ -848,6 +848,39 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// The host directory a bind-mounted data directory really occupies: the mount source with the
+    /// part of <c>DATA_PATH</c> that falls below the mount target appended, canonicalized with host
+    /// semantics.
+    /// </summary>
+    /// <remarks>
+    /// A bind mount is a window onto the host filesystem, so where the cluster lands is a single
+    /// host path and not the (source, subdirectory) pair it was written as. Binding
+    /// <c>/srv/documentdb</c> at <c>/data</c> with <c>DATA_PATH=/data/cluster</c> and binding
+    /// <c>/srv/documentdb/cluster</c> at <c>/data</c> put their clusters in the same place, and
+    /// comparing the pairs rather than the path would miss it.
+    /// </remarks>
+    private static string CanonicalizeHostDataDirectory(string source, string containerSubpath)
+    {
+        if (containerSubpath.Length == 0)
+        {
+            return CanonicalizeHostPath(source);
+        }
+
+        // The subpath is a container path; its separators become the host's on the way through.
+        var hostSubpath = containerSubpath.Replace('/', Path.DirectorySeparatorChar);
+
+        try
+        {
+            return CanonicalizeHostPath(Path.Combine(CanonicalizeHostPath(source), hostSubpath));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
+        {
+            // Same fallback as CanonicalizeHostPath: compare what was written rather than crash.
+            return source + Path.DirectorySeparatorChar + hostSubpath;
+        }
+    }
+
+    /// <summary>
     /// Installs the data-storage guard: a final environment callback and a final command-line
     /// callback that reject data-directory configurations the DocumentDB Local container cannot
     /// use, before the container is created and fails with a misleading message.
@@ -892,19 +925,27 @@ public static class DocumentDBBuilderExtensions
     /// </para>
     /// <para>
     /// The guard runs <em>inside</em> the resource's real configuration pipeline rather than
-    /// beside it. Both callbacks are appended when <see cref="BeforeStartEvent"/> is published —
-    /// after every builder call has been made and before Aspire gathers anything — so they are the
-    /// last callbacks in their pipelines and observe the final <c>DATA_PATH</c> and the final
-    /// argument list, including values produced by dynamic callbacks, whatever the call order. The
-    /// environment callback replaces <c>DATA_PATH</c> with the single canonical string it
-    /// validated, so the container is guaranteed to receive exactly the directory that was judged.
-    /// Aspire caches each callback's result for the lifetime of a run and re-evaluates it on
-    /// restart, so a stateful callback is evaluated once and the guard and the container cannot
-    /// disagree.
+    /// beside it. Both callbacks observe the final <c>DATA_PATH</c> and the final argument list,
+    /// including values produced by dynamic callbacks, whatever the call order. The environment
+    /// callback replaces <c>DATA_PATH</c> with the single canonical string it validated — and sets
+    /// it even when nothing else did — so the container is guaranteed to receive exactly the
+    /// directory that was judged, whatever default its image would otherwise have applied. Aspire
+    /// caches each callback's result for the lifetime of a run and re-evaluates it on restart, so a
+    /// stateful callback is evaluated once and the guard and the container cannot disagree.
     /// </para>
     /// <para>
-    /// The one ordering the guard cannot be last for is a <c>WithEnvironment</c> call made from a
-    /// <see cref="BeforeStartEvent"/> subscriber registered <em>after</em> <c>AddDocumentDB</c>.
+    /// Being last is established twice and then verified. The callbacks are appended when
+    /// <see cref="BeforeStartEvent"/> is published, which is before Aspire gathers anything but
+    /// before <see cref="Lifecycle.IDistributedApplicationLifecycleHook.BeforeStartAsync"/> and
+    /// before any later <see cref="BeforeStartEvent"/> subscriber, either of which may append more
+    /// callbacks. They are therefore moved back to the end of their pipelines when
+    /// <see cref="BeforeResourceStartedEvent"/> is published, the last phase Aspire offers before
+    /// the container's environment and arguments are gathered. Anything that appends after
+    /// <em>that</em> — a <see cref="BeforeResourceStartedEvent"/> subscriber registered after
+    /// <c>AddDocumentDB</c>, or a lifecycle hook in publish mode, where no per-resource event is
+    /// published — is caught by the callbacks themselves: each one checks that it is still the last
+    /// of its kind and fails the resource rather than validating a configuration something else can
+    /// still change.
     /// </para>
     /// </remarks>
     private static IResourceBuilder<DocumentDBServerResource> SubscribeDataStorageGuard(
@@ -913,9 +954,27 @@ public static class DocumentDBBuilderExtensions
         var resource = builder.Resource;
         var coordinator = DataStorageCoordinator.For(builder.ApplicationBuilder);
 
-        builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((evt, _) =>
         {
-            InstallDataStorageGuard(resource, coordinator);
+            InstallDataStorageGuard(resource, coordinator, evt.Services);
+            return Task.CompletedTask;
+        });
+
+        // Two later phases, because no single one covers every shape of resource. Endpoints are
+        // allocated before any container object is created, on every path including the delayed
+        // creation an explicitly started container with a persistent lifetime takes; the
+        // per-resource start event is the last phase before an ordinary container's configuration
+        // is built. Re-appending at either puts the guard after anything a lifecycle hook or a
+        // later BeforeStartEvent subscriber added.
+        builder.ApplicationBuilder.Eventing.Subscribe<ResourceEndpointsAllocatedEvent>(resource, (evt, _) =>
+        {
+            InstallDataStorageGuard(resource, coordinator, evt.Services);
+            return Task.CompletedTask;
+        });
+
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(resource, (evt, _) =>
+        {
+            InstallDataStorageGuard(resource, coordinator, evt.Services);
             return Task.CompletedTask;
         });
 
@@ -924,24 +983,38 @@ public static class DocumentDBBuilderExtensions
 
     /// <summary>
     /// Appends the guard's environment and command-line callbacks to <paramref name="resource"/>,
-    /// at most once.
+    /// or moves the ones already installed back to the end of their pipelines.
     /// </summary>
-    private static void InstallDataStorageGuard(DocumentDBServerResource resource, DataStorageCoordinator coordinator)
+    /// <remarks>
+    /// Moving re-uses the same annotation instances, so Aspire's per-callback result cache is
+    /// untouched and the guard is still evaluated exactly once per run.
+    /// </remarks>
+    private static void InstallDataStorageGuard(
+        DocumentDBServerResource resource,
+        DataStorageCoordinator coordinator,
+        IServiceProvider? services)
     {
-        if (resource.Annotations.OfType<DataStorageGuardAnnotation>().Any())
+        if (resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault() is { } installed)
         {
+            installed.Services ??= services;
+            MoveToEnd(resource, installed.Environment);
+            MoveToEnd(resource, installed.Arguments);
             return;
         }
-
-        resource.Annotations.Add(new DataStorageGuardAnnotation());
 
         // One-shot so restart attempts don't repeat advisory warnings. Hard failures are
         // deterministic and intentionally re-thrown on every start attempt.
         var sharedStorageWarningLogged = 0;
         var declaredVolumeWarningLogged = 0;
 
-        resource.Annotations.Add(new EnvironmentCallbackAnnotation(async context =>
+        DataStorageGuardAnnotation? guard = null;
+        EnvironmentCallbackAnnotation? environmentCallback = null;
+        CommandLineArgsCallbackAnnotation? argumentsCallback = null;
+
+        environmentCallback = new EnvironmentCallbackAnnotation(async context =>
         {
+            EnsureGuardRunsLast(resource, environmentCallback!, "environment");
+
             RejectMountTargetsThatEscapeContainerRoot(resource);
 
             var dataPath = await CanonicalizeEffectiveDataPathAsync(resource, context).ConfigureAwait(false);
@@ -984,7 +1057,7 @@ public static class DocumentDBBuilderExtensions
                 !resource.Annotations.OfType<ContainerMountAnnotation>().Any(mount => TargetsContainerPath(mount, DefaultMountedDataPath)) &&
                 Interlocked.CompareExchange(ref declaredVolumeWarningLogged, 1, 0) == 0)
             {
-                context.Logger?.LogWarning(
+                TryGetStorageLogger(resource, context)?.LogWarning(
                     "DocumentDB resource '{ResourceName}' stores data at '{DataPath}', but its " +
                     "image (v{Version} or later) declares '{DefaultDataPath}' as a container " +
                     "volume. Neither Docker nor Aspire can un-declare an image volume, so the " +
@@ -996,17 +1069,130 @@ public static class DocumentDBBuilderExtensions
                     DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion,
                     DefaultMountedDataPath);
             }
-        }));
+        });
 
-        resource.Annotations.Add(new CommandLineArgsCallbackAnnotation(context =>
+        argumentsCallback = new CommandLineArgsCallbackAnnotation(context =>
         {
+            EnsureGuardRunsLast(resource, argumentsCallback!, "command-line");
+
             RejectReservedDataPathArguments(resource, context);
             return Task.CompletedTask;
-        }));
+        });
+
+        guard = new DataStorageGuardAnnotation(environmentCallback, argumentsCallback) { Services = services };
+        resource.Annotations.Add(guard);
+        resource.Annotations.Add(environmentCallback);
+        resource.Annotations.Add(argumentsCallback);
     }
 
-    /// <summary>Marks a resource whose storage guard callbacks are already installed.</summary>
-    private sealed class DataStorageGuardAnnotation : IResourceAnnotation;
+    /// <summary>
+    /// Moves an annotation the resource already carries to the end of the collection, so it is the
+    /// last of its kind when Aspire gathers it. The instance is preserved, so its cached result —
+    /// and with it the guarantee of a single evaluation — is preserved too.
+    /// </summary>
+    private static void MoveToEnd(DocumentDBServerResource resource, IResourceAnnotation annotation)
+    {
+        if (!resource.Annotations.Remove(annotation))
+        {
+            return;
+        }
+
+        resource.Annotations.Add(annotation);
+    }
+
+    /// <summary>
+    /// Fails the resource when something appended a callback of the same kind after the guard's.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The guard's answer is only worth anything if nothing can change the configuration after it.
+    /// It is appended at <see cref="BeforeStartEvent"/> and moved back to the end at
+    /// <see cref="BeforeResourceStartedEvent"/>, which covers lifecycle hooks and later
+    /// <see cref="BeforeStartEvent"/> subscribers; a subscriber that appends later still — or, in
+    /// publish mode, any lifecycle hook, because no per-resource event is published there — would
+    /// otherwise be able to move the data directory past every rule.
+    /// </para>
+    /// <para>
+    /// That is reported rather than tolerated. No value is included in the message: the point is
+    /// the shape of the configuration, and the callback that ran last may well be carrying a
+    /// secret.
+    /// </para>
+    /// </remarks>
+    private static void EnsureGuardRunsLast<TAnnotation>(
+        DocumentDBServerResource resource,
+        TAnnotation guardCallback,
+        string pipeline)
+        where TAnnotation : class, IResourceAnnotation
+    {
+        var last = resource.Annotations.OfType<TAnnotation>().LastOrDefault();
+        if (ReferenceEquals(last, guardCallback))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' has a later {pipeline} callback registered after " +
+            $"its data-storage guard, so the guard cannot be sure the configuration it checked is the " +
+            $"one the container receives. The guard is appended when the application starts, and " +
+            $"moved back to the end of its pipeline at the latest phase the run offers; a callback " +
+            $"added after that usually comes from a subscriber registered after AddDocumentDB, or " +
+            $"from an IDistributedApplicationLifecycleHook where no later phase is published. The " +
+            $"resource is failed instead of being started on an unchecked data directory. " +
+            $"Recovery: make that configuration part of the " +
+            $"application model (WithDataVolume(), WithDataBindMount(...), " +
+            $"WithEnvironment(\"{DataPathEnvVarName}\", ...), WithArgs(...)) rather than adding it " +
+            $"after the model is built, or register the subscriber before AddDocumentDB.");
+    }
+
+    /// <summary>
+    /// Carries the guard's own callbacks so a later phase can move them back to the end of their
+    /// pipelines without re-creating them.
+    /// </summary>
+    private sealed class DataStorageGuardAnnotation(
+        EnvironmentCallbackAnnotation environment,
+        CommandLineArgsCallbackAnnotation arguments) : IResourceAnnotation
+    {
+        public EnvironmentCallbackAnnotation Environment { get; } = environment;
+
+        public CommandLineArgsCallbackAnnotation Arguments { get; } = arguments;
+
+        /// <summary>
+        /// The AppHost's services, captured from whichever event installed or re-established the
+        /// guard, so its advisory warnings can reach a logger that is really wired up.
+        /// </summary>
+        public IServiceProvider? Services { get; set; }
+    }
+
+    /// <summary>
+    /// A logger for the guard's advisory warnings.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Not <see cref="EnvironmentCallbackContext.Logger"/>: Aspire discovers a container's
+    /// dependencies before it builds its configuration, and that pass runs the environment
+    /// callbacks — through the same one-shot cache — with no logger attached. The guard's callback
+    /// is therefore evaluated once, usually by that pass, and anything written to the context's
+    /// logger is discarded. The AppHost's own services are captured when the guard is installed so
+    /// there is a logger to write to whichever pass gets there first.
+    /// </para>
+    /// <para>
+    /// The destination is the AppHost's log, under
+    /// <see cref="StorageLoggerCategory"/>, rather than the resource's log pane. These warnings are
+    /// about how the resource was configured and are produced before the container exists, so they
+    /// belong with the orchestration diagnostics; the resource pane carries the container's own
+    /// output, whose stream is not yet being replayed when the configuration is built.
+    /// </para>
+    /// </remarks>
+    private static ILogger? TryGetStorageLogger(
+        DocumentDBServerResource resource,
+        EnvironmentCallbackContext context)
+    {
+        var services = resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault()?.Services
+            ?? context.ExecutionContext.Services;
+
+        return services?.GetService<ILoggerFactory>()?.CreateLogger(StorageLoggerCategory)
+            ?? context.Logger;
+    }
 
     /// <summary>
     /// Refuses a mount target whose <c>..</c> segments reach above the container root. Docker does
@@ -1057,7 +1243,15 @@ public static class DocumentDBBuilderExtensions
     /// context Aspire itself builds for an environment variable, and the canonical result replaces
     /// it. Aspire then has a string to render and never asks the provider again, so there is
     /// exactly one evaluation and no way for the guard and the container to see different values.
-    /// In publish mode a deferred value stays a manifest expression and is left untouched.
+    /// </para>
+    /// <para>
+    /// In publish mode a deferred value cannot be resolved: it is a manifest expression, and
+    /// reading the value behind it would both fail (the value belongs to the deployment, not the
+    /// build) and put a secret into a place it does not belong. Such a value is therefore refused
+    /// whenever the resource also mounts storage, because then the read-only, duplicate-mount and
+    /// shared-data-directory rules would all be answering about a directory nobody can name. A
+    /// resource that mounts nothing has no storage to get wrong, so there the deferred value is
+    /// left alone.
     /// </para>
     /// <para>
     /// Nothing else is read or resolved: the password and every other environment value are left
@@ -1067,7 +1261,9 @@ public static class DocumentDBBuilderExtensions
     /// An absent, null or empty <c>DATA_PATH</c> is the image's own default. The entrypoint
     /// applies <c>DATA_PATH=${DATA_PATH:-/data}</c>, which treats empty and unset alike, so an
     /// empty value is judged as <c>/data</c> rather than turned into a failure of this package's
-    /// invention.
+    /// invention — and the canonical <c>/data</c> is then written into the environment, so a custom
+    /// image whose own default is somewhere else cannot quietly write to a directory the guard
+    /// never looked at.
     /// </para>
     /// </remarks>
     private static async ValueTask<string?> CanonicalizeEffectiveDataPathAsync(
@@ -1076,6 +1272,9 @@ public static class DocumentDBBuilderExtensions
     {
         if (!context.EnvironmentVariables.TryGetValue(DataPathEnvVarName, out var value) || value is null)
         {
+            // Written rather than assumed: the checks below are about '/data', so '/data' is what
+            // the container must be told to use, whatever its image would have defaulted to.
+            context.EnvironmentVariables[DataPathEnvVarName] = DefaultMountedDataPath;
             return DefaultMountedDataPath;
         }
 
@@ -1086,6 +1285,23 @@ public static class DocumentDBBuilderExtensions
         }
         else if (context.ExecutionContext.IsPublishMode)
         {
+            if (resource.Annotations.OfType<ContainerMountAnnotation>().Any())
+            {
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{resource.Name}' sets {DataPathEnvVarName} to a value that " +
+                    $"is only known at deployment time, and also mounts storage. In publish mode the " +
+                    $"value is a manifest expression, so the data directory cannot be identified: the " +
+                    $"read-only, duplicate-mount and shared-data-directory rules would all be silently " +
+                    $"skipped, and a manifest that puts two DocumentDB resources on one data directory " +
+                    $"would be published without complaint. Resolving it here is not an option either " +
+                    $"— the value belongs to the deployment, and a parameter may be a secret. " +
+                    $"Recovery: give {DataPathEnvVarName} a literal path (or leave it to " +
+                    $"WithDataVolume()/WithDataBindMount(...), which mount the container default " +
+                    $"'{DefaultMountedDataPath}'), and use a parameter for the storage source instead " +
+                    $"of the container path.");
+            }
+
+            // No mounts, so there is no storage this value could be wrong about.
             return null;
         }
         else if (value is IValueProvider provider)
@@ -1210,11 +1426,28 @@ public static class DocumentDBBuilderExtensions
     /// when another DocumentDB resource has already registered the same one.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Each resource registers while its own configuration pipeline runs, so no peer's callbacks
     /// are ever executed on its behalf and no unrelated value is resolved. Every peer already
     /// registered on the same storage is examined before anything is reported: a pairing that only
     /// warrants a warning must not mask a later peer that warrants a failure, and which resource
     /// reaches the storage first must not change the verdict.
+    /// </para>
+    /// <para>
+    /// What is registered is the directory the cluster really occupies, not the pair of strings it
+    /// was spelled with. For a bind mount that is one host path — the mount source with the part of
+    /// <c>DATA_PATH</c> that falls below the mount target appended — so a resource that binds
+    /// <c>/srv/documentdb</c> and writes to <c>/data/cluster</c> and a resource that binds
+    /// <c>/srv/documentdb/cluster</c> and writes to <c>/data</c> are recognised as the one
+    /// directory they are. It is compared with the host's own case rules, which is also what makes
+    /// <c>/data/Cluster</c> and <c>/data/cluster</c> one directory on a case-insensitive host and
+    /// two on Linux.
+    /// </para>
+    /// <para>
+    /// A volume name is not a path and cannot be combined with one, so a volume's identity stays
+    /// its name plus the subdirectory, compared exactly: the container reads that subdirectory on
+    /// its own case-sensitive filesystem.
+    /// </para>
     /// </remarks>
     private static void ClaimDataStorage(
         DataStorageCoordinator coordinator,
@@ -1225,35 +1458,39 @@ public static class DocumentDBBuilderExtensions
         EnvironmentCallbackContext context,
         ref int sharedStorageWarningLogged)
     {
-        // Two resources contend only when they mount the same source *and* place their data
-        // directories at the same place within it: one volume shared as '/data/alpha' and
-        // '/data/beta' is two directories, not one cluster.
+        // Two resources contend only when their data directories are the same directory: one
+        // volume shared as '/data/alpha' and '/data/beta' is two directories, not one cluster.
         var subpath = dataPath.Length == mountTarget.Length
             ? string.Empty
             : dataPath[(mountTarget.Length + 1)..];
 
-        var source = dataMount.Type == ContainerMountType.BindMount
-            ? CanonicalizeHostPath(dataMount.Source!)
-            : dataMount.Source!;
+        string key;
+        string description;
 
-        if (dataMount.Type == ContainerMountType.BindMount && HostPathComparison != StringComparison.Ordinal)
+        if (dataMount.Type == ContainerMountType.BindMount)
         {
-            source = source.ToUpperInvariant();
+            var hostDirectory = CanonicalizeHostDataDirectory(dataMount.Source!, subpath);
+            description = $"host directory '{hostDirectory}'";
+
+            key = "bind\u0000" + (HostPathComparison == StringComparison.Ordinal
+                ? hostDirectory
+                : hostDirectory.ToUpperInvariant());
+        }
+        else
+        {
+            description = $"volume '{dataMount.Source}'";
+            if (subpath.Length > 0)
+            {
+                description += $" (subdirectory '{subpath}')";
+            }
+
+            key = $"volume\u0000{dataMount.Source}\u0000{subpath}";
         }
 
-        var peers = coordinator.Register($"{dataMount.Type}\u0000{source}\u0000{subpath}", resource);
+        var peers = coordinator.Register(key, resource);
         if (peers.Count == 0)
         {
             return;
-        }
-
-        var description = dataMount.Type == ContainerMountType.BindMount
-            ? $"host directory '{dataMount.Source}'"
-            : $"volume '{dataMount.Source}'";
-
-        if (subpath.Length > 0)
-        {
-            description += $" (subdirectory '{subpath}')";
         }
 
         var thisInterlocked = ResolvesToDataVolumeAwareImage(resource);
@@ -1282,9 +1519,10 @@ public static class DocumentDBBuilderExtensions
 
         if (warnings is not null && Interlocked.CompareExchange(ref sharedStorageWarningLogged, 1, 0) == 0)
         {
+            var logger = TryGetStorageLogger(resource, context);
             foreach (var warning in warnings)
             {
-                context.Logger?.LogWarning("{Message}", warning);
+                logger?.LogWarning("{Message}", warning);
             }
         }
     }
@@ -1310,18 +1548,47 @@ public static class DocumentDBBuilderExtensions
     /// there is nothing to gain by adding a second.
     /// </para>
     /// <para>
-    /// Only literal string arguments are examined. A deferred argument is left alone: resolving it
-    /// to look at it would be a second evaluation, and replacing it with its resolved value would
-    /// discard the sensitivity Aspire tracks for parameters.
+    /// A token that is not a literal string cannot be read without resolving it, and resolving it
+    /// here would be a second evaluation of a value Aspire is about to evaluate itself — of a
+    /// parameter whose sensitivity would be lost if the resolved string were written back, at that.
+    /// So such a token is refused unless its position makes it impossible for it to be an option at
+    /// all: the entrypoint's own grammar is <c>--option value</c>, so a token that directly follows
+    /// a literal option known to take a value is that option's operand and is left alone. Anywhere
+    /// else it could resolve to <c>--data-path</c>, and the resource is failed instead.
     /// </para>
     /// </remarks>
     private static void RejectReservedDataPathArguments(IResource resource, CommandLineArgsCallbackContext context)
     {
+        // Mirrors the entrypoint's own cursor: an option that takes a value consumes exactly the
+        // next token, whatever that token looks like. Tracking that for literal tokens too is what
+        // keeps the two cursors together — '--username --owner X' feeds '--owner' to '--username'
+        // and then reads 'X' as an option name, and a model that only tracked deferred tokens would
+        // have believed 'X' was sheltered.
+        var expectOperand = false;
+
         foreach (var argument in context.Args)
         {
+            if (expectOperand)
+            {
+                expectOperand = false;
+                continue;
+            }
+
             if (argument is not string text)
             {
-                continue;
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{resource.Name}' passes a command-line argument whose value " +
+                    $"is only known later (a parameter or an expression) in a position where the " +
+                    $"container entrypoint reads an option name. The entrypoint treats " +
+                    $"'--data-path' as an override of the {DataPathEnvVarName} environment variable, " +
+                    $"so a token that resolved to it there would move the data directory past the " +
+                    $"read-only, duplicate-mount and shared-data-directory checks — and the guard " +
+                    $"cannot rule that out without resolving the token a second time, which would " +
+                    $"both duplicate Aspire's own evaluation and risk exposing a secret. Recovery: " +
+                    $"pass option names as literal strings (a deferred value is fine as the operand " +
+                    $"of one, as in WithArgs(\"--log-level\", level)), and set the data directory " +
+                    $"through storage — WithDataVolume(), WithDataBindMount(...), or " +
+                    $"WithEnvironment(\"{DataPathEnvVarName}\", ...).");
             }
 
             var name = text;
@@ -1331,23 +1598,56 @@ public static class DocumentDBBuilderExtensions
                 name = text[..separator];
             }
 
-            if (!string.Equals(name, "--data-path", StringComparison.Ordinal) &&
-                !string.Equals(name, "-d", StringComparison.Ordinal))
+            if (string.Equals(name, "--data-path", StringComparison.Ordinal) ||
+                string.Equals(name, "-d", StringComparison.Ordinal))
             {
-                continue;
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{resource.Name}' passes the command-line argument '{text}'. " +
+                    $"The container entrypoint treats '--data-path' as an override of the DATA_PATH " +
+                    $"environment variable ('-d' is reserved for the same setting), so it would move " +
+                    $"the data directory to a path the environment never names — past the read-only, " +
+                    $"duplicate-mount and shared-data-directory checks, and past the mount that was " +
+                    $"supposed to back it. Recovery: set the data directory through storage instead — " +
+                    $"WithDataVolume(), WithDataBindMount(...), or WithEnvironment(\"{DataPathEnvVarName}\", ...) " +
+                    $"— and remove the argument.");
             }
 
-            throw new InvalidOperationException(
-                $"DocumentDB resource '{resource.Name}' passes the command-line argument '{text}'. " +
-                $"The container entrypoint treats '--data-path' as an override of the DATA_PATH " +
-                $"environment variable ('-d' is reserved for the same setting), so it would move " +
-                $"the data directory to a path the environment never names — past the read-only, " +
-                $"duplicate-mount and shared-data-directory checks, and past the mount that was " +
-                $"supposed to back it. Recovery: set the data directory through storage instead — " +
-                $"WithDataVolume(), WithDataBindMount(...), or WithEnvironment(\"{DataPathEnvVarName}\", ...) " +
-                $"— and remove the argument.");
+            // An option written as '--option=value' carries its own operand, so the next token is
+            // read as an option name again.
+            expectOperand = separator < 0 && s_valueTakingEntrypointOptions.Contains(name);
         }
     }
+
+    /// <summary>
+    /// The container entrypoint options that consume the token after them, so that a deferred
+    /// token in that position is an operand rather than a possible <c>--data-path</c>.
+    /// </summary>
+    /// <remarks>
+    /// Taken from the entrypoint's own argument loop, which has carried the same set from
+    /// <c>0.112.0</c> through <c>0.116.0</c>. Options that take no operand (<c>-h</c>,
+    /// <c>--help</c>, <c>--skip-init-data</c>, <c>--disable-extended-rum</c>) are deliberately
+    /// absent: the token after one of those is read as the next option name. An option a future
+    /// image adds is absent too, which fails the deferred token closed — the safe direction.
+    /// </remarks>
+    private static readonly HashSet<string> s_valueTakingEntrypointOptions = new(StringComparer.Ordinal)
+    {
+        "--allow-external-connections",
+        "--cert-path",
+        "--create-user",
+        "--documentdb-port",
+        "--enable-telemetry",
+        "--init-data",
+        "--init-data-path",
+        "--key-file",
+        "--log-level",
+        "--owner",
+        "--password",
+        "--pg-port",
+        "--start-pg",
+        "--tlsMode",
+        "--toast-compression",
+        "--username",
+    };
 
     private static string SharedDataDirectoryMessage(
         IResource resource,
