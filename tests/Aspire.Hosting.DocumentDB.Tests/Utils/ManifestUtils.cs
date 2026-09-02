@@ -152,6 +152,44 @@ public sealed class ManifestUtils
         return node;
     }
 
+    /// <summary>
+    /// Writes a resource's manifest entry through Aspire's real writer, expecting the write to be
+    /// refused, and returns both the failure and the bytes the writer had already produced when it
+    /// was raised.
+    /// </summary>
+    /// <remarks>
+    /// What the entry would have carried is the whole point of the refusal. Aspire emits a
+    /// container's connection string and image before it evaluates a single environment callback,
+    /// so a callback that changes the model from inside that evaluation leaves the already-written
+    /// fields describing the resource as it was; the only way to assert that is to read what the
+    /// writer had emitted at the moment the refusal came. The result is deliberately raw text: the
+    /// entry is unfinished, which is exactly what "the partly written manifest is abandoned"
+    /// means.
+    /// </remarks>
+    public static async Task<(InvalidOperationException Failure, string Written)> WriteResourceExpectingFailureAsync(
+        IResource resource,
+        string? manifestDirectory = null)
+    {
+        manifestDirectory ??= Environment.CurrentDirectory;
+
+        using var ms = new MemoryStream();
+        var writer = new Utf8JsonWriter(ms);
+        var executionContext = new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish);
+        writer.WriteStartObject();
+        var context = new ManifestPublishingContext(executionContext, Path.Combine(manifestDirectory, "manifest.json"), writer);
+
+        var writeResourceMethod = typeof(ManifestPublishingContext)
+            .GetMethod("WriteResourceAsync", BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(writeResourceMethod);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => (Task)writeResourceMethod.Invoke(context, [resource])!);
+
+        writer.Flush();
+
+        return (failure, Encoding.UTF8.GetString(ms.ToArray()));
+    }
+
     public static async Task<JsonNode?> GetManifestOrNull(IResource resource, string? manifestDirectory = null)
     {
         manifestDirectory ??= Environment.CurrentDirectory;
