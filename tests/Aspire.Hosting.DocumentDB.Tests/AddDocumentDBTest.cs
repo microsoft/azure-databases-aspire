@@ -1,6 +1,8 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+#pragma warning disable ASPIRECONTAINERSHELLEXECUTION001
+
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Net.Sockets;
@@ -4421,7 +4423,7 @@ public class AddDocumentDBTests
         // and one of them is what the wrapper falls back to.
         Assert.DoesNotContain("\"/var/tmp|", script, StringComparison.Ordinal);
         Assert.DoesNotContain("\"/dev/shm|", script, StringComparison.Ordinal);
-        Assert.Contains("every temporary directory is on the same host directory or volume as DATA_PATH", script, StringComparison.Ordinal);
+        Assert.Contains("aliases DATA_PATH storage or cannot be proven independent", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -4465,9 +4467,45 @@ public class AddDocumentDBTests
     }
 
     /// <summary>
-    /// The other direction: the scratch root is a subdirectory of the data directory's host tree,
-    /// so it aliases the data directory itself and every directory above it inside that tree — but
-    /// not a sibling.
+    /// DATA_PATH can be above the mount that exposes the candidate's physical alias. Writing
+    /// through the candidate still creates an entry inside the data directory.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ATemporaryRootAliasedBelowDataPathRejectsTheContainingDirectory(bool useBindMounts)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("DATA_PATH", "/data");
+
+        if (useBindMounts)
+        {
+            documentDB
+                .WithBindMount("/srv/documentdb/cluster", "/data/cluster")
+                .WithBindMount("/srv/scratch", "/tmp");
+        }
+        else
+        {
+            documentDB
+                .WithVolume("shared", "/data/cluster")
+                .WithVolume("shared", "/tmp");
+        }
+
+        documentDB.WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other direction: the scratch root is a subdirectory of the data directory's host tree.
+    /// Because both paths are bind-backed, every DATA_PATH under that bind target is conservatively
+    /// incompatible; a daemon-side symbolic link could make even a sibling spelling an alias.
     /// </summary>
     [Fact]
     public async Task ATemporaryRootBoundBelowTheDataDirectoryAliasesOnlyTheDirectoriesThatContainIt()
@@ -4483,26 +4521,19 @@ public class AddDocumentDBTests
 
         var script = await GetWrapperScriptAsync(SingleServerResource(app));
 
-        // '/data' contains the scratch region, and '/data/scratch' is it.
+        // The whole bind-backed data region is rejected, which includes both '/data' and every
+        // descendant such as '/data/scratch'.
         Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
-        Assert.Contains("\"/tmp|/data/scratch\"", script, StringComparison.Ordinal);
-        Assert.Contains("\"/tmp|/data/scratch\"/*", script, StringComparison.Ordinal);
-
-        // A sibling data directory is a different host directory and stays usable.
-        Assert.DoesNotContain("\"/tmp|/data/cluster\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// Two bind sources that are different directories leave every candidate usable, and the
-    /// emitted script is the one a resource with no mounts gets. This is also where the documented
-    /// limit sits: sources are compared as written, so two spellings that name one directory only
-    /// through a symbolic link are treated as different storage here. Resolving them would require
-    /// the path to exist on the machine building the model — which a bind source aimed at a VM,
-    /// a remote daemon, or a directory Docker has yet to create does not — and would make the
-    /// published manifest depend on the publishing machine's filesystem.
+    /// Two lexically different bind sources may resolve through daemon-side symbolic links to one
+    /// directory. The model cannot prove otherwise without depending on the local filesystem, so a
+    /// bind-backed candidate is conservatively skipped whenever DATA_PATH may also be bind-backed.
     /// </summary>
     [Fact]
-    public async Task ATemporaryRootBackedByDifferentStorageIsLeftAlone()
+    public async Task ATemporaryRootOnAnotherBindIsConservativelySkipped()
     {
         var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
@@ -4515,7 +4546,60 @@ public class AddDocumentDBTests
 
         var script = await GetWrapperScriptAsync(SingleServerResource(app));
 
-        Assert.DoesNotContain("$y|$d", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A bind mount and a named volume are distinct storage types, so no daemon-side path alias can
+    /// make them the same backing region.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DifferentStorageTypesLeaveTheTemporaryRootUsable(bool dataIsBind)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0");
+
+        if (dataIsBind)
+        {
+            documentDB
+                .WithDataBindMount("/srv/documentdb")
+                .WithVolume("scratch-volume", "/tmp");
+        }
+        else
+        {
+            documentDB
+                .WithDataVolume("documentdb-data")
+                .WithBindMount("/srv/scratch", "/tmp");
+        }
+
+        documentDB.WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.DoesNotContain("\"/tmp|/data\"", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DifferentNamedVolumesLeaveTheTemporaryRootUsable()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataVolume("documentdb-data")
+            .WithVolume("scratch-volume", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.DoesNotContain("\"/tmp|/data\"", script, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -4542,9 +4626,35 @@ public class AddDocumentDBTests
         Assert.Contains("\"/var/tmp|/data\"", script, StringComparison.Ordinal);
         Assert.Contains("\"/dev/shm|/data\"", script, StringComparison.Ordinal);
         Assert.Contains(
-            "if [ -n \"$w\" ]; then echo \"aspire-documentdb -- every temporary directory is on the same host directory or volume as DATA_PATH ($d), so the telemetry configuration cannot be kept out of it\" >&2; ",
+            "if [ -n \"$w\" ]; then echo \"aspire-documentdb -- every temporary directory aliases DATA_PATH storage or cannot be proven independent of it, so the telemetry configuration cannot be kept out of it\" >&2; ",
             script,
             StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Even three unrelated-looking bind source strings cannot prove physical independence from a
+    /// bind-backed DATA_PATH on a remote daemon. Every candidate is therefore rejected.
+    /// </summary>
+    [Fact]
+    public async Task EveryBindBackedTemporaryRootIsRejectedWhenDataPathIsBindBacked()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/scratch-one", "/tmp")
+            .WithBindMount("/srv/scratch-two", "/var/tmp")
+            .WithBindMount("/srv/scratch-three", "/dev/shm")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/var/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/dev/shm|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("cannot be proven independent", script, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -4558,7 +4668,7 @@ public class AddDocumentDBTests
             appBuilder.AddDocumentDB("DocumentDB")
                 .WithImageTag("pg17-0.116.0")
                 .WithDataBindMount("/srv/documentdb")
-                .WithBindMount("/srv/documentdb", "/tmp")
+                .WithBindMount("/srv/possibly-linked-scratch", "/tmp")
                 .WithOpenTelemetryMetrics());
 
         var script = manifest["resources"]?["DocumentDB"]?["args"]?[1]?.ToString();
@@ -6066,9 +6176,376 @@ public class AddDocumentDBTests
         Assert.Null(manifest["resources"]?["DocumentDB"]);
     }
 
+    public static TheoryData<string[], string> StorageChangingRuntimeArgumentCases => new()
+    {
+        { ["--mount", "type=volume,source=runtime-secret,target=/tmp"], "--mount" },
+        { ["--mount=type=volume,source=runtime-secret,target=/tmp"], "--mount" },
+        { ["--volume", "runtime-secret:/tmp"], "--volume" },
+        { ["--volume=runtime-secret:/tmp"], "--volume" },
+        { ["-v", "runtime-secret:/tmp"], "--volume" },
+        { ["-vruntime-secret:/tmp"], "--volume" },
+        { ["-v=runtime-secret:/tmp"], "--volume" },
+        { ["-itvruntime-secret:/tmp"], "--volume" },
+        { ["-l=", "--mount", "type=volume,source=runtime-secret,target=/tmp"], "--mount" },
+        { ["--tmpfs", "/tmp:size=64m"], "--tmpfs" },
+        { ["--tmpfs=/tmp:size=64m"], "--tmpfs" },
+        { ["--volume-driver", "runtime-secret"], "--volume-driver" },
+        { ["--volumes-from", "runtime-secret"], "--volumes-from" },
+        { ["--use-api-socket"], "--use-api-socket" },
+    };
+
+    [Theory]
+    [MemberData(nameof(StorageChangingRuntimeArgumentCases))]
+    public async Task WithOpenTelemetryMetricsRejectsStorageChangingRuntimeArguments(
+        string[] runtimeArguments,
+        string expectedOption)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("storage-changing container runtime option", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedOption, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--entrypoint", "/runtime-secret/entrypoint")]
+    [InlineData("--entrypoint=/runtime-secret/entrypoint")]
+    public async Task WithOpenTelemetryMetricsRejectsRawRuntimeEntrypoints(params string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("'--entrypoint'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    public static TheoryData<string[]> ProtectedRuntimeEnvironmentCases => new()
+    {
+        { ["--env", "DATA_PATH=/runtime-secret"] },
+        { ["--env=CONFIG_DIR=/runtime-secret"] },
+        { ["-e", "GATEWAY_HOME=/runtime-secret"] },
+        { ["-eOTEL_METRICS_ENABLED=false"] },
+        { ["-e=OTEL_EXPORTER_OTLP_ENDPOINT=http://runtime-secret"] },
+        { ["--env-file", "/runtime-secret/environment"] },
+        { ["--env-file=/runtime-secret/environment"] },
+    };
+
+    [Theory]
+    [MemberData(nameof(ProtectedRuntimeEnvironmentCases))]
+    public async Task WithOpenTelemetryMetricsRejectsProtectedRuntimeEnvironmentOverrides(
+        string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotTreatUnrelatedOptionValuesAsOptions()
+    {
+        string[] runtimeArguments =
+        [
+            "--label", "--mount",
+            "-l--volume",
+            "--health-cmd", "--entrypoint",
+            "--name=--tmpfs",
+            "--env", "UNRELATED=DATA_PATH=/runtime-secret",
+            "-eUNRELATED=--mount",
+            "-it",
+            "--label=CONFIG_DIR=/runtime-secret",
+        ];
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            runtimeArguments,
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserUsesResolvedDeferredValuesExactlyOnce()
+    {
+        var option = new CountingValueProvider("--label");
+        var value = new CountingValueProvider("--mount");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(option);
+                context.Args.Add(value);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            ["--label", "--mount"],
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+        Assert.Equal(1, option.Evaluations);
+        Assert.Equal(1, value.Evaluations);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredStorageOptionWithoutRepeatingIt()
+    {
+        var option = new CountingValueProvider("--mount");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(option);
+                context.Args.Add("type=volume,source=runtime-secret,target=/tmp");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, option.Evaluations);
+        Assert.Contains("'--mount'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredProtectedEnvironmentValue()
+    {
+        var environment = new CountingValueProvider("DATA_PATH=/runtime-secret");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--env");
+                context.Args.Add(environment);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, environment.Evaluations);
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserResolvesParameterBackedRuntimeArguments()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:runtime-option"] = "--label";
+        var runtimeOption = appBuilder.AddParameter("runtime-option", secret: true);
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(runtimeOption.Resource);
+                context.Args.Add("team=data");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            ["--label", "team=data"],
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsAllowsNullOrFalseShellExecution(bool? shellExecution)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+        documentDB.Resource.ShellExecution = shellExecution;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsShellExecutionBeforeDcpRewritesTheCommand()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+        documentDB.Resource.ShellExecution = true;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var runtimeException = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+        var commandException = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(resource));
+
+        Assert.Contains("ShellExecution", runtimeException.Message, StringComparison.Ordinal);
+        Assert.Contains("rewrites the already verified wrapper arguments", runtimeException.Message, StringComparison.Ordinal);
+        Assert.Equal(runtimeException.Message, commandException.Message);
+    }
+
+    [Fact]
+    public async Task ShellExecutionMutationAfterCachedCommandGenerationFailsAtRuntimeCheckpoint()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        documentDB.Resource.ShellExecution = true;
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("ShellExecution", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CustomImagesKeepTheirRuntimeAndShellExecutionBehavior()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("contoso/documentdb-custom")
+            .WithImageTag("latest")
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs("--label", "documentdb.custom=1");
+        documentDB.Resource.ShellExecution = true;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Null(resource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+        Assert.Equal(
+            ["--label", "documentdb.custom=1"],
+            await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task OfficialImagesWithoutTheWrapperKeepShellExecutionBehavior()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.114.0")
+            .WithOpenTelemetryMetrics()
+            .WithArgs("echo", "unchanged")
+            .WithContainerRuntimeArgs("--label", "documentdb.legacy=1");
+        documentDB.Resource.ShellExecution = true;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Null(resource.Entrypoint);
+        Assert.Equal(["echo", "unchanged"], await BuildContainerArgsAsync(resource));
+        Assert.Equal(
+            ["--label", "documentdb.legacy=1"],
+            await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenShellExecutionIsTrue()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+            documentDB.Resource.ShellExecution = true;
+        });
+
+        Assert.Contains("ShellExecution", log, StringComparison.Ordinal);
+        Assert.Contains("false or null", log, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsPublishesWithNullOrFalseShellExecution(bool? shellExecution)
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+            documentDB.Resource.ShellExecution = shellExecution;
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.Equal(GatewayConfigurationShell, resource?["entrypoint"]?.GetValue<string>());
+        Assert.Equal("-c", resource?["args"]?[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, resource?["args"]?[2]?.GetValue<string>());
+    }
+
     /// <summary>
     /// The other control: container runtime arguments that only do what they are for still work,
-    /// and the checkpoint the package adds contributes nothing to them.
+    /// and the checkpoint returns the same resolved values it validated.
     /// </summary>
     [Fact]
     public async Task WithOpenTelemetryMetricsLeavesBenignContainerRuntimeArgumentsAlone()
@@ -6477,6 +6954,17 @@ public class AddDocumentDBTests
     /// creator does: in annotation order, over one shared list, with no result cache — which is
     /// what makes this the run's unconditional checkpoint.
     /// </summary>
+    private sealed class CountingValueProvider(string value) : IValueProvider
+    {
+        public int Evaluations { get; private set; }
+
+        public ValueTask<string?> GetValueAsync(CancellationToken cancellationToken = default)
+        {
+            Evaluations++;
+            return ValueTask.FromResult<string?>(value);
+        }
+    }
+
     private static async Task<string[]> RunContainerRuntimeArgsAsync(DocumentDBServerResource resource)
     {
         var args = new List<object>();
@@ -8746,8 +9234,9 @@ public class AddDocumentDBTests
         Assert.Contains(
             "WithPostgresEndpoint() requires DocumentDB",
             (await FailAtTheRunCheckpointAsync(
-                documentDB => documentDB.WithImageTag("pg17-0.111.0"),
-                gatherFirst: false)).Message,
+                _ => { },
+                gatherFirst: false,
+                imageTag: "pg17-0.111.0")).Message,
             StringComparison.Ordinal);
     }
 
@@ -8756,13 +9245,19 @@ public class AddDocumentDBTests
     /// <see cref="BeforeResourceStartedEvent"/> subscriber change it, and returns whatever the
     /// container-runtime-arguments checkpoint refused it with.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="imageTag"/> is chosen while the model is being built, which is before the
+    /// run seals the image. A floor is therefore judged on the image the orchestrator was really
+    /// given rather than on one substituted after the seal, which is refused as a change instead.
+    /// </remarks>
     private static async Task<InvalidOperationException> FailAtTheRunCheckpointAsync(
         Action<IResourceBuilder<DocumentDBServerResource>> mutate,
-        bool gatherFirst)
+        bool gatherFirst,
+        string imageTag = InterlockedTag)
     {
         var appBuilder = CreateLifecycleTestBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag(InterlockedTag)
+            .WithImageTag(imageTag)
             .WithPostgresEndpoint()
             .WithOpenTelemetryMetrics();
 
@@ -8777,7 +9272,16 @@ public class AddDocumentDBTests
         });
 
         using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
-        await RaiseResourceStartPhasesAsync(app);
+
+        try
+        {
+            await RaiseResourceStartPhasesAsync(app);
+        }
+        catch (InvalidOperationException)
+        {
+            // A rule that also reports itself at the resource-start event reports itself again at
+            // the uncached checkpoint below, which is the one this asserts on.
+        }
 
         return await Assert.ThrowsAsync<InvalidOperationException>(
             () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));

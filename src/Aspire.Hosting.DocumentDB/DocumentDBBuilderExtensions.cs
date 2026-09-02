@@ -1,9 +1,12 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+#pragma warning disable ASPIRECONTAINERSHELLEXECUTION001 // Guard Aspire's experimental shell argument rewrite.
+
 using System.Globalization;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.DocumentDB;
+using Aspire.Hosting.Lifecycle;
 using Aspire.Hosting.Pipelines;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -116,6 +119,7 @@ public static class DocumentDBBuilderExtensions
         System.Collections.Immutable.ImmutableArray<EnvironmentCallbackAnnotation> EnvironmentCallbacks,
         System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
         string? Entrypoint,
+        bool ShellExecutionEnabled,
         DocumentDBEffectiveImage Image,
         TerminalCommandSeal Command);
 
@@ -236,7 +240,11 @@ public static class DocumentDBBuilderExtensions
     /// DocumentDB <c>0.116.0</c> refuses to initialise. The container path test stays in the
     /// script, because <c>DATA_PATH</c> can still be moved at runtime with <c>--data-path</c>; the
     /// backing test is decided here, where the mount table is known, and emitted as the exact set
-    /// of data directories each candidate root cannot be used with. See
+    /// of data directories each candidate root cannot be used with. Named volumes can be compared
+    /// exactly. Bind sources are resolved by the Docker daemon and may traverse unavailable
+    /// symbolic links, so a bind-backed candidate is conservatively skipped for every bind-backed
+    /// data path without consulting the local filesystem. Raw runtime mounts are rejected before
+    /// container creation because they are absent from this table. See
     /// <see cref="BuildOpenTelemetryScratchRootAliases"/>.
     /// </para>
     /// <para>
@@ -295,7 +303,7 @@ public static class DocumentDBBuilderExtensions
             ? "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi; "
             : "if [ -z \"$r\" ]; then " +
                 "if [ -n \"$w\" ]; then " +
-                    "echo \"aspire-documentdb -- every temporary directory is on the same host directory or volume as DATA_PATH ($d), so the telemetry configuration cannot be kept out of it\" >&2; " +
+                    "echo \"aspire-documentdb -- every temporary directory aliases DATA_PATH storage or cannot be proven independent of it, so the telemetry configuration cannot be kept out of it\" >&2; " +
                 "else " +
                     "echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; " +
                 "fi; " +
@@ -315,15 +323,15 @@ public static class DocumentDBBuilderExtensions
     private static readonly string[] s_openTelemetryScratchRoots = ["/tmp", "/var/tmp", "/dev/shm"];
 
     /// <summary>
-    /// Where a container path really lives: the host directory a bind mount opens onto, or a named
-    /// volume plus the part of the path that falls below its mount point.
+    /// Where a volume-backed container path lives: a named volume plus the part of the path below
+    /// its mount point. Bind mounts retain only their type because their physical source cannot be
+    /// proven from a host path string.
     /// </summary>
     /// <remarks>
-    /// A bind mount is a window onto the host filesystem, so its region is a single host path —
-    /// the mount source with the container subpath appended — and two windows onto the same
-    /// directory, or onto a directory and one of its ancestors, are the same storage however
-    /// differently their container paths are spelled. A volume name is not a path and cannot be
-    /// combined with one, so a volume's region stays its name plus the subdirectory, compared
+    /// A bind source is resolved by the Docker daemon, which may be remote and may traverse
+    /// symbolic links that do not exist on the model-building or publishing machine. Therefore two
+    /// bind-backed paths are conservatively treated as potentially aliased regardless of how their
+    /// source strings differ. Named-volume identity is daemon-independent and can still be compared
     /// exactly: the container reads that subdirectory on its own case-sensitive filesystem.
     /// </remarks>
     private readonly record struct MountBackingRegion(ContainerMountType Type, string Source, string Subpath);
@@ -343,12 +351,16 @@ public static class DocumentDBBuilderExtensions
     /// The data directory is only known at runtime — <c>DATA_PATH</c> can be a deferred value and
     /// <c>--data-path</c> can move it again — but the mount table is known here, so the answer is
     /// expressed as the set of data directories each candidate is incompatible with rather than as
-    /// a decision. Two shapes produce that set: a mount whose whole region falls inside the
-    /// candidate's region, which makes every path under that mount an alias; and a mount whose
-    /// region contains the candidate's, which makes the one path that lands on the candidate's
-    /// region an alias, together with everything under it and each of its ancestors down to the
-    /// mount point — a data directory above the scratch region contains it just as surely as one
-    /// inside it.
+    /// a decision. Named volumes can be compared exactly. Bind paths cannot: when both the
+    /// candidate and a possible data path are bind-backed, that candidate is skipped because the
+    /// Docker daemon may resolve lexically different sources through a symbolic link to the same
+    /// directory. This is deliberately independent of the local filesystem so run and publish
+    /// produce the same command for a remote daemon. Two shapes otherwise produce that set: a
+    /// mount whose whole region falls inside the candidate's region, which makes every path under
+    /// that mount an alias; and a mount whose region contains the candidate's, which makes the one
+    /// path that lands on the candidate's region an alias, together with everything under it and
+    /// each of its ancestors down to the mount point — a data directory above the scratch region
+    /// contains it just as surely as one inside it.
     /// </para>
     /// <para>
     /// Anonymous volumes are left out: nothing else can be mounted from one, so a candidate and a
@@ -396,12 +408,31 @@ public static class DocumentDBBuilderExtensions
 
                 foreach (var (other, otherTarget) in mounts)
                 {
+                    if (candidateRegion.Type == ContainerMountType.BindMount &&
+                        other.Type == ContainerMountType.BindMount)
+                    {
+                        // There is no daemon-independent proof that two bind source spellings are
+                        // physically disjoint. The remote daemon may resolve either through an
+                        // ancestor or a symbolic link that is absent on this machine.
+                        AddForbiddenDataPathAndAncestors(
+                            forbidden,
+                            candidate,
+                            otherTarget,
+                            withDescendants: true);
+                        continue;
+                    }
+
                     var otherRegion = DescribeMountBackingRegion(other, otherTarget, otherTarget);
 
                     if (TryGetRegionSubpath(candidateRegion, otherRegion, out _))
                     {
-                        // Everything the other mount supplies is inside the candidate's region.
-                        AddForbiddenDataPath(forbidden, candidate, otherTarget, withDescendants: true);
+                        // Everything the other mount supplies is inside the candidate's region,
+                        // and a DATA_PATH above the mount point contains that alias too.
+                        AddForbiddenDataPathAndAncestors(
+                            forbidden,
+                            candidate,
+                            otherTarget,
+                            withDescendants: true);
                         continue;
                     }
 
@@ -413,6 +444,12 @@ public static class DocumentDBBuilderExtensions
                     // The candidate's region is one directory below the other mount's. That exact
                     // container path is the alias, and so is anything under it - and so is every
                     // directory between the mount point and it, which would contain it.
+                    AddForbiddenDataPathAndAncestors(
+                        forbidden,
+                        candidate,
+                        otherTarget,
+                        withDescendants: false);
+
                     var path = otherTarget;
                     foreach (var segment in delta.Split('/', StringSplitOptions.RemoveEmptyEntries))
                     {
@@ -428,6 +465,32 @@ public static class DocumentDBBuilderExtensions
         }
 
         return [.. patterns];
+    }
+
+    /// <summary>
+    /// Records a mounted alias and every container directory above it, because DATA_PATH contains
+    /// the alias when it names any such ancestor.
+    /// </summary>
+    private static void AddForbiddenDataPathAndAncestors(
+        SortedSet<string> forbidden,
+        string candidate,
+        string dataPath,
+        bool withDescendants)
+    {
+        AddForbiddenDataPath(forbidden, candidate, dataPath, withDescendants);
+
+        var ancestor = dataPath;
+        while (true)
+        {
+            var separator = ancestor.LastIndexOf('/');
+            if (separator <= 0)
+            {
+                break;
+            }
+
+            ancestor = ancestor[..separator];
+            AddForbiddenDataPath(forbidden, candidate, ancestor, withDescendants: false);
+        }
     }
 
     /// <summary>
@@ -472,7 +535,7 @@ public static class DocumentDBBuilderExtensions
         var subpath = path.Length == mountTarget.Length ? string.Empty : path[(mountTarget.Length + 1)..];
 
         return mount.Type == ContainerMountType.BindMount
-            ? new(ContainerMountType.BindMount, CanonicalizeHostDataDirectory(mount.Source!, subpath), string.Empty)
+            ? new(ContainerMountType.BindMount, string.Empty, string.Empty)
             : new(ContainerMountType.Volume, mount.Source!, subpath);
     }
 
@@ -484,29 +547,10 @@ public static class DocumentDBBuilderExtensions
     {
         subpath = string.Empty;
 
-        if (outer.Type != inner.Type)
+        if (outer.Type != ContainerMountType.Volume ||
+            inner.Type != ContainerMountType.Volume)
         {
             return false;
-        }
-
-        if (outer.Type == ContainerMountType.BindMount)
-        {
-            if (string.Equals(outer.Source, inner.Source, HostPathComparison))
-            {
-                return true;
-            }
-
-            if (inner.Source.Length <= outer.Source.Length ||
-                !IsHostPathSeparator(inner.Source[outer.Source.Length]) ||
-                !inner.Source.StartsWith(outer.Source, HostPathComparison))
-            {
-                return false;
-            }
-
-            subpath = inner.Source[(outer.Source.Length + 1)..]
-                .Replace(Path.DirectorySeparatorChar, '/')
-                .Replace(Path.AltDirectorySeparatorChar, '/');
-            return true;
         }
 
         if (!string.Equals(outer.Source, inner.Source, StringComparison.Ordinal))
@@ -535,9 +579,6 @@ public static class DocumentDBBuilderExtensions
         subpath = inner.Subpath[(outer.Subpath.Length + 1)..];
         return true;
     }
-
-    private static bool IsHostPathSeparator(char value) =>
-        value == Path.DirectorySeparatorChar || value == Path.AltDirectorySeparatorChar;
 
     /// <summary>
     /// One <c>case</c> pattern matching the literal candidate root and data directory pair, as a
@@ -659,6 +700,12 @@ public static class DocumentDBBuilderExtensions
 
         var DocumentDBContainer = new DocumentDBServerResource(name, userName?.Resource, passwordParameter);
 
+        // One hook per application, however many DocumentDB resources it has: the hook walks the
+        // model rather than closing over a resource. See DocumentDBImageSealLifecycleHook.
+#pragma warning disable CS0618 // The lifecycle-hook phase has no eventing equivalent that runs after every BeforeStartEvent subscriber.
+        builder.Services.TryAddLifecycleHook<DocumentDBImageSealLifecycleHook>();
+#pragma warning restore CS0618
+
         string? connectionString = null;
 
         builder.Eventing.Subscribe<ConnectionStringAvailableEvent>(DocumentDBContainer, async (@event, ct) =>
@@ -726,6 +773,9 @@ public static class DocumentDBBuilderExtensions
             builder.Resource,
             (evt, ct) =>
             {
+                // The image the orchestrator prepared, not the annotation as it now reads.
+                VerifyImageSeal(evt.Resource);
+
                 if (DescribeUnpublishedPostgresVariant(evt.Resource, ResolveEffectiveImage(evt.Resource)) is { } incompatible)
                 {
                     throw incompatible;
@@ -962,7 +1012,7 @@ public static class DocumentDBBuilderExtensions
     /// message instead of silently skipping it.
     /// </para>
     /// </remarks>
-    private static DocumentDBEffectiveImage ResolveEffectiveImage(IResource resource)
+    private static DocumentDBEffectiveImage ResolveModelImage(IResource resource)
     {
         var image = resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
 
@@ -1003,6 +1053,220 @@ public static class DocumentDBBuilderExtensions
         }
 
         return new(DocumentDBImageOrigin.Curated, image.Image, tag, digest, pg, version);
+    }
+
+    /// <summary>
+    /// What this package knows about the image the resource will really run: the seal a run takes
+    /// before the orchestrator prepares anything, and the live model when there is none.
+    /// </summary>
+    /// <remarks>
+    /// Every version-dependent decision in this package goes through here, so all of them judge
+    /// one image — the one the container runtime is committed to. See
+    /// <see cref="DocumentDBImageSealLifecycleHook"/> for why the model on its own is not that
+    /// image, and <see cref="ResolveModelImage"/> for the live reading, which only the seal itself
+    /// and the check that the model still agrees with it are allowed to use. Outside a run no seal
+    /// is ever taken and this is exactly <see cref="ResolveModelImage"/> — a publish reads the
+    /// model at serialization time, which is the only image a publish has.
+    /// </remarks>
+    private static DocumentDBEffectiveImage ResolveEffectiveImage(IResource resource) =>
+        resource.Annotations.OfType<DocumentDBImageSealAnnotation>().LastOrDefault() is { } seal
+            ? seal.Image
+            : ResolveModelImage(resource);
+
+    /// <summary>
+    /// The image and build origin a run has been committed to, recorded at the last phase before
+    /// the orchestrator reads them.
+    /// </summary>
+    private sealed class DocumentDBImageSealAnnotation(
+        DocumentDBEffectiveImage image,
+        string? reference,
+        System.Collections.Immutable.ImmutableArray<DockerfileBuildAnnotation> build) : IResourceAnnotation
+    {
+        /// <summary>What this package knows about the sealed image.</summary>
+        public DocumentDBEffectiveImage Image { get; } = image;
+
+        /// <summary>
+        /// The image reference exactly as Aspire composes it for the container spec —
+        /// <see cref="ResourceExtensions.TryGetContainerImageName(IResource, out string?)"/> — so
+        /// the seal is literally the string the orchestrator snapshots rather than a
+        /// re-derivation of it. That includes the <c>registry/</c> prefix, the <c>@sha256:</c>
+        /// form a digest pin takes, and the built-image name a Dockerfile origin substitutes.
+        /// </summary>
+        public string? Reference { get; } = reference;
+
+        /// <summary>
+        /// The build definitions the resource carried, by identity and in order. They decide both
+        /// what <see cref="Reference"/> resolves to and whether the image is a published release
+        /// at all, and a replacement can leave the reference untouched.
+        /// </summary>
+        public System.Collections.Immutable.ImmutableArray<DockerfileBuildAnnotation> Build { get; } = build;
+    }
+
+    /// <summary>
+    /// Seals the image every DocumentDB resource in the model will run, at the last phase that is
+    /// guaranteed to precede the orchestrator's own reading of it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Aspire snapshots a container's image into the DCP container spec while it prepares
+    /// resources — <c>ContainerCreator.PrepareObjects()</c> calls
+    /// <see cref="ResourceExtensions.TryGetContainerImageName(IResource, out string?)"/> once and
+    /// creates the spec from the result — and nothing re-reads
+    /// <see cref="ContainerImageAnnotation"/> for it afterwards. That preparation happens before
+    /// endpoints are allocated, so <see cref="ResourceEndpointsAllocatedEvent"/>,
+    /// <see cref="BeforeResourceStartedEvent"/> and the container-runtime-argument callbacks all
+    /// run after the image is already fixed. A check that read the annotation at any of those
+    /// phases would be judging a different image from the one being started: raising the tag from
+    /// a subscriber makes a floor pass while the old image starts, and lowering it makes this
+    /// package promise a data-directory interlock the running release does not have.
+    /// </para>
+    /// <para>
+    /// <see cref="IDistributedApplicationLifecycleHook.BeforeStartAsync"/> is the answer rather
+    /// than <see cref="BeforeStartEvent"/>: Aspire publishes that event, then runs every lifecycle
+    /// hook, then the before-start pipeline, and only then starts the host and the orchestrator. A
+    /// hook therefore runs after every <see cref="BeforeStartEvent"/> subscriber — including ones
+    /// registered after <c>AddDocumentDB</c>, which is exactly where ordinary late configuration
+    /// lives — and still strictly before anything is prepared. Configuration written before that
+    /// point is ordinary and is sealed as it stands; a change made after it is refused by
+    /// <see cref="VerifyImageSeal"/>.
+    /// </para>
+    /// <para>
+    /// One hook seals the whole model, not one hook per resource: it is registered with
+    /// <c>TryAddLifecycleHook</c>, which deduplicates on service and implementation type, and it
+    /// walks the model rather than closing over a resource.
+    /// </para>
+    /// <para>
+    /// Run mode only. A publish never prepares a container: the manifest is written from the model
+    /// at serialization time, which is later than every lifecycle phase, so there the model is the
+    /// authority and sealing it would report ordinary publish-time configuration as a change. What
+    /// protects a publish is the manifest checkpoint, which judges the resource while it is being
+    /// serialized.
+    /// </para>
+    /// </remarks>
+#pragma warning disable CS0618 // The lifecycle-hook phase has no eventing equivalent that runs after every BeforeStartEvent subscriber.
+    private sealed class DocumentDBImageSealLifecycleHook(DistributedApplicationExecutionContext executionContext)
+        : IDistributedApplicationLifecycleHook
+    {
+        public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            if (!executionContext.IsRunMode)
+            {
+                return Task.CompletedTask;
+            }
+
+            foreach (var resource in appModel.Resources.OfType<DocumentDBServerResource>())
+            {
+                SealLaunchImage(resource);
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+#pragma warning restore CS0618
+
+    private static void SealLaunchImage(DocumentDBServerResource resource)
+    {
+        if (resource.Annotations.OfType<DocumentDBImageSealAnnotation>().Any())
+        {
+            return;
+        }
+
+        resource.Annotations.Add(new DocumentDBImageSealAnnotation(
+            ResolveModelImage(resource),
+            resource.TryGetContainerImageName(out var reference) ? reference : null,
+            [.. resource.Annotations.OfType<DockerfileBuildAnnotation>()]));
+    }
+
+    /// <summary>
+    /// Fails the resource when its image or build origin no longer matches the one the run was
+    /// sealed on.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Called from the checkpoints that run after the seal and cannot be cached: the
+    /// container-runtime-arguments callback, which Aspire re-invokes on every container creation,
+    /// and the per-resource start event, which is where a caller sees the failure reported against
+    /// the resource. Nothing is repaired: the spec the orchestrator holds was built from the sealed
+    /// reference and cannot be rewritten from here, so the only honest outcome is to refuse to
+    /// start rather than to run one image while every rule in this package judged another.
+    /// </para>
+    /// <para>
+    /// Image references are configuration, not credentials, so both are named: knowing which two
+    /// images disagree is the whole content of the diagnostic.
+    /// </para>
+    /// <para>
+    /// Outside a run there is no seal and this does nothing.
+    /// </para>
+    /// </remarks>
+    private static void VerifyImageSeal(IResource resource)
+    {
+        if (resource.Annotations.OfType<DocumentDBImageSealAnnotation>().LastOrDefault() is not { } seal)
+        {
+            return;
+        }
+
+        var reference = resource.TryGetContainerImageName(out var current) ? current : null;
+
+        var change =
+            !string.Equals(reference, seal.Reference, StringComparison.Ordinal)
+                ? "the image reference it will run changed"
+            : !SameBuildOrigin(resource, seal)
+                ? "the container build it is produced by was added, removed or replaced"
+            : !ResolveModelImage(resource).Equals(seal.Image)
+                ? "the release the image names changed"
+            : null;
+
+        if (change is null)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' changed the container image it will run after " +
+            $"this package sealed it: {change}. Aspire snapshots a container's image into the DCP " +
+            $"container spec while it prepares resources, which is before endpoints are allocated " +
+            $"and before the resource-start event is published, so a change made after the image " +
+            $"it will run had already been settled lands in the application model but never " +
+            $"reaches the container runtime: the container would run the sealed reference while " +
+            $"this package judged the current one — its version floors, its data-directory " +
+            $"interlock and its declared-volume advice would all describe an image that is not the " +
+            $"one starting. The resource is failed instead. " +
+            $"Sealed reference: '{DescribeReference(seal.Reference)}'. " +
+            $"Current reference: '{DescribeReference(reference)}'. " +
+            $"Recovery: choose the image while the application model is being built — " +
+            $"WithImage(...), WithImageTag(...), WithImageRegistry(...), WithImageSHA256(...), " +
+            $"WithDockerfile(...) — or at the latest from a BeforeStartEvent subscriber, rather " +
+            $"than from a ResourceEndpointsAllocatedEvent or BeforeResourceStartedEvent subscriber " +
+            $"or an IDistributedApplicationLifecycleHook that runs after this package's.");
+
+        static string DescribeReference(string? reference) => reference ?? "<none>";
+    }
+
+    /// <summary>
+    /// Compares the build definitions by identity, in order. Identity rather than value, because a
+    /// replacement can be indistinguishable by value and still carry a different Dockerfile
+    /// factory; order, because Aspire builds from the single build annotation a resource carries
+    /// and refuses the resource outright when there is more than one, so no legitimate reordering
+    /// exists.
+    /// </summary>
+    private static bool SameBuildOrigin(IResource resource, DocumentDBImageSealAnnotation seal)
+    {
+        var current = resource.Annotations.OfType<DockerfileBuildAnnotation>().ToArray();
+
+        if (current.Length != seal.Build.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < current.Length; index++)
+        {
+            if (!ReferenceEquals(current[index], seal.Build[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -1057,7 +1321,121 @@ public static class DocumentDBBuilderExtensions
 
         return builder.ApplicationBuilder
             .AddResource(DocumentDBDatabase)
-            .WithHealthCheck(healthCheckKey);
+            .WithHealthCheck(healthCheckKey)
+            .InstallDatabaseManifestCheckpoint();
+    }
+
+    /// <summary>
+    /// Installs the checkpoint that judges a database's published connection string while the
+    /// database is being serialized.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A database's manifest entry is a connection string and nothing else, and that string is
+    /// built from the parent server's TLS settings —
+    /// <see cref="DocumentDBServerResource.BuildConnectionString"/> — so the same mutation the
+    /// server's checkpoint exists to catch changes what every child publishes too. The two are
+    /// written as separate entries, and writing either of them can run a callback that changes the
+    /// other: Aspire pulls a resource referenced by a connection string into the manifest while
+    /// writing the entry that references it, and the server's own entry evaluates its environment
+    /// callbacks. So the child is checked where the child is written rather than only where the
+    /// parent is.
+    /// </para>
+    /// <para>
+    /// The checkpoint holds the position the publisher reads — last — and hands the writing on to
+    /// whatever it displaced, so the entry is byte-for-byte the one Aspire would have produced: a
+    /// caller's own <c>WithManifestPublishingCallback(...)</c> still writes it, and
+    /// <c>ExcludeFromManifest()</c> still excludes it, because a resource that emits nothing
+    /// publishes no connection string to judge.
+    /// </para>
+    /// </remarks>
+    private static IResourceBuilder<DocumentDBDatabaseResource> InstallDatabaseManifestCheckpoint(
+        this IResourceBuilder<DocumentDBDatabaseResource> builder)
+    {
+        var resource = builder.Resource;
+        ManifestPublishingCallbackAnnotation? checkpoint = null;
+
+        checkpoint = new ManifestPublishingCallbackAnnotation(async context =>
+        {
+            var security = CaptureConnectionStringSecurity(resource.Parent, resource);
+
+            var displaced = resource.Annotations.OfType<ManifestPublishingCallbackAnnotation>()
+                .LastOrDefault(annotation => !ReferenceEquals(annotation, checkpoint));
+
+            if (displaced is null)
+            {
+                // What Aspire writes for an IResourceWithConnectionString that is not a container,
+                // an executable, a project or a parameter.
+                context.Writer.WriteString("type", "value.v0");
+                context.WriteConnectionString(resource);
+            }
+            else if (displaced.Callback is { } callback)
+            {
+                await callback(context).ConfigureAwait(false);
+            }
+
+            VerifyDatabaseConnectionStringUnchanged(resource, security);
+        });
+
+        resource.Annotations.Add(checkpoint);
+
+        // ExcludeFromManifest() and WithManifestPublishingCallback() both append after this, and
+        // the publisher reads only the last annotation, so the position is taken back at the two
+        // phases a publish raises before it serializes anything.
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            EstablishManifestCheckpoint(resource, checkpoint);
+            return Task.CompletedTask;
+        });
+
+        builder.ApplicationBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, _) =>
+        {
+            EstablishManifestCheckpoint(resource, checkpoint);
+            return Task.CompletedTask;
+        });
+
+        return builder;
+    }
+
+    /// <summary>
+    /// Fails the publish when a database's published connection string, or the TLS state behind it,
+    /// changed while its entry was being written.
+    /// </summary>
+    /// <remarks>
+    /// Nothing is repaired: the string is already in the writer and cannot be taken back. No value
+    /// is reported either — the connection string carries the resource's credentials, and the name
+    /// of what changed is the whole of what is safe and the whole of what is useful.
+    /// </remarks>
+    private static void VerifyDatabaseConnectionStringUnchanged(
+        DocumentDBDatabaseResource resource,
+        ConnectionStringSecuritySnapshot before)
+    {
+        var after = CaptureConnectionStringSecurity(resource.Parent, resource);
+
+        var change =
+            after.Tls != before.Tls
+                ? "whether it uses TLS changed"
+            : after.AllowInsecureTls != before.AllowInsecureTls
+                ? "whether it accepts an invalid TLS certificate changed"
+            : !string.Equals(after.Expression, before.Expression, StringComparison.Ordinal)
+                ? "the connection string itself changed"
+            : null;
+
+        if (change is null)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB database resource '{resource.Name}' was changed while its manifest entry " +
+            $"was being written: {change}. A database publishes nothing but the connection string " +
+            $"its parent server '{resource.Parent.Name}' builds, and Aspire writes that string " +
+            $"before it evaluates any environment callback, so a change made from inside one lands " +
+            $"in the model but not in the entry — the published string would secure the connection " +
+            $"the way it was before the change, and every deployment reading the manifest would " +
+            $"follow it. The publish is failed and the partly written manifest is abandoned rather " +
+            $"than completed. Recovery: call UseTls(...)/AllowInsecureTls(...) on the server while " +
+            $"the application model is being built, not from a WithEnvironment(...) callback.");
     }
 
     /// <summary>
@@ -1195,6 +1573,8 @@ public static class DocumentDBBuilderExtensions
             builder.Resource,
             (evt, ct) =>
             {
+                VerifyImageSeal(evt.Resource);
+
                 var image = ResolveEffectiveImage(evt.Resource);
                 if (image.Origin == DocumentDBImageOrigin.None)
                 {
@@ -2179,7 +2559,43 @@ public static class DocumentDBBuilderExtensions
         string? Entrypoint,
         DocumentDBEffectiveImage Image,
         ManifestBuildSnapshot Build,
-        bool ExplicitlyStarted);
+        bool ExplicitlyStarted,
+        ConnectionStringSecuritySnapshot Security);
+
+    /// <summary>
+    /// The security state of the connection string a resource publishes, as it stood when the
+    /// entry started being written.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Aspire writes a resource's <c>connectionString</c> before it evaluates a single environment
+    /// callback — <c>WriteContainerAsync</c> emits the type, then the connection string, then the
+    /// image, and only afterwards the environment — so a callback that changes how the connection
+    /// is secured changes it strictly after the string describing it has been written. That is not
+    /// a hypothetical shape: <c>.WithEnvironment(_ =&gt; db.AllowInsecureTls(false))</c> is a
+    /// supported call, and it publishes <c>tlsInsecure=true</c> while the final model says
+    /// certificates must be valid — the manifest tells every deployment to skip certificate
+    /// validation, and nothing reports it.
+    /// </para>
+    /// <para>
+    /// All three are recorded rather than just the flags. <see cref="Tls"/> and
+    /// <see cref="AllowInsecureTls"/> are the settings a caller changes;
+    /// <see cref="Expression"/> is what was actually written, so a change that reaches the
+    /// published string by some other route — a credential parameter, an endpoint, a database name
+    /// — is caught with them.
+    /// </para>
+    /// <para>
+    /// The expression is kept as a digest, never as itself. It carries the resource's credential
+    /// parameters, and a change detected here is reported by name only, so there is no reason for
+    /// this package to hold a second copy of it or to be able to put it in a message.
+    /// </para>
+    /// </remarks>
+    private sealed record ConnectionStringSecuritySnapshot(bool Tls, bool AllowInsecureTls, string Expression);
+
+    private static ConnectionStringSecuritySnapshot CaptureConnectionStringSecurity(
+        DocumentDBServerResource server,
+        IResourceWithConnectionString resource) =>
+        new(server.TLS, server.AllowInsecureTls, DigestForSeal(resource.ConnectionStringExpression.ValueExpression));
 
     private static ManifestStructureSnapshot CaptureManifestStructure(DocumentDBServerResource resource) =>
         new(
@@ -2191,7 +2607,8 @@ public static class DocumentDBBuilderExtensions
             resource.Entrypoint,
             ResolveEffectiveImage(resource),
             CaptureManifestBuild(resource),
-            resource.Annotations.OfType<ExplicitStartupAnnotation>().Any());
+            resource.Annotations.OfType<ExplicitStartupAnnotation>().Any(),
+            CaptureConnectionStringSecurity(resource, resource));
 
     /// <summary>
     /// The parts of an endpoint the manifest carries, and nothing else: an allocated address
@@ -2379,6 +2796,12 @@ public static class DocumentDBBuilderExtensions
                 ? "the container build definition it publishes changed"
             : after.ExplicitlyStarted != before.ExplicitlyStarted
                 ? "its explicit-start setting changed"
+            : after.Security.Tls != before.Security.Tls
+                ? "whether its published connection string uses TLS changed"
+            : after.Security.AllowInsecureTls != before.Security.AllowInsecureTls
+                ? "whether its published connection string accepts an invalid TLS certificate changed"
+            : !string.Equals(after.Security.Expression, before.Security.Expression, StringComparison.Ordinal)
+                ? "the connection string it publishes changed"
             : null;
 
         if (change is null)
@@ -2388,14 +2811,17 @@ public static class DocumentDBBuilderExtensions
 
         throw new InvalidOperationException(
             $"DocumentDB resource '{resource.Name}' was changed while its manifest entry was being " +
-            $"written: {change}. Aspire writes a container's image, entrypoint and mounts before it " +
-            $"evaluates the environment callbacks and its bindings after them, so a change made from " +
-            $"inside that evaluation lands in the model but not in the fields that have already been " +
-            $"written, and the data-storage rules judged a resource the manifest does not describe. " +
-            $"The publish is failed and the partly written manifest is abandoned rather than " +
-            $"completed. Recovery: configure the resource while the application model is being built " +
-            $"(WithDataVolume(), WithDataBindMount(...), WithEndpoint(...), WithImageTag(...)) " +
-            $"instead of mutating it from a WithEnvironment(...) callback.");
+            $"written: {change}. Aspire writes a container's connection string, image, entrypoint " +
+            $"and mounts before it evaluates the environment callbacks and its bindings after them, " +
+            $"so a change made from inside that evaluation lands in the model but not in the fields " +
+            $"that have already been written: the published entry would describe a resource neither " +
+            $"the model nor the data-storage rules ever judged, and a TLS setting changed that way " +
+            $"is published inverted — every deployment reading the manifest would secure the " +
+            $"connection the way it was before the change. The publish is failed and the partly " +
+            $"written manifest is abandoned rather than completed. Recovery: configure the resource " +
+            $"while the application model is being built (WithDataVolume(), WithDataBindMount(...), " +
+            $"WithEndpoint(...), WithImageTag(...), UseTls(...), AllowInsecureTls(...)) instead of " +
+            $"mutating it from a WithEnvironment(...) callback.");
     }
 
     /// <summary>
@@ -2972,6 +3398,269 @@ public static class DocumentDBBuilderExtensions
             // read as an option name again.
             expectOperand = separator < 0 && s_valueTakingEntrypointOptions.Contains(name);
         }
+    }
+
+    /// <summary>
+    /// The environment variables whose value this package decides, and which therefore may not be
+    /// set from outside the model.
+    /// </summary>
+    /// <remarks>
+    /// <c>DATA_PATH</c> is the storage guard's own: the whole read-only, duplicate-mount and
+    /// shared-directory verdict is a statement about the one path it canonicalized, so a second
+    /// channel to that value would move the data directory past every rule. The credentials are
+    /// here because they are what the connection string this package generates authenticates with,
+    /// so replacing one of them leaves the container and every consumer of the resource
+    /// disagreeing about how to log in — and because a raw <c>--env</c> is where a password would
+    /// be written in the clear.
+    /// </remarks>
+    private static readonly HashSet<string> s_guardOwnedEnvironmentVariables = new(StringComparer.Ordinal)
+    {
+        DataPathEnvVarName,
+        UserEnvVarName,
+        PasswordEnvVarName,
+    };
+
+    /// <summary>
+    /// The environment variables the OpenTelemetry compatibility wrapper's own command depends on.
+    /// They are added to <see cref="s_guardOwnedEnvironmentVariables"/> only while the wrapper is
+    /// required, because outside that case this package has made no promise about them.
+    /// </summary>
+    private static readonly HashSet<string> s_openTelemetryRuntimeProtectedEnvironmentVariables =
+        new(StringComparer.Ordinal)
+        {
+            "CONFIG_DIR",
+            "GATEWAY_HOME",
+            DataPathEnvVarName,
+            EnableTelemetryEnvVarName,
+            OtelMetricsEnabledEnvVarName,
+            OtelExporterOtlpMetricsEndpointEnvVarName,
+            OtelExporterOtlpMetricsTimeoutEnvVarName,
+            OtelMetricExportIntervalEnvVarName,
+            OtelServiceNameEnvVarName,
+            OtelServiceVersionEnvVarName,
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TIMEOUT",
+            "OTEL_RESOURCE_ATTRIBUTES",
+        };
+
+    /// <summary>
+    /// Reads the finished container-runtime argument list once, with the container runtime's own
+    /// option grammar, and fails the resource when it carries an option that would add storage, set
+    /// an environment variable this package owns, replace the entry point, or displace the image.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="ContainerResourceBuilderExtensions.WithContainerRuntimeArgs{T}(IResourceBuilder{T}, string[])"/>
+    /// hands its arguments to <c>docker run</c> ahead of the image, so they are not part of the
+    /// model: <c>--mount</c>, <c>-v</c>, <c>--volume</c>, <c>--volumes-from</c>, <c>--tmpfs</c>,
+    /// <c>--volume-driver</c> and <c>--use-api-socket</c> add storage with no
+    /// <see cref="ContainerMountAnnotation"/> to read, <c>--read-only</c> makes the data directory
+    /// unwritable without one either, <c>--env</c> sets <c>DATA_PATH</c> without an
+    /// <see cref="EnvironmentCallbackAnnotation"/>, and <c>--entrypoint</c> replaces the entry
+    /// point without touching <see cref="ContainerResource.Entrypoint"/>. Every storage rule in
+    /// this package is written against the model, so each of those reaches past all of them: a
+    /// read-only mount added this way starts a container DocumentDB cannot initialise, and a shared
+    /// one puts two clusters on one directory, with nothing reported either time.
+    /// </para>
+    /// <para>
+    /// Read here rather than where the arguments are written, because only the last
+    /// container-runtime-argument callback sees the whole line — earlier callbacks append to the
+    /// same list, and a value a callback contributed is not visible from the call that registered
+    /// it. <see cref="EnsureTerminalCallbackRunsLast{TAnnotation}"/> is what makes this callback
+    /// that one, and there is one such callback for the package, so the storage rules and the
+    /// OpenTelemetry wrapper judge the same line rather than competing for the last position.
+    /// </para>
+    /// <para>
+    /// While the wrapper is required the list is resolved first and written back, so the exact
+    /// strings validated here are the exact strings the runtime receives and Aspire does not
+    /// evaluate a deferred value a second time. Otherwise nothing is resolved: a deferred token
+    /// where the runtime reads an option name could be any of the refused options and is reported
+    /// as such, which is the fail-closed answer that does not duplicate Aspire's own evaluation of
+    /// a value that may be a secret.
+    /// </para>
+    /// <para>
+    /// The reading is the container runtime's own grammar rather than a search for dangerous
+    /// spellings; see <see cref="DocumentDBContainerRuntimeArguments"/>. A search would refuse
+    /// <c>--label -v</c>, which passes a label, and accept <c>--mount=type=bind,...</c>, which
+    /// mounts. Ordinary arguments — <c>--cap-add</c>, <c>--network</c>, <c>--memory</c>,
+    /// <c>--pull</c>, <c>--platform</c>, <c>--dns</c> — are passed through untouched.
+    /// </para>
+    /// <para>
+    /// No value ever reaches the message: an operand is where a mount source, a variable's value or
+    /// a password would be, so only the option's name — and, for an environment option, the name of
+    /// the variable it sets — is reported.
+    /// </para>
+    /// </remarks>
+    private static async Task ValidateContainerRuntimeArgumentsAsync(
+        DocumentDBServerResource resource,
+        ContainerRuntimeArgsCallbackContext context,
+        DistributedApplicationExecutionContext executionContext)
+    {
+        var wrapperRequired =
+            ResolveOpenTelemetryGatewayConfigurationRequirement(resource) ==
+                GatewayConfigurationRequirement.Required;
+
+        var resolved = wrapperRequired
+            ? await ResolveContainerRuntimeArgumentsAsync(resource, context, executionContext).ConfigureAwait(false)
+            : null;
+
+        var finding = DocumentDBContainerRuntimeArguments.Read(
+            resolved ?? [.. context.Args],
+            wrapperRequired
+                ? static name =>
+                    s_guardOwnedEnvironmentVariables.Contains(name) ||
+                    s_openTelemetryRuntimeProtectedEnvironmentVariables.Contains(name)
+                : s_guardOwnedEnvironmentVariables.Contains);
+
+        if (finding.Verdict != DocumentDBRuntimeArgumentVerdict.Harmless)
+        {
+            throw DescribeUnsafeRuntimeArgument(resource, finding, wrapperRequired);
+        }
+
+        if (resolved is null)
+        {
+            return;
+        }
+
+        // Hand the runtime the very strings that were validated, so a deferred value is neither
+        // resolved twice nor able to resolve to something else on the second reading.
+        context.Args.Clear();
+        foreach (var argument in resolved)
+        {
+            context.Args.Add(argument);
+        }
+    }
+
+    /// <summary>
+    /// Resolves the completed runtime-argument list exactly once, so the parser reads the strings
+    /// the container runtime will really be given.
+    /// </summary>
+    private static async Task<List<object>> ResolveContainerRuntimeArgumentsAsync(
+        DocumentDBServerResource resource,
+        ContainerRuntimeArgsCallbackContext context,
+        DistributedApplicationExecutionContext executionContext)
+    {
+        var resolved = new List<object>(context.Args.Count);
+        var valueProviderContext = new ValueProviderContext
+        {
+            Caller = resource,
+            ExecutionContext = executionContext,
+        };
+
+        foreach (var argument in context.Args.ToArray())
+        {
+            var value = argument switch
+            {
+                string text => text,
+                IValueProvider provider => await provider
+                    .GetValueAsync(valueProviderContext, context.CancellationToken)
+                    .ConfigureAwait(false),
+                null => null,
+                _ => argument.ToString(),
+            };
+
+            if (value is null)
+            {
+                continue;
+            }
+
+            resolved.Add(value);
+        }
+
+        return resolved;
+    }
+
+    /// <summary>
+    /// Turns one reading of the argument list into the diagnostic that belongs to it: the wrapper's
+    /// own when the wrapper owns the command, and the storage rules' otherwise.
+    /// </summary>
+    private static InvalidOperationException DescribeUnsafeRuntimeArgument(
+        DocumentDBServerResource resource,
+        DocumentDBRuntimeArgumentFinding finding,
+        bool wrapperRequired)
+    {
+        if (wrapperRequired)
+        {
+            switch (finding.Verdict)
+            {
+                case DocumentDBRuntimeArgumentVerdict.Storage:
+                    return new InvalidOperationException(
+                        $"DocumentDB resource '{resource.Name}' adds the storage-changing container " +
+                        $"runtime option '{finding.CanonicalOption}' while the " +
+                        $"WithOpenTelemetryMetrics() compatibility wrapper is required. Raw runtime " +
+                        $"mounts are applied outside the resource's mount model, so the wrapper " +
+                        $"cannot prove that its temporary configuration stays off DATA_PATH " +
+                        $"storage. Use WithBindMount(...) or WithVolume(...) so the mount can be " +
+                        $"validated, or remove the raw runtime option.");
+
+                case DocumentDBRuntimeArgumentVerdict.Entrypoint:
+                    return new InvalidOperationException(
+                        $"DocumentDB resource '{resource.Name}' adds the container runtime option " +
+                        $"'--entrypoint' while the WithOpenTelemetryMetrics() compatibility wrapper " +
+                        $"is required. That raw option can replace the verified '/bin/bash' " +
+                        $"entrypoint after the resource model has been sealed. Configure no custom " +
+                        $"entrypoint, or drop WithOpenTelemetryMetrics() and configure telemetry " +
+                        $"from your own entrypoint.");
+
+                case DocumentDBRuntimeArgumentVerdict.Environment:
+                    var reason =
+                        string.Equals(finding.CanonicalOption, "--env-file", StringComparison.Ordinal)
+                            ? "an environment file cannot be inspected"
+                        : finding.Variable is null
+                            ? "the option has no value"
+                            : "it overrides protected container configuration";
+
+                    return new InvalidOperationException(
+                        $"DocumentDB resource '{resource.Name}' adds a raw container runtime " +
+                        $"environment override while the WithOpenTelemetryMetrics() compatibility " +
+                        $"wrapper is required, but {reason}. The override could invalidate the " +
+                        $"telemetry command or its DATA_PATH isolation after the resource model has " +
+                        $"been sealed. Use WithEnvironment(...) so the value is part of the " +
+                        $"validated model.");
+            }
+        }
+
+        var (what, recovery) = finding.Verdict switch
+        {
+            DocumentDBRuntimeArgumentVerdict.Storage =>
+                ($"'{finding.Option}', which changes what the container mounts",
+                 "declare storage in the application model instead — WithDataVolume(), " +
+                 "WithDataBindMount(...), WithVolume(...) or WithBindMount(...) — so the " +
+                 "read-only, duplicate-mount and shared-data-directory rules can see it"),
+
+            DocumentDBRuntimeArgumentVerdict.Environment =>
+                ($"'{finding.Option}', which sets an environment variable this package has already decided",
+                 $"set it through the model instead — WithDataVolume(), WithDataBindMount(...) or " +
+                 $"WithEnvironment(\"{DataPathEnvVarName}\", ...) for the data directory, and the " +
+                 $"userName/password parameters of AddDocumentDB(...) for the credentials"),
+
+            DocumentDBRuntimeArgumentVerdict.Entrypoint =>
+                ($"'{finding.Option}', which replaces the image's entry point",
+                 "leave the entry point to the image, or set it on the resource " +
+                 "(ContainerResource.Entrypoint) so the model describes what runs"),
+
+            DocumentDBRuntimeArgumentVerdict.Image =>
+                ($"'{finding.Option}', which the runtime reads as the image and which would " +
+                 $"displace the one this run was sealed on",
+                 "choose the image with WithImage(...), WithImageTag(...), WithImageRegistry(...) " +
+                 "or WithDockerfile(...) while the application model is being built"),
+
+            _ =>
+                ("a value that is only known later, in a position where the runtime reads an " +
+                 "option name — so it could be any of --mount, -v, --tmpfs, --env or --entrypoint",
+                 "pass option names as literal strings; a deferred value is fine as the operand of " +
+                 "one, as in WithContainerRuntimeArgs(\"--network\", network)"),
+        };
+
+        return new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' passes the container-runtime argument {what}. " +
+            $"Container-runtime arguments go straight to the container runtime ahead of the image, " +
+            $"so they are not part of the application model and none of this package's storage " +
+            $"rules can see them: a read-only mount added this way starts a container DocumentDB " +
+            $"cannot initialise, a shared one puts two clusters on one data directory, and a " +
+            $"replaced entry point or data directory silently discards everything that was checked. " +
+            $"The resource is failed instead of being started on storage that was never judged. " +
+            $"Recovery: {recovery}.");
     }
 
     /// <summary>
@@ -3723,11 +4412,20 @@ public static class DocumentDBBuilderExtensions
             return Task.CompletedTask;
         });
 
-        guard.RuntimeCheckpoint = new ContainerRuntimeArgsCallbackAnnotation(_ =>
+        guard.RuntimeCheckpoint = new ContainerRuntimeArgsCallbackAnnotation(async context =>
         {
             EnsureTerminalCallbackRunsLast(resource, guard.RuntimeCheckpoint, "container-runtime-arguments");
+
+            // Being last is also what makes context.Args final: every other callback has already
+            // contributed, so this is the line the container runtime will be given.
+            await ValidateContainerRuntimeArgumentsAsync(
+                resource,
+                context,
+                builder.ApplicationBuilder.ExecutionContext).ConfigureAwait(false);
+
+            // The image the orchestrator prepared, not the annotation as it now reads.
+            VerifyImageSeal(resource);
             VerifyTerminalCheckpoint(resource, guard);
-            return Task.CompletedTask;
         });
 
         guard.ManifestCheckpoint = new ManifestPublishingCallbackAnnotation(async context =>
@@ -3767,7 +4465,7 @@ public static class DocumentDBBuilderExtensions
         resource.Annotations.Add(guard);
         resource.Annotations.Add(guard.CommandLineCallback);
         resource.Annotations.Add(guard.RuntimeCheckpoint);
-        EstablishManifestCheckpoint(resource, guard);
+        EstablishManifestCheckpoint(resource, guard.ManifestCheckpoint);
         RegisterTerminalManifestCheckpoint(builder.ApplicationBuilder, resource, guard);
 
         void RetakeLastPosition() => RetakeTerminalGuardPositions(resource, guard);
@@ -3840,7 +4538,7 @@ public static class DocumentDBBuilderExtensions
             MoveToEnd(resource, storage.Environment);
         }
 
-        EstablishManifestCheckpoint(resource, guard);
+        EstablishManifestCheckpoint(resource, guard.ManifestCheckpoint);
     }
 
     /// <summary>
@@ -3855,20 +4553,20 @@ public static class DocumentDBBuilderExtensions
     /// configuration to check and the exclusion is left in place.
     /// </remarks>
     private static void EstablishManifestCheckpoint(
-        DocumentDBServerResource resource,
-        TerminalGuardAnnotation guard)
+        IResource resource,
+        ManifestPublishingCallbackAnnotation checkpoint)
     {
         var displaced = resource.Annotations.OfType<ManifestPublishingCallbackAnnotation>()
-            .LastOrDefault(annotation => !ReferenceEquals(annotation, guard.ManifestCheckpoint));
+            .LastOrDefault(annotation => !ReferenceEquals(annotation, checkpoint));
 
-        resource.Annotations.Remove(guard.ManifestCheckpoint);
+        resource.Annotations.Remove(checkpoint);
 
         if (displaced is not null && displaced.Callback is null)
         {
             return;
         }
 
-        resource.Annotations.Add(guard.ManifestCheckpoint);
+        resource.Annotations.Add(checkpoint);
     }
 
     /// <summary>
@@ -3927,7 +4625,7 @@ public static class DocumentDBBuilderExtensions
 
                 foreach (var (registeredResource, registeredGuard) in registration.Guards)
                 {
-                    EstablishManifestCheckpoint(registeredResource, registeredGuard);
+                    EstablishManifestCheckpoint(registeredResource, registeredGuard.ManifestCheckpoint);
                 }
 
                 return Task.CompletedTask;
@@ -3972,6 +4670,7 @@ public static class DocumentDBBuilderExtensions
             [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
             [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
             resource.Entrypoint,
+            resource.ShellExecution is true,
             ResolveEffectiveImage(resource),
             CaptureTerminalCommandSeal(resource, state));
 
@@ -4088,12 +4787,26 @@ public static class DocumentDBBuilderExtensions
                 throw StaleConfiguration(resource, "its container entrypoint changed");
             }
 
+            if (seal.Command.GatewayRequirement == GatewayConfigurationRequirement.Required &&
+                (resource.ShellExecution is true) != seal.ShellExecutionEnabled)
+            {
+                ValidateOpenTelemetryShellExecution(resource);
+                throw StaleConfiguration(
+                    resource,
+                    "whether Aspire shell-rewrites its container arguments changed");
+            }
+
             if (!ResolveEffectiveImage(resource).Equals(seal.Image))
             {
                 throw StaleConfiguration(resource, "the image it will run changed");
             }
 
+            ValidateOpenTelemetryShellExecution(resource);
             VerifyTerminalCommandSeal(resource, seal.Command);
+        }
+        else
+        {
+            ValidateOpenTelemetryShellExecution(resource);
         }
 
         // The storage rules answer in the environment pipeline, which is gathered separately from
@@ -4247,6 +4960,28 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Refuses Aspire's post-validation shell rewrite when the compatibility wrapper owns the
+    /// command. DCP applies this switch after it gathers the verified arguments.
+    /// </summary>
+    private static void ValidateOpenTelemetryShellExecution(DocumentDBServerResource resource)
+    {
+        if (resource.ShellExecution is not true ||
+            ResolveOpenTelemetryGatewayConfigurationRequirement(resource) !=
+                GatewayConfigurationRequirement.Required)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' enables ContainerResource.ShellExecution " +
+            $"while the WithOpenTelemetryMetrics() compatibility wrapper is required. Aspire " +
+            $"rewrites the already verified wrapper arguments into one joined '-c' command after " +
+            $"the terminal check, so '/bin/bash' receives a nested shell command and DocumentDB " +
+            $"does not start. Set ShellExecution to false or null, or drop " +
+            $"WithOpenTelemetryMetrics() and configure telemetry from your own shell command.");
+    }
+
+    /// <summary>
     /// Verifies that the finished command line is exactly the one the gateway configuration
     /// wrapper needs, whenever the wrapper is required at all.
     /// </summary>
@@ -4275,6 +5010,8 @@ public static class DocumentDBBuilderExtensions
         DocumentDBServerResource resource,
         TerminalCommandLineState state)
     {
+        ValidateOpenTelemetryShellExecution(resource);
+
         var required = ResolveOpenTelemetryGatewayConfigurationRequirement(resource) ==
             GatewayConfigurationRequirement.Required;
 

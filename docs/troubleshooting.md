@@ -44,6 +44,45 @@ Common causes:
 - Corrupted data volume (remove the volume and restart)
 - A username beginning with a reserved DocumentDB `0.116.0` prefix (`documentdb`, `citus`, `pg`, or `internal_role`)
 
+### The container image changed after it was sealed
+
+**Symptom:** starting the resource fails with an `InvalidOperationException` such as:
+
+```
+DocumentDB resource 'documentdb' changed the container image it will run after this
+package sealed it: the image reference it will run changed. Aspire snapshots a
+container's image into the DCP container spec while it prepares resources, ...
+Sealed reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.111.0'.
+Current reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0'.
+```
+
+The clause after the colon says what changed: `the image reference it will run changed`,
+`the container build it is produced by was added, removed or replaced`, or `the release
+the image names changed`.
+
+**Cause:** Aspire composes the image reference once, while it prepares the
+application's containers, and writes it into the DCP container spec. That happens
+before endpoints are allocated and before `BeforeResourceStartedEvent` is published,
+so an image chosen after that point is only visible to the application model — the
+container runtime still launches the earlier one, while this package's version floors,
+data-directory interlock and declared-volume advice judge another release. Rather than
+let the model and the running container disagree in either direction, the integration
+refuses the run.
+
+**Solution:** Choose the image while the application model is being built:
+
+```csharp
+var db = builder.AddDocumentDB("documentdb")
+                .WithDocumentDBVersion(DocumentDBVersion.V0_116_0);
+```
+
+`WithImageTag(...)`, `WithImageRegistry(...)`, `WithImage(...)`, `WithImageSHA256(...)`
+and `WithDockerfile(...)` are all still honoured anywhere during model building,
+including from a `BeforeStartEvent` subscriber. Re-applying the same image is not a
+change. Only a change made from a `ResourceEndpointsAllocatedEvent` /
+`BeforeResourceStartedEvent` subscriber, or from a lifecycle hook that runs after this
+package's, is refused. Publish mode is unaffected: no container is prepared, so the
+manifest is written from the model as usual.
 ## Connection issues
 
 ### TLS certificate errors
@@ -131,6 +170,27 @@ that is caught when the wrapper's arguments are resolved, and `aspire publish` r
 `publish-manifest` step as failed. Drop the custom entrypoint, or drop
 `WithOpenTelemetryMetrics(...)` and configure telemetry from your own entrypoint.
 
+### `WithOpenTelemetryMetrics()` throws about `ShellExecution`
+
+Leave `ContainerResource.ShellExecution` as `null` or set it to `false`. With `true`, DCP joins the
+already validated wrapper arguments into a second `-c` command after the package's terminal check,
+so `/bin/bash` no longer receives `-c <wrapper> --` and DocumentDB does not start. The effective
+setting is sealed with the command and checked again before both container creation and manifest
+serialization, so enabling it after an early configuration read also fails clearly.
+
+### `WithOpenTelemetryMetrics()` rejects a container runtime option
+
+`WithContainerRuntimeArgs(...)` is applied outside the resource model. Raw mounts
+(`--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`, `--volumes-from`, `--use-api-socket` and
+`--read-only`) can put DATA_PATH storage back under a scratch root after the wrapper has selected
+it, and raw `--entrypoint` can replace `/bin/bash`.
+They are rejected on every DocumentDB resource — see
+[A container-runtime argument is rejected](#a-container-runtime-argument-is-rejected) — and this
+message is the wrapper's own wording for them. Protected `--env`/`-e` overrides
+are rejected too, as is `--env-file`, whose contents cannot be validated. Use `WithBindMount(...)`,
+`WithVolume(...)`, and `WithEnvironment(...)`; harmless runtime options continue to work. Error
+messages name the option class but never repeat its value.
+
 ### `WithOpenTelemetryMetrics()` throws about a later command-line callback
 
 The wrapper's `-c <script> --` prefix has to be the first thing on the container command line, so
@@ -157,8 +217,8 @@ The wrapper records what its answer depended on and compares it at the last poin
 unconditionally: a container-runtime-arguments callback in a run, and — in a publish —
 `BeforePublishEvent` and again while the resource is being serialized into the manifest.
 A mismatch fails the resource before the container is created or the manifest is written, and names
-what kind of thing changed — callbacks, entrypoint, or image — without repeating a value, because
-whatever changed the model may be carrying a secret.
+what kind of thing changed — callbacks, entrypoint, `ShellExecution`, or image — without repeating
+a value, because whatever changed the model may be carrying a secret.
 
 Finish configuring the resource before anything reads its configuration. If a lifecycle hook has to
 contribute arguments, let it add them without reading first: they are ordered behind the wrapper
@@ -380,6 +440,22 @@ Or the application fails to start with an `InvalidOperationException` saying two
 **Cause:** Aspire writes a container's `build` object, image, entrypoint and mounts before it evaluates the environment callbacks, and its bindings after them. A `WithEnvironment(...)` callback that adds, removes or replaces a mount, re-points an endpoint, swaps the image, or adds, replaces or edits the Dockerfile build definition therefore changes the resource halfway through its own manifest entry: the fields already written describe the resource as it was, and the rules judged the resource as it became. The entry cannot be taken back, so the publish is failed and the partly written manifest is abandoned rather than completed.
 
 **Solution:** configure the resource while the application model is being built — `WithDataVolume()`, `WithDataBindMount(...)`, `WithEndpoint(...)`, `WithImageTag(...)`, `WithDockerfile(...)` and the build arguments and secrets that go with it — instead of mutating it from an environment callback. Writing environment values from an environment callback is unaffected, and so is re-declaring or reordering the same mounts. A build definition swapped for an identically valued one is still reported: its Dockerfile can be generated by a factory, which cannot be compared by value.
+
+### A TLS change made while the manifest was being written fails the publish
+
+**Symptom:** `aspire publish` fails and the pipeline reports an `InvalidOperationException` saying the resource `was changed while its manifest entry was being written: whether its published connection string accepts an invalid TLS certificate changed`, or the same for `whether its published connection string uses TLS changed` or `the connection string it publishes changed`. For a database the message names the database resource and reads `whether it accepts an invalid TLS certificate changed`.
+
+**Cause:** Aspire writes a resource's `connectionString` before it evaluates a single environment callback. A callback such as `.WithEnvironment(_ => db.AllowInsecureTls(false))` therefore changes the setting strictly after the string describing it has been written: the manifest would ship `tlsInsecure=true` while the final model says certificates must be valid, and every deployment reading it would skip certificate validation. Databases publish nothing but the string their parent server builds, so the same change moves every child too.
+
+**Solution:** call `UseTls(...)` and `AllowInsecureTls(...)` while the application model is being built. Setting a flag to the value it already has is not a change, and an environment callback that only sets environment variables is unaffected.
+
+### A container-runtime argument is rejected
+
+**Symptom:** starting the resource fails with an `InvalidOperationException` saying it `passes the container-runtime argument '--mount', which changes what the container mounts` — or the same for `-v`, `--volume`, `--volume-driver`, `--volumes-from`, `--tmpfs`, `--use-api-socket`, `--read-only`, for `'--env DATA_PATH'`/`'--env-file'`, which set an environment variable this package has already decided, for `'--entrypoint'`, or for an operand the runtime would read as the image. While `WithOpenTelemetryMetrics(...)` needs its compatibility wrapper the same readings are reported in the wrapper's own words; see [`WithOpenTelemetryMetrics()` rejects a container runtime option](#withopentelemetrymetrics-rejects-a-container-runtime-option).
+
+**Cause:** `WithContainerRuntimeArgs(...)` passes its arguments straight to the container runtime ahead of the image, so they are not part of the application model and none of the storage rules can see them. A read-only mount added that way starts a container DocumentDB cannot initialise, a shared one puts two clusters on one data directory, and a replaced entry point or `DATA_PATH` silently discards everything that was checked.
+
+**Solution:** declare storage in the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithVolume(...)`, `WithBindMount(...)` — set the data directory with `WithEnvironment("DATA_PATH", ...)`, supply credentials through the `userName`/`password` parameters of `AddDocumentDB(...)`, and choose the image with `WithImageTag(...)`. Ordinary container-runtime arguments are unaffected: the line is parsed with the runtime's own grammar, so `--label -v` passes a label and `--cap-add`, `--network`, `--memory`, `--pull`, `--platform`, `--dns`, `--ulimit`, `--sysctl` and `-it` reach the runtime untouched. A token whose value is only known later is rejected where the runtime reads an option name — it could resolve to `--mount` — but is fine as the operand of one, as in `WithContainerRuntimeArgs("--network", network)`.
 
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 

@@ -391,6 +391,26 @@ internal static class DocumentDBEndToEndSupport
             $"Resource '{resourceName}' never reported a container id in its snapshot.");
     }
 
+    /// <summary>
+    /// Reads the image reference the container runtime was actually given when it created the
+    /// container.
+    /// </summary>
+    /// <remarks>
+    /// The Aspire resource snapshot's <c>container.image</c> property is not a substitute:
+    /// <c>ApplicationOrchestrator.OnResourceStarting</c> computes it from the live model with
+    /// <c>TryGetContainerImageName</c>, so it agrees with the model even when the container spec
+    /// DCP prepared earlier says something else. <c>.Config.Image</c> is what the daemon recorded
+    /// at create time, which is the only account of the container that actually exists.
+    /// </remarks>
+    public static async Task<string> GetContainerImageAsync(string containerId)
+    {
+        var (exitCode, output) = await RunDockerAsync("inspect", containerId, "--format", "{{.Config.Image}}");
+
+        Assert.Equal(0, exitCode);
+
+        return output.Trim();
+    }
+
     /// <summary>Reads the effective environment of a running container as a dictionary.</summary>
     public static async Task<IReadOnlyDictionary<string, string>> GetContainerEnvironmentAsync(string containerId)
     {

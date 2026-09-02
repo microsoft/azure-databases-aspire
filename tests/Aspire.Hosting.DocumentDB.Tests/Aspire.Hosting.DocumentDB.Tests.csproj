@@ -13,6 +13,7 @@
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.AdaptationEndToEndApp\Aspire.Hosting.DocumentDB.AdaptationEndToEndApp.csproj" />
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.FeatureMatrixEndToEndApp\Aspire.Hosting.DocumentDB.FeatureMatrixEndToEndApp.csproj" />
     <ProjectReference Include="..\Aspire.Hosting.DocumentDB.StorageGuardEndToEndApp\Aspire.Hosting.DocumentDB.StorageGuardEndToEndApp.csproj" />
+    <ProjectReference Include="..\Aspire.Hosting.DocumentDB.ImageSealEndToEndApp\Aspire.Hosting.DocumentDB.ImageSealEndToEndApp.csproj" />
     <PackageReference Include="Aspire.MongoDB.Driver" />
     <PackageReference Include="Aspire.Hosting.Testing" />
     <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
@@ -23,5 +24,6 @@
 
   <ItemGroup>
     <Compile Include="$(RepoRoot)src\Aspire.Hosting.DocumentDB\DocumentDBContainerImageTags.cs" />
+    <Compile Include="$(RepoRoot)src\Aspire.Hosting.DocumentDB\DocumentDBContainerRuntimeArguments.cs" />
   </ItemGroup>
 </Project>

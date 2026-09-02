@@ -1,8 +1,12 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+#pragma warning disable ASPIRECONTAINERSHELLEXECUTION001
+
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Eventing;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Aspire.Hosting.DocumentDB.FeatureMatrixEndToEndApp;
 
@@ -30,6 +34,8 @@ public class Program
     public const string OtelEndpointEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_ENDPOINT";
     public const string OtelEnabledEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_ENABLED";
     public const string DataPathArgumentEnvironmentVariable = "DOCUMENTDB_FEATURE_DATA_PATH_ARGUMENT";
+    public const string ScratchBindMountPathEnvironmentVariable = "DOCUMENTDB_FEATURE_SCRATCH_BINDMOUNT";
+    public const string ShellExecutionEnvironmentVariable = "DOCUMENTDB_FEATURE_SHELL_EXECUTION";
 
     /// <summary>Custom credential parameters, two databases, one with a distinct database name.</summary>
     public const string CustomCredentialsMultiDbScenario = "custom-credentials-multi-db";
@@ -64,6 +70,23 @@ public class Program
     /// storage tells them apart.
     /// </summary>
     public const string TelemetryAliasedTemporaryRootScenario = "telemetry-aliased-temporary-root";
+
+    /// <summary>Telemetry wrapper with a daemon-resolved symlink alias mounted at <c>/tmp</c>.</summary>
+    public const string TelemetrySymlinkAliasedTemporaryRootScenario =
+        "telemetry-symlink-aliased-temporary-root";
+
+    /// <summary>A raw runtime mount that aliases the named DATA_PATH volume at <c>/tmp</c>.</summary>
+    public const string TelemetryRawRuntimeVolumeScenario = "telemetry-raw-runtime-volume";
+
+    /// <summary>Every telemetry scratch candidate is bind-backed and physically unprovable.</summary>
+    public const string TelemetryUnprovableTemporaryRootsScenario =
+        "telemetry-unprovable-temporary-roots";
+
+    /// <summary>Telemetry wrapper with ShellExecution explicitly selected by the scenario input.</summary>
+    public const string TelemetryShellExecutionScenario = "telemetry-shell-execution";
+
+    /// <summary>ShellExecution is enabled after the telemetry command has already been cached.</summary>
+    public const string TelemetryShellExecutionMutationScenario = "telemetry-shell-execution-mutation";
 
     /// <summary>WithLogLevel(Debug), exercised with normal MongoDB traffic by the test.</summary>
     public const string DebugLogLevelScenario = "debug-log-level";
@@ -263,6 +286,57 @@ public class Program
                     .WithDataBindMount(GetRequired(BindMountPathEnvironmentVariable))
                     .WithBindMount(GetRequired(BindMountPathEnvironmentVariable), "/tmp")
                     .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
+                break;
+
+            case TelemetrySymlinkAliasedTemporaryRootScenario:
+                documentDB
+                    .WithDataBindMount(GetRequired(BindMountPathEnvironmentVariable))
+                    .WithBindMount(GetRequired(ScratchBindMountPathEnvironmentVariable), "/tmp")
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
+                break;
+
+            case TelemetryRawRuntimeVolumeScenario:
+                var runtimeVolume = GetRequired(VolumeNameEnvironmentVariable);
+                documentDB
+                    .WithDataVolume(runtimeVolume)
+                    .WithContainerRuntimeArgs(
+                        "--mount",
+                        $"type=volume,source={runtimeVolume},target=/tmp")
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
+                break;
+
+            case TelemetryUnprovableTemporaryRootsScenario:
+                var scratchRoot = GetRequired(ScratchBindMountPathEnvironmentVariable);
+                documentDB
+                    .WithDataBindMount(GetRequired(BindMountPathEnvironmentVariable))
+                    .WithBindMount(Path.Combine(scratchRoot, "tmp"), "/tmp")
+                    .WithBindMount(Path.Combine(scratchRoot, "var-tmp"), "/var/tmp")
+                    .WithBindMount(Path.Combine(scratchRoot, "dev-shm"), "/dev/shm")
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
+                break;
+
+            case TelemetryShellExecutionScenario:
+                documentDB.WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
+                documentDB.Resource.ShellExecution =
+                    GetRequired(ShellExecutionEnvironmentVariable) switch
+                    {
+                        "null" => null,
+                        "false" => false,
+                        "true" => true,
+                        var value => throw new InvalidOperationException(
+                            $"{ShellExecutionEnvironmentVariable} must be null, false, or true, but was '{value}'."),
+                    };
+                break;
+
+            case TelemetryShellExecutionMutationScenario:
+                documentDB.WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
+                builder.Eventing.Subscribe<BeforeStartEvent>(async (_, cancellationToken) =>
+                {
+                    await ExecutionConfigurationBuilder.Create(documentDB.Resource)
+                        .WithArgumentsConfig()
+                        .BuildAsync(builder.ExecutionContext, NullLogger.Instance, cancellationToken);
+                    documentDB.Resource.ShellExecution = true;
+                });
                 break;
 
             case DebugLogLevelScenario:

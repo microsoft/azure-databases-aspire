@@ -201,16 +201,56 @@ which runs while the resource is serialized and so after every model event. A mi
 resource, naming what kind of thing changed and no value. Re-declaring the same storage is not a
 change: replacing a mount with an identical one, or reordering them, is accepted.
 
-The manifest is checked on both sides of the write, because the app host emits a container's image,
-entrypoint and mounts *before* it evaluates the environment callbacks, and its bindings after them.
-An environment callback that mutates the model while the entry is being written would therefore land
-on both sides of it at once, and the rules above would have judged a resource the manifest does not
-describe. The safety-relevant structure — the mounts, the endpoints, the membership of the three
-callback pipelines, the entrypoint, the effective image, the container build definition and
-`WithExplicitStart()` — is recorded immediately before the writer is handed the resource and
-compared again immediately afterwards. Any difference fails the publish, which abandons the partly
-written manifest rather than completing it; writing environment values, and re-declaring or
-reordering the same mounts, are not differences.
+The manifest is checked on both sides of the write, because the app host emits a container's
+connection string, image, entrypoint and mounts *before* it evaluates the environment callbacks, and
+its bindings after them. An environment callback that mutates the model while the entry is being
+written would therefore land on both sides of it at once, and the storage rules would have judged a
+resource the manifest does not describe. The safety-relevant structure — the mounts, the endpoints,
+the membership of the three callback pipelines, the entrypoint, the effective image, the container
+build definition, `WithExplicitStart()` and the connection string's security state — is recorded
+immediately before the writer is handed the resource and compared again immediately afterwards. Any
+difference fails the publish, which abandons the partly written manifest rather than completing it;
+writing environment values, and re-declaring or reordering the same mounts, are not differences.
+
+The connection string's security state is part of that because it is written first of all. `UseTls`,
+`AllowInsecureTls` and the exact published expression are recorded, so
+`.WithEnvironment(_ => db.AllowInsecureTls(false))` — a supported call — no longer publishes
+`tlsInsecure=true` while the final model says certificates must be valid. Each database is checked
+where the database is written, since a database publishes nothing but the string its parent builds.
+The expression is kept only as a digest and never appears in a failure: it carries the resource's
+credentials.
+
+The image is settled before any of this, and before the app host prepares a single container. The
+app host snapshots a container's image into the orchestrator's container spec while it prepares
+resources, which is before endpoints are allocated and before the resource-start event, and nothing
+re-reads the image annotation for it afterwards. So a run records the image — the composed
+reference, the release it resolves to, and the container build definitions behind it — from
+`IDistributedApplicationLifecycleHook.BeforeStartAsync`, which the app host runs after every
+`BeforeStartEvent` subscriber and still before it prepares anything, and every rule in this package
+judges that record. Choosing the image while the model is built, in any order, or from a
+`BeforeStartEvent` subscriber, is ordinary and is what gets recorded. Changing it later — from a
+`ResourceEndpointsAllocatedEvent` or `BeforeResourceStartedEvent` subscriber, or from a lifecycle
+hook registered after this package's — fails the resource, naming both references: the container
+would run one release while these rules judged another, in either direction. A publish records
+nothing, because it prepares no container and writes the manifest from the model.
+
+Container-runtime arguments are read too. `WithContainerRuntimeArgs(...)` passes its arguments
+straight to the container runtime ahead of the image, so nothing added there is visible to any rule
+written against the model: `--mount`, `-v`, `--volume`, `--volume-driver`, `--volumes-from`,
+`--tmpfs` and `--use-api-socket` mount storage with no annotation to read, `--read-only` makes the
+data directory unwritable without one either,
+`--env DATA_PATH=...` moves the data directory past the one checked path above, `--env`/`-e` can
+replace `USERNAME` or `PASSWORD` out from under the generated connection string, `--entrypoint`
+replaces the entry point, and a bare operand would be read as the image. All of those fail the
+resource, in every spelling the runtime accepts — `--option value`, `--option=value`, the attached
+short form `-eDATA_PATH=...`, short-option clusters, `--env-file`, and values contributed by
+another callback — as does a token whose value is only known later sitting where the runtime reads
+an option name. One parser and one terminal container-runtime callback serve the whole package, so
+the storage rules and the `WithOpenTelemetryMetrics(...)` wrapper judge the same finished line. The arguments
+are parsed with the runtime's own grammar rather than searched, so `--label -v` passes a label,
+`--memory 512m` is not a mount, and `--cap-add`, `--network`, `--pull`, `--platform`, `--dns`,
+`--ulimit`, `--sysctl`, `-it` and the rest reach the runtime untouched. No operand appears in the
+failure, which names the option and, for an environment option, the variable.
 
 A container built from a Dockerfile is recorded twice over, because every such build resolves to the
 same effective image and the `build` object is the first thing the writer emits. The annotation's
@@ -660,7 +700,7 @@ for a build neither is what runs. A private registry mirror is wrapped when it i
 repository directly beneath a registry host — only the host differs — however the reference spells
 the boundary between the two annotation fields; a mirror that adds a namespace path, such as
 `contoso.azurecr.io/mirrors/documentdb/documentdb-local`, is a different repository and is left
-alone. See [How the image is recognised](#how-the-image-is-recognised). Four situations throw
+alone. See [How the image is recognised](#how-the-image-is-recognised). These situations throw
 instead of guessing:
 
 - Pinning the official image by digest (`WithImageSHA256`). The digest supersedes the tag — Aspire
@@ -678,6 +718,18 @@ instead of guessing:
   entrypoint — including by adding a Dockerfile build at that point. The wrapper cannot be
   uninstalled, and dropping its arguments would leave `/bin/bash` with nothing to run. Select the
   image before configuring metrics.
+- Setting `ContainerResource.ShellExecution` to `true`. DCP applies that switch after argument
+  validation and replaces the wrapper arguments with one joined `-c` string, producing a nested
+  shell command that does not start DocumentDB. Leave it `null` or set it to `false`.
+- Passing raw `--entrypoint`, `--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`,
+  `--volumes-from`, or `--use-api-socket` options through `WithContainerRuntimeArgs(...)`. Those
+  options bypass the resource model after the wrapper has been generated. Use `WithBindMount(...)` or
+  `WithVolume(...)` for storage.
+- Passing a raw runtime environment override for `DATA_PATH`, `CONFIG_DIR`, `GATEWAY_HOME`, or a
+  telemetry value the wrapper protects. `--env-file` is also rejected because its contents cannot
+  be inspected. Use `WithEnvironment(...)`, which is part of both the validated model and the
+  published manifest. Other Docker runtime options, including unrelated `--env` values, remain
+  available.
 
 **Argument ordering is fixed, and enforced.** `/bin/bash` reads its command from the first
 arguments, so the wrapper's `-c <script> --` prefix has to stay in front of everything else: one
@@ -701,6 +753,8 @@ position at every phase the app host offers — `BeforeStartEvent`,
 - The finished command line is checked before it is used: the entrypoint must still be `/bin/bash`,
   the arguments must begin with exactly `-c`, this run's script, `--`, and the script must not
   appear twice.
+- `ShellExecution` must remain `null` or `false`; its effective value is sealed with the command
+  and checked again in both run and publish mode.
 
 **Reading the configuration early freezes it.** The app host records each callback's result the
 first time it runs and reuses it for the rest of the run, and it takes the *last* callback's
@@ -710,12 +764,12 @@ early — `ExecutionConfigurationBuilder` or `GetArgumentValuesAsync`, typically
 the command line: the recorded wrapper is dropped from it entirely, and nothing re-validates.
 
 The wrapper closes that by recording what the container's command depended on when it produced its
-answer — the callbacks in every pipeline, the entrypoint, and the image the resource will run — and
-comparing it at the two points the app host never caches:
+answer — the callbacks in every pipeline, the entrypoint, `ShellExecution`, and the image the
+resource will run — and comparing it at the two points the app host never caches:
 
 | Mode | Checkpoint | Runs |
 | --- | --- | --- |
-| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read |
+| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read; it also resolves the final Docker runtime arguments once and rejects command, environment, or storage overrides that bypass the model |
 | Publish | the manifest publishing callback the package adds | while the resource is serialized, after every lifecycle hook and every model event, including ones raised by subscribers registered after `AddDocumentDB` |
 
 If anything changed, the resource is failed — a publish before the manifest is written, a run
@@ -736,12 +790,15 @@ mounted twice — and a scratch directory created through the second window appe
 directory, which DocumentDB `0.116.0` refuses to initialise. The container-path test stays in the
 container, because `DATA_PATH` can be moved again at runtime with `--data-path`; the backing-storage
 test is decided while the model is built, where the mount table is known, and travels with the
-command as the exact set of data directories each candidate root cannot be used with. Mount targets
-that are ancestors of the data directory or of a candidate root, and the relative subpaths below
-them, are taken into account, so `/srv` mounted at `/tmp` and `/srv/documentdb` mounted at `/data`
-are recognised as one region. Candidates are tried in the order `/tmp`, `/var/tmp`, `/dev/shm`, and
-if every one of them is on the data directory's storage the container fails to start with a
-diagnostic that says so.
+command as the exact set of data directories each candidate root cannot be used with. Named volumes
+are compared by name and subpath. Bind sources are different: Docker resolves them on the daemon,
+which may be remote and may traverse symbolic links that do not exist on the publishing machine.
+Whenever both `DATA_PATH` and a candidate are bind-backed, that candidate is therefore skipped even
+if the two source strings look unrelated. This conservative rule is machine-independent and covers
+exact, ancestor/subpath, and symbolic-link aliases. Different storage types remain independent.
+Candidates are tried in the order `/tmp`, `/var/tmp`, `/dev/shm`; if every candidate aliases
+`DATA_PATH` or cannot be proven independent, the container fails clearly. Raw runtime mounts are
+rejected because they never enter this model.
 
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
@@ -903,14 +960,23 @@ builder.AddProject<Projects.Worker>("worker")
 > `.WithImageTag(...)` shown above.
 >
 > **Scope of the guard:**
-> - **Judged on the image that will actually run.** The floor is reported by a
->   `BeforeResourceStartedEvent` subscriber, and applied again from the
->   package's uncached checkpoints — immediately before each container is
->   created, and while `azd publish` / `--publisher manifest` serializes the
->   resource — so a subscriber or lifecycle hook that swaps the image after the
->   event cannot slip a pre-`0.112.0` image past it. Publishing a manifest for
->   such a resource is refused with the same message; `ExcludeFromManifest()`
->   remains the way to keep a resource out of the manifest entirely.
+> - **Judged on the image that will actually run.** In run mode the integration
+>   seals the resource's image reference and build origin at the last point that
+>   precedes Aspire's container preparation, and every floor is judged on that
+>   sealed value. Aspire writes the image into the DCP container spec before
+>   endpoints are allocated and before `BeforeResourceStartedEvent` is
+>   published, so a `ResourceEndpointsAllocatedEvent` /
+>   `BeforeResourceStartedEvent` subscriber that swaps the image can no longer
+>   slip a pre-`0.112.0` image past the floor, nor make the model report a
+>   release the container runtime was never given — such a change is refused
+>   outright. Choosing the image while the application model is being built
+>   (including from a `BeforeStartEvent` subscriber) keeps working exactly as
+>   before. The floor is also applied where Aspire caches nothing —
+>   immediately before each container is created, and while `azd publish` /
+>   `--publisher manifest` serializes the resource. Publishing a manifest for a
+>   resource below the floor is refused with the same message;
+>   `ExcludeFromManifest()` remains the way to keep a resource out of the
+>   manifest entirely.
 > - **Curated image only.** A custom image (any reference that is not the
 >   curated repository under a registry host, e.g. a fork via
 >   `.WithImage("myorg/build", "pg17-0.110.0")` or a mirror path such as
