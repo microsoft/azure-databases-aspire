@@ -547,11 +547,11 @@ container would otherwise have used, removes the keys the environment has to win
 `CONFIG_DIR` at the sanitized copy, and execs the image's own entrypoint.
 
 The sanitized copy is created under the first writable directory among `/tmp`, `/var/tmp`, and
-`/dev/shm` whose filesystem subtree does not overlap the canonical `DATA_PATH`. This matters when
-the database itself uses a normally temporary path such as `/tmp`: placing the copy there would
-make a fresh data directory non-empty before PostgreSQL initialization. If none of those locations
-is safely separated and writable, startup fails with a diagnostic instead of writing into the data
-directory.
+`/dev/shm` whose filesystem subtree does not overlap the effective canonical `DATA_PATH`, including
+a `-d` or `--data-path` command-line override. This matters when the database itself uses a normally
+temporary path such as `/tmp`: placing the copy there would make a fresh data directory non-empty
+before PostgreSQL initialization. If none of those locations is safely separated and writable,
+startup fails with a diagnostic instead of writing into the data directory.
 
 **Which directory the wrapper reads.** Exactly the one the image entrypoint would have read:
 

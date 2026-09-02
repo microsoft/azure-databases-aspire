@@ -3438,6 +3438,9 @@ public class AddDocumentDBTests
         var script = await GetWrapperScriptAsync(SingleServerResource(app));
 
         Assert.Contains("d=\"$DATA_PATH\"", script, StringComparison.Ordinal);
+        Assert.Contains("for a in \"$@\"", script, StringComparison.Ordinal);
+        Assert.Contains("-d|--data-path) q=\"d\"", script, StringComparison.Ordinal);
+        Assert.Contains("--username) q=\"v\"", script, StringComparison.Ordinal);
         Assert.Contains("realpath -m -- \"$d\"", script, StringComparison.Ordinal);
         Assert.Contains("if [ \"$d\" = \"/\" ]", script, StringComparison.Ordinal);
         Assert.Contains("for x in /tmp /var/tmp /dev/shm", script, StringComparison.Ordinal);
