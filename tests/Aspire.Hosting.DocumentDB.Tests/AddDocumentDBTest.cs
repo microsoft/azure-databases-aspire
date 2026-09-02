@@ -1445,6 +1445,7 @@ public class AddDocumentDBTests
             () => ConfigureResourceAsync(app, "standby"));
 
         Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("an image pinned by digest", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
     }
 

@@ -1982,8 +1982,9 @@ public static class DocumentDBBuilderExtensions
               "the data directory'."
             : "At least one of the two runs an image with no data-directory interlock (DocumentDB " +
               "before v" + DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion +
-              ", an unrecognised tag, a custom image, or a Dockerfile build), so nothing refuses " +
-              "the second start: two PostgreSQL instances would open the same data directory and " +
+              ", an unrecognised tag, a custom image, a Dockerfile build, or an image pinned by " +
+              "digest, whose version the tag beside it does not settle), so nothing refuses the " +
+              "second start: two PostgreSQL instances would open the same data directory and " +
               "corrupt it silently.";
 
         var explicitStart = explicitStartNote

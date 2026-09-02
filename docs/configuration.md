@@ -281,8 +281,9 @@ One narrow case is downgraded to a warning: both resources resolve to a recognis
 later tag **and** one of them is started manually with `WithExplicitStart()`. There the pair may
 never run at the same time, and if they do, the image refuses the second start loudly rather than
 corrupting anything. When either side is an older, unrecognised, or custom image — or is built
-from your own Dockerfile, whatever its image annotation says — the combination stays a hard failure
-even with `WithExplicitStart()`, because there is no interlock to fall back on.
+from your own Dockerfile or pinned by digest, whatever its image annotation says — the combination
+stays a hard failure even with `WithExplicitStart()`, because there is no interlock to fall back
+on.
 
 Sharing storage that is *not* the peer's data directory is not a conflict: a resource may point
 `WithInitData(...)` or `WithTlsCertificate(...)` at the same host directory another resource uses
