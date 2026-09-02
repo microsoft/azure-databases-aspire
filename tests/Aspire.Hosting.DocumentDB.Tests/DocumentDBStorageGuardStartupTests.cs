@@ -32,6 +32,7 @@ public class DocumentDBStorageGuardStartupTests
     [InlineData(Scenarios.SharedDataDirectoryScenario, "as their data directory")]
     [InlineData(Scenarios.DeferredDataPathArgumentScenario, "reads an option name")]
     [InlineData(Scenarios.LateDataPathOverrideScenario, "mounts its data directory ('/pgdata') read-only")]
+    [InlineData(Scenarios.LateReadOnlyDataMountScenario, "was changed after its data directory ('/data') had already been checked")]
     public async Task AnUnusableDataStorageConfigurationFailsTheResourceOnARealStart(string scenario, string expected)
     {
         RequireDocker();

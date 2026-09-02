@@ -3,6 +3,7 @@
 
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Aspire.Hosting.DocumentDB.StorageGuardEndToEndApp;
 
@@ -47,6 +48,14 @@ public class Program
     /// path the image declares as a volume. The warning has to actually reach the operator.
     /// </summary>
     public const string DeclaredVolumeWarningScenario = "declared-volume-warning";
+
+    /// <summary>
+    /// A subscriber registered after <c>AddDocumentDB</c> builds the resource's configuration
+    /// through the public <see cref="ExecutionConfigurationBuilder"/> — which records the storage
+    /// verdict for the rest of the run — and only then mounts the data directory read-only. No
+    /// rule runs again, so the recorded verdict has to be re-checked.
+    /// </summary>
+    public const string LateReadOnlyDataMountScenario = "late-read-only-data-mount";
 
     public static async Task Main(string[] args)
     {
@@ -97,6 +106,24 @@ public class Program
                 builder.AddDocumentDB("documentdb")
                     .WithImageTag("pg17-0.116.0")
                     .WithDataVolume(targetPath: "/pgdata");
+                break;
+
+            case LateReadOnlyDataMountScenario:
+                var gathered = builder.AddDocumentDB("documentdb");
+
+                builder.Eventing.Subscribe<BeforeStartEvent>(async (_, token) =>
+                {
+                    await ExecutionConfigurationBuilder.Create(gathered.Resource)
+                        .WithArgumentsConfig()
+                        .WithEnvironmentVariablesConfig()
+                        .BuildAsync(
+                            new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                            NullLogger.Instance,
+                            token);
+
+                    gathered.Resource.Annotations.Add(new ContainerMountAnnotation(
+                        "documentdb-late-read-only-data", "/data", ContainerMountType.Volume, isReadOnly: true));
+                });
                 break;
 
             case ReadOnlyDataMountScenario:

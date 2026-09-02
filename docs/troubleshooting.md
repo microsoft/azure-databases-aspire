@@ -259,6 +259,14 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 **Solution:** make the configuration part of the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`, `WithArgs(...)` — instead of adding it after the model is built. If a subscriber must add it, register that subscriber before `AddDocumentDB`.
 
+### A change made after the storage was checked fails the resource
+
+**Symptom:** starting or publishing the resource fails with an `InvalidOperationException` saying it `was changed after its data directory ('/data') had already been checked`, followed by what changed — for example `a volume or bind mount was added, removed or changed`.
+
+**Cause:** Aspire records each callback's result the first time it runs and reuses it for the rest of the run. Something built the resource's configuration early — `ExecutionConfigurationBuilder` (or `GetEnvironmentVariableValuesAsync`) from an `IDistributedApplicationLifecycleHook` or an event subscriber — and then changed the resource. Storage lives in annotations, so a volume or bind mount added afterwards changes what the container really mounts without any rule running again. The guard records what it judged and compares it at the last uncached points of a run and of a publish, and fails the resource rather than starting it on a data directory nothing checked.
+
+**Solution:** finish configuring the resource before anything reads its configuration, or make the change part of the application model (`WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`) while it is being built. Re-declaring the same storage is not a change: the mounts are compared by value, so replacing a mount with an identical one, or reordering them, is accepted.
+
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 
 **Symptom:** A container using a bind-mounted data directory logs

@@ -174,6 +174,20 @@ hook — makes the resource fail rather than start on a data directory nothing c
 storage through the application model rather than after it is built, or register such a subscriber
 before `AddDocumentDB`.
 
+Position alone is not enough, because the app host records each callback's result the first time it
+runs and reuses it for the rest of the run. Storage is the sharpest form of that: a volume or bind
+mount is a plain annotation, so anything that builds the resource's configuration early —
+`ExecutionConfigurationBuilder`, the same public API the app host uses, from a lifecycle hook or an
+event subscriber — and only then mounts `/data` read-only, or puts a second resource on the same
+volume, changes what the container mounts without running a single check again. The guard therefore
+records what it judged — the mounts by value, the membership of both callback pipelines,
+`WithExplicitStart()` and the effective image — and compares it at the two points nothing is
+cached: a container-runtime-arguments callback on every container creation in a run, and the
+manifest publishing callback in a publish, which runs while the resource is serialized and so after
+every model event. A mismatch fails the resource, naming what kind of thing changed and no value.
+Re-declaring the same storage is not a change: replacing a mount with an identical one, or
+reordering them, is accepted.
+
 In publish mode a `DATA_PATH` supplied as a parameter is a manifest expression, not a path.
 Resolving it is not an option — the value belongs to the deployment, and a parameter may be a
 secret — so a resource that supplies one *and* mounts storage is refused: every rule below would

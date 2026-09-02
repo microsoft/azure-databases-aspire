@@ -2727,6 +2727,423 @@ public class AddDocumentDBTests
         Assert.Equal("/srv/pgdata-1", second["DATA_PATH"]);
     }
 
+    // ---------------------------------------------------------------------
+    // Being last is not enough on its own
+    //
+    // Aspire records each callback's result the first time it runs and reuses
+    // it for the rest of the run. Anything that builds the resource's
+    // configuration early — ExecutionConfigurationBuilder from a lifecycle
+    // hook or an event subscriber, which is the same public API Aspire itself
+    // uses — freezes the storage verdict. Storage is the sharpest form of the
+    // problem, because a volume or bind mount is a plain annotation: adding
+    // one afterwards changes what the container really mounts without running
+    // a single line of the guard again.
+    //
+    // The verdict is therefore recorded and compared at the two checkpoints
+    // Aspire never caches: the container-runtime-arguments callback in a run,
+    // and the manifest publishing callback — which runs while the resource is
+    // being serialized, later than any model event — in a publish.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The reported bypass, in a run: a lifecycle hook gathers the configuration and only then
+    /// mounts <c>/data</c> read-only. The environment the container receives is the one recorded
+    /// before the mount existed, so nothing would re-check it; DocumentDB 0.116 chowns and chmods
+    /// its data directory on start and cannot come up on a read-only one.
+    /// </summary>
+    [Fact]
+    public async Task AReadOnlyDataMountAddedAfterAGatherFailsTheRun()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(InterlockedTag);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+        appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+            new GatherThenMutateLifecycleHook(
+                ["DocumentDB"],
+                model => SingleServerResource(model, "DocumentDB").Annotations.Add(
+                    new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: true)),
+                DistributedApplicationOperation.Run));
+#pragma warning restore CS0618
+
+        using var app = appBuilder.Build();
+
+        await PublishBeforeStartAsync(app);
+        await RunLifecycleHooksAsync(app);
+        await PublishBeforeResourceStartedAsync(app, "DocumentDB");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app, "DocumentDB")));
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("a volume or bind mount was added, removed or changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same thing in a publish, through the real publisher. Publish raises no per-resource
+    /// event, and a subscriber registered after this package could run after
+    /// <c>BeforePublishEvent</c> too, so the check has to live where the resource is actually
+    /// serialized.
+    /// </summary>
+    [Fact]
+    public async Task AReadOnlyDataMountAddedAfterAGatherFailsRealManifestPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB").WithImageTag(InterlockedTag);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    ["DocumentDB"],
+                    model => SingleServerResource(model, "DocumentDB").Annotations.Add(
+                        new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: true))));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", log, StringComparison.Ordinal);
+        Assert.Contains("a volume or bind mount was added, removed or changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A subscriber registered after <c>AddDocumentDB</c> gets the last <c>BeforePublishEvent</c>,
+    /// which is after every retake this package can arrange. Replacing the judged data volume with
+    /// a read-only bind mount there still has to be caught.
+    /// </summary>
+    [Fact]
+    public async Task ReplacingTheDataMountFromALateBeforePublishSubscriberFailsPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data");
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (evt, token) =>
+            {
+                var resource = SingleServerResource(
+                    evt.Services.GetRequiredService<DistributedApplicationModel>(), "DocumentDB");
+
+                await ExecutionConfigurationBuilder.Create(resource)
+                    .WithArgumentsConfig()
+                    .WithEnvironmentVariablesConfig()
+                    .BuildAsync(
+                        new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                        NullLogger.Instance,
+                        token);
+
+                foreach (var mount in resource.Annotations.OfType<ContainerMountAnnotation>().ToList())
+                {
+                    resource.Annotations.Remove(mount);
+                }
+
+                resource.Annotations.Add(
+                    new ContainerMountAnnotation("/srv/readonly", "/data", ContainerMountType.BindMount, isReadOnly: true));
+            });
+
+            _ = documentDB;
+        });
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The corruption guard's own bypass: two resources on an image that predates the data
+    /// directory's exclusive lock gather with no storage at all, and only then are put on one
+    /// named volume. Nothing at runtime would refuse the pairing on those images, so the check has
+    /// to.
+    /// </summary>
+    [Fact]
+    public async Task TwoOldImagesPutOnOneVolumeAfterAGatherFailPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0");
+            appBuilder.AddDocumentDB("secondary").WithImageTag("pg17-0.114.0");
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    ["primary", "secondary"],
+                    model =>
+                    {
+                        foreach (var name in new[] { "primary", "secondary" })
+                        {
+                            SingleServerResource(model, name).Annotations.Add(
+                                new ContainerMountAnnotation("shared-late", "/data", ContainerMountType.Volume, isReadOnly: false));
+                        }
+                    }));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", log, StringComparison.Ordinal);
+        Assert.Contains("a volume or bind mount was added, removed or changed", log, StringComparison.Ordinal);
+        Assert.Contains("a shared one puts two clusters on one directory", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Storage that is re-declared rather than changed is the same storage. The mounts are
+    /// recorded by value and in a fixed order, so replacing an annotation with an identical one —
+    /// or shuffling the collection — leaves the verdict standing and the manifest is published.
+    /// </summary>
+    [Fact]
+    public async Task ReDeclaringTheSameStorageAfterAGatherIsAccepted()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data")
+                .WithBindMount("./certs", "/certs", isReadOnly: true);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    ["DocumentDB"],
+                    model =>
+                    {
+                        var resource = SingleServerResource(model, "DocumentDB");
+                        var mounts = resource.Annotations.OfType<ContainerMountAnnotation>().ToList();
+
+                        foreach (var mount in mounts)
+                        {
+                            resource.Annotations.Remove(mount);
+                        }
+
+                        // Fresh instances, reversed, describing exactly the same storage.
+                        mounts.Reverse();
+                        foreach (var mount in mounts)
+                        {
+                            resource.Annotations.Add(
+                                new ContainerMountAnnotation(mount.Source, mount.Target, mount.Type, mount.IsReadOnly));
+                        }
+                    }));
+#pragma warning restore CS0618
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal("/data", resource!["env"]?["DATA_PATH"]?.GetValue<string>());
+
+        var volume = Assert.Single(resource["volumes"]!.AsArray());
+        Assert.Equal("documentdb-data", volume!["name"]?.GetValue<string>());
+        Assert.Equal("/data", volume["target"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// The publish checkpoint has to be invisible when nothing is wrong: it writes exactly what
+    /// the publisher would have written for the resource on its own.
+    /// </summary>
+    [Fact]
+    public async Task ThePublishCheckpointLeavesTheManifestUnchanged()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataBindMount("./pgdata"));
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal("container.v0", resource!["type"]?.GetValue<string>());
+        Assert.Equal(
+            $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{InterlockedTag}",
+            resource["image"]?.GetValue<string>());
+        Assert.Equal("/data", resource["env"]?["DATA_PATH"]?.GetValue<string>());
+        Assert.NotNull(resource["connectionString"]);
+        Assert.NotNull(resource["bindings"]);
+
+        var bindMount = Assert.Single(resource["bindMounts"]!.AsArray());
+        Assert.Equal("/data", bindMount!["target"]?.GetValue<string>());
+        Assert.False(bindMount["readOnly"]?.GetValue<bool>());
+    }
+
+    /// <summary>
+    /// A resource the caller excluded is not written at all, checkpoint or no checkpoint: there is
+    /// no published configuration to be wrong about, and taking the last manifest position from
+    /// the exclusion would publish a resource the caller removed.
+    /// </summary>
+    [Fact]
+    public async Task AnExcludedResourceIsStillAbsentFromTheManifest()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume()
+                .ExcludeFromManifest());
+
+        Assert.Null(manifest["resources"]?["DocumentDB"]);
+    }
+
+    /// <summary>
+    /// The one shape where the storage rules legitimately decline to judge: publish mode with a
+    /// <c>DATA_PATH</c> that is a manifest expression and no storage at all. "Mounts nothing" is
+    /// still an observation, and a mount added after it has been made contradicts it.
+    /// </summary>
+    [Fact]
+    public async Task StorageAddedAfterADeferredDataPathWasAcceptedFailsPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var dataPath = appBuilder.AddParameter("datapath", "/pgdata");
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithEnvironment("DATA_PATH", dataPath);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    ["DocumentDB"],
+                    model => SingleServerResource(model, "DocumentDB").Annotations.Add(
+                        new ContainerMountAnnotation("late-data", "/pgdata", ContainerMountType.Volume, isReadOnly: true))));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its storage (it mounted none) had already been checked", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The window between the run's checkpoint and the gather it protects. Aspire invokes every
+    /// container-runtime-argument callback, in annotation order, and only then builds the
+    /// container's environment, so a callback appended after the checkpoint runs once the verdict
+    /// has already been re-checked — and can still append an environment callback that moves
+    /// <c>DATA_PATH</c> onto read-only storage, because the guard's own environment callback is
+    /// cached and no longer re-checks anything.
+    /// </summary>
+    [Fact]
+    public async Task ARuntimeArgumentCallbackAddedAfterAGatherFailsTheRun()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "documentdb-data")
+            .WithVolume("documentdb-archive", "/archive", isReadOnly: true);
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, async (_, token) =>
+        {
+            var resource = documentDB.Resource;
+
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithArgumentsConfig()
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    token);
+
+            resource.Annotations.Add(new ContainerRuntimeArgsCallbackAnnotation(_ =>
+            {
+                resource.Annotations.Add(new EnvironmentCallbackAnnotation(
+                    (Func<EnvironmentCallbackContext, Task>)(context =>
+                    {
+                        context.EnvironmentVariables["DATA_PATH"] = "/archive";
+                        return Task.CompletedTask;
+                    })));
+
+                return Task.CompletedTask;
+            }));
+        });
+
+        using var app = appBuilder.Build();
+
+        await PublishBeforeStartAsync(app);
+        await PublishBeforeResourceStartedAsync(app, "DocumentDB");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app, "DocumentDB")));
+
+        Assert.Contains("has a later container-runtime-arguments callback registered after", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A lifecycle hook that moves <c>DATA_PATH</c> without reading the configuration first is
+    /// repairable rather than fatal. Publish raises no per-resource event, so
+    /// <c>BeforePublishEvent</c> is where the guard takes the last position in the environment
+    /// pipeline back; the value it then reads is judged on its own terms — here, onto a read-only
+    /// mount — instead of being reported as an ordering problem.
+    /// </summary>
+    [Fact]
+    public async Task ADataPathSetByALifecycleHookIsJudgedOnItsOwnTermsWhenPublishing()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data")
+                .WithVolume("documentdb-archive", "/pgdata", isReadOnly: true);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new DataPathLifecycleHook("DocumentDB", "/pgdata"));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Invokes the resource's container-runtime-argument callbacks the way Aspire's container
+    /// creator does: in annotation order, over one shared list, with no result cache — which is
+    /// what makes this the run's unconditional checkpoint.
+    /// </summary>
+    private static async Task<string[]> RunContainerRuntimeArgsAsync(DocumentDBServerResource resource)
+    {
+        var args = new List<object>();
+        var context = new ContainerRuntimeArgsCallbackContext(args, CancellationToken.None);
+
+        foreach (var annotation in resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>())
+        {
+            await annotation.Callback(context);
+        }
+
+        return [.. args.Select(argument => argument as string ?? argument.ToString()!)];
+    }
+
+    private static DocumentDBServerResource SingleServerResource(DistributedApplication app, string name) =>
+        SingleServerResource(app.Services.GetRequiredService<DistributedApplicationModel>(), name);
+
+    private static DocumentDBServerResource SingleServerResource(DistributedApplicationModel model, string name) =>
+        model.Resources.OfType<DocumentDBServerResource>().Single(resource => resource.Name == name);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+    private static async Task RunLifecycleHooksAsync(DistributedApplication app)
+    {
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        foreach (var hook in app.Services.GetServices<IDistributedApplicationLifecycleHook>())
+        {
+            await hook.BeforeStartAsync(model, CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// A lifecycle hook that builds the named resources' configuration through the same public API
+    /// Aspire uses, and only then changes the model — the shape that made a recorded storage
+    /// verdict stale.
+    /// </summary>
+    private sealed class GatherThenMutateLifecycleHook(
+        string[] resourceNames,
+        Action<DistributedApplicationModel> mutate,
+        DistributedApplicationOperation operation = DistributedApplicationOperation.Publish)
+        : IDistributedApplicationLifecycleHook
+    {
+        public async Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            foreach (var name in resourceNames)
+            {
+                await ExecutionConfigurationBuilder.Create(SingleServerResource(appModel, name))
+                    .WithArgumentsConfig()
+                    .WithEnvironmentVariablesConfig()
+                    .BuildAsync(
+                        new DistributedApplicationExecutionContext(operation),
+                        NullLogger.Instance,
+                        cancellationToken);
+            }
+
+            mutate(appModel);
+        }
+    }
+#pragma warning restore CS0618
+
     // The lifecycle-hook interface is obsolete in favour of eventing subscribers, but Aspire still
     // runs registered hooks — after BeforeStartEvent — so it remains a way to mutate the model late
     // and the guard has to hold against it.
