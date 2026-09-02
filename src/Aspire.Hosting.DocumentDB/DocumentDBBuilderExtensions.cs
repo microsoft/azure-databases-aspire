@@ -3033,8 +3033,8 @@ public static class DocumentDBBuilderExtensions
     /// spellings; see <see cref="DocumentDBContainerRuntimeArguments"/>. A search would refuse
     /// <c>--label -v</c>, which passes a label, and accept <c>--mount=type=bind,...</c>, which
     /// mounts. Ordinary arguments — <c>--cap-add</c>, <c>--network</c>, <c>--memory</c>,
-    /// <c>--pull</c>, <c>--platform</c>, <c>--dns</c>, and the Podman-only <c>--pod</c>,
-    /// <c>--tz</c>, <c>--systemd</c> — are passed through untouched.
+    /// <c>--pull</c>, <c>--platform</c>, <c>--dns</c>, and the Podman-only <c>--tz</c>,
+    /// <c>--sdnotify</c>, <c>--uidmap</c> — are passed through untouched.
     /// </para>
     /// <para>
     /// No value the caller wrote ever reaches the message, whether it is a literal or a parameter

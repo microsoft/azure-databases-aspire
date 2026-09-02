@@ -266,10 +266,27 @@ package owns; and `--rootfs` replaces the image with a directory, so it is refus
 sealed image. An explicit `--option=false` on a value-less option is the caller declining it, and is
 passed through.
 
+Storage is not only what a `--mount` spells, so an option that creates, selects or alters mounts or
+the root filesystem without naming one is refused as storage too: `--storage-opt` (the storage
+driver's options for this container, which is the size and backing of the root filesystem the data
+directory sits on when nothing is mounted over it), `--volume-driver` (which driver supplies every
+`-v` volume), `--chrootdirs` (further directories the runtime bind-mounts its managed files into),
+`--ipc` (whose `/dev/shm` the container gets — `host` mounts the host's, `container:`*id* another
+container's), `--pod` and `--pod-id-file` (the pod whose infra container brings namespaces and the
+pod's own volumes, and which `--pod new:`*name* also creates), `--read-only-tmpfs` (the read-write
+tmpfs the runtime mounts over `/dev`, `/dev/shm`, `/run`, `/tmp` and `/var/tmp` under `--read-only`),
+`--systemd` (systemd mode, which mounts tmpfs on `/run`, `/run/lock`, `/tmp` and `/var/log/journal`
+and mounts the cgroup filesystem) and `--use-api-socket` (which bind-mounts the runtime's API socket
+and a synthesized credential file). `--read-only-tmpfs=false` and `--use-api-socket=false` are the
+caller declining them and pass through; so does `--systemd=false`, which is the one off spelling
+Podman reads for a three-valued option — `--systemd=0` is not.
+
 The arguments are parsed with the runtimes' own grammar rather than searched, so `--label -v` passes
 a label, `--memory 512m` is not a mount, and `--cap-add`, `--network`, `--pull`, `--platform`,
-`--dns`, `--ulimit`, `--sysctl`, `-it` — and Podman's `--pod`, `--tz`, `--systemd`, `--sdnotify`,
-`--uidmap`, `--authfile`, `--seccomp-policy` and the rest — reach the runtime untouched.
+`--dns`, `--ulimit`, `--sysctl`, `-it` — and Podman's `--tz`, `--umask`, `--sdnotify`, `--uidmap`,
+`--authfile`, `--seccomp-policy` and the rest — reach the runtime untouched. A value-less option
+takes its value only after an `=`, so a bare `--systemd`, `--read-only-tmpfs` or `--use-api-socket`
+does not consume the token behind it and cannot hide a `--mount=type=bind,...` as its operand.
 
 No value the caller wrote appears in the failure. What is named is the option spelling this
 package's own table holds and, for an environment option, the package-owned variable name this

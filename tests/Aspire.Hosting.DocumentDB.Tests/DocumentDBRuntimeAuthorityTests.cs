@@ -514,14 +514,10 @@ public class DocumentDBRuntimeAuthorityTests
         new[] { "--sysctl", "net.core.somaxconn=1024", "--cap-add", "NET_ADMIN" },
 
         // Podman-only options that reach nothing this package owns. They are here as much for
-        // their arity as for their verdict: without it '--pod mypod' would leave 'mypod' looking
+        // their arity as for their verdict: without it '--tz local' would leave 'local' looking
         // like the bare operand the runtime reads as the image.
-        new[] { "--pod", "documentdb-pod" },
-        new[] { "--pod=documentdb-pod" },
-        new[] { "--pod-id-file", "/run/documentdb.pod" },
         new[] { "--tz", "UTC" },
         new[] { "--umask", "0022" },
-        new[] { "--systemd", "always" },
         new[] { "--sdnotify", "container" },
         new[] { "--arch", "arm64" },
         new[] { "--os", "linux" },
@@ -534,7 +530,6 @@ public class DocumentDBRuntimeAuthorityTests
         new[] { "--retry", "3", "--retry-delay", "5s" },
         new[] { "--uidmap", "0:100000:65536", "--gidmap", "0:100000:65536" },
         new[] { "--subuidname", "containers", "--subgidname", "containers" },
-        new[] { "--chrootdirs", "/var/lib/documentdb" },
         new[] { "--personality", "linux" },
         new[] { "--pidfile", "/run/documentdb.pid" },
         new[] { "--conmon-pidfile", "/run/conmon.pid" },
@@ -558,6 +553,17 @@ public class DocumentDBRuntimeAuthorityTests
         new[] { "--unsetenv-all=false" },
         new[] { "--read-only=false" },
         new[] { "--rootfs=0" },
+        new[] { "--read-only-tmpfs=false" },
+        new[] { "--read-only-tmpfs=0" },
+        new[] { "--use-api-socket=false" },
+        new[] { "--use-api-socket=F" },
+
+        // '--systemd' is three-valued rather than boolean, so only Podman's own off spelling is
+        // read as off — and it still does not consume the token after it.
+        new[] { "--systemd=false" },
+        new[] { "--systemd=FALSE" },
+        new[] { "--systemd=false", "--label", "owner=documentdb" },
+        new[] { "--read-only=false", "--read-only-tmpfs=false", "--label", "owner=documentdb" },
 
         // The scoped Podman environment options, naming variables this package does not own.
         new[] { "--env-merge", "TZ=${TZ}-utc" },
@@ -662,6 +668,129 @@ public class DocumentDBRuntimeAuthorityTests
         var exception = await RunWithRuntimeArgumentsExpectingFailureAsync(arguments);
 
         Assert.Contains($"'{option}', which changes what the container mounts", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Storage is not only what a <c>--mount</c> spells. These options create, select or alter
+    /// mounts or the root filesystem without naming one — the storage driver's options for this
+    /// container, the driver every <c>-v</c> volume comes from, the directories the runtime
+    /// bind-mounts its managed files into, whose <c>/dev/shm</c> the container gets, the pod whose
+    /// infra container supplies namespaces and volumes, and the mounts the runtime makes on its own
+    /// for <c>--read-only</c> containers, systemd mode and the API socket. Every one reaches past
+    /// the application model exactly as <c>--mount</c> does, in both the split and the inline form.
+    /// </summary>
+    public static TheoryData<string[], string> MountAffectingRuntimeArguments => new()
+    {
+        { new[] { "--storage-opt", "size=10G" }, "--storage-opt" },
+        { new[] { "--storage-opt=size=10G" }, "--storage-opt" },
+        { new[] { "--volume-driver", "local" }, "--volume-driver" },
+        { new[] { "--volume-driver=local" }, "--volume-driver" },
+        { new[] { "--chrootdirs", "/var/lib/documentdb" }, "--chrootdirs" },
+        { new[] { "--chrootdirs=/var/lib/documentdb" }, "--chrootdirs" },
+        { new[] { "--ipc", "host" }, "--ipc" },
+        { new[] { "--ipc=host" }, "--ipc" },
+        { new[] { "--ipc=container:documentdb-peer" }, "--ipc" },
+        { new[] { "--pod", "documentdb-pod" }, "--pod" },
+        { new[] { "--pod=documentdb-pod" }, "--pod" },
+        { new[] { "--pod=new:documentdb-pod" }, "--pod" },
+        { new[] { "--pod-id-file", "/run/documentdb.pod" }, "--pod-id-file" },
+        { new[] { "--pod-id-file=/run/documentdb.pod" }, "--pod-id-file" },
+
+        // Value-less forms: bare is the option being set, and only the runtime's own off spelling
+        // is the caller declining it.
+        { new[] { "--read-only-tmpfs" }, "--read-only-tmpfs" },
+        { new[] { "--read-only-tmpfs=true" }, "--read-only-tmpfs" },
+        { new[] { "--read-only-tmpfs=yes" }, "--read-only-tmpfs" },
+        { new[] { "--use-api-socket" }, "--use-api-socket" },
+        { new[] { "--use-api-socket=true" }, "--use-api-socket" },
+        { new[] { "--use-api-socket=1" }, "--use-api-socket" },
+
+        // '--systemd' is three-valued: bare means true, and 'always' forces systemd mode on
+        // whatever the image runs. '0' and 'f' are not spellings Podman reads as off, so they are
+        // read as the option being set rather than as the caller declining it.
+        { new[] { "--systemd" }, "--systemd" },
+        { new[] { "--systemd=true" }, "--systemd" },
+        { new[] { "--systemd=always" }, "--systemd" },
+        { new[] { "--systemd=ALWAYS" }, "--systemd" },
+        { new[] { "--systemd=0" }, "--systemd" },
+        { new[] { "--systemd=f" }, "--systemd" },
+    };
+
+    [Theory]
+    [MemberData(nameof(MountAffectingRuntimeArguments))]
+    public async Task AMountAffectingRuntimeArgumentIsRefused(string[] arguments, string option)
+    {
+        var exception = await RunWithRuntimeArgumentsExpectingFailureAsync(arguments);
+
+        Assert.Contains($"'{option}', which changes what the container mounts", exception.Message, StringComparison.Ordinal);
+
+        // The operand of a mount-affecting option is a host path, a pod name or a driver name, and
+        // none of them reaches the message. A one- or two-character operand cannot be told apart
+        // from the message's own prose, so only operands long enough to be recognisable are
+        // asserted on; the whole invariant is asserted separately, with a distinctive value in
+        // every operand position, by NoRuntimeArgumentValueReachesTheDiagnosticForAnyRefusedOption.
+        foreach (var argument in arguments)
+        {
+            string? operand;
+
+            if (!argument.StartsWith('-'))
+            {
+                operand = argument;
+            }
+            else
+            {
+                var separator = argument.IndexOf('=', StringComparison.Ordinal);
+                operand = separator < 0 ? null : argument[(separator + 1)..];
+            }
+
+            if (operand is { Length: > 2 })
+            {
+                Assert.DoesNotContain(operand, exception.Message, StringComparison.Ordinal);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The reason <c>--systemd</c> is out of the arity table. Read as an option that consumes the
+    /// token after it, a bare <c>--systemd</c> swallows the <c>--mount</c> behind it as its own
+    /// operand and the mount is never seen at all. It takes its value only after an <c>=</c>, so
+    /// the token after it is the next option — and the bare spelling is itself refused, which is
+    /// what makes the hiding impossible rather than merely unlikely.
+    /// </summary>
+    public static TheoryData<string[]> RuntimeArgumentsThatCannotHideAMount => new()
+    {
+        new[] { "--systemd", "--mount=type=bind,source=/host/hunter2-tr0ub4dor,target=/data" },
+        new[] { "--systemd", "--mount", "type=bind,source=/host/hunter2-tr0ub4dor,target=/data" },
+        new[] { "--systemd", "-v/host/hunter2-tr0ub4dor:/data" },
+        new[] { "--systemd", "--entrypoint=/host/hunter2-tr0ub4dor" },
+        new[] { "--read-only-tmpfs", "--mount=type=bind,source=/host/hunter2-tr0ub4dor,target=/data" },
+        new[] { "--use-api-socket", "--mount=type=bind,source=/host/hunter2-tr0ub4dor,target=/data" },
+        new[] { "--systemd=false", "--mount=type=bind,source=/host/hunter2-tr0ub4dor,target=/data" },
+        new[] { "--read-only-tmpfs=false", "--volume=/host/hunter2-tr0ub4dor:/data" },
+    };
+
+    [Theory]
+    [MemberData(nameof(RuntimeArgumentsThatCannotHideAMount))]
+    public async Task AValuelessOptionCannotHideAFollowingStorageArgument(string[] arguments)
+    {
+        var exception = await RunWithRuntimeArgumentsExpectingFailureAsync(arguments);
+
+        Assert.Contains("passes the container-runtime argument '--", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("hunter2-tr0ub4dor", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same line one token longer: whatever the option before it is, the mount is still read as
+    /// the mount and not as somebody's operand.
+    /// </summary>
+    [Fact]
+    public async Task ASystemdArgumentDoesNotConsumeTheMountBehindIt()
+    {
+        var exception = await RunWithRuntimeArgumentsExpectingFailureAsync(
+            ["--systemd=false", "--label", "owner=documentdb", "--mount=type=bind,source=/host/secrets,target=/data"]);
+
+        Assert.Contains("'--mount', which changes what the container mounts", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("/host/secrets", exception.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -839,6 +968,18 @@ public class DocumentDBRuntimeAuthorityTests
         new[] { "--secret", "hunter2-tr0ub4dor,type=mount,target=/data" },
         new[] { "--image-volume", "hunter2-tr0ub4dor" },
         new[] { "--init-path", "/host/hunter2-tr0ub4dor" },
+        new[] { "--storage-opt", "size=hunter2-tr0ub4dor" },
+        new[] { "--storage-opt=size=hunter2-tr0ub4dor" },
+        new[] { "--volume-driver", "hunter2-tr0ub4dor" },
+        new[] { "--chrootdirs", "/host/hunter2-tr0ub4dor" },
+        new[] { "--ipc", "container:hunter2-tr0ub4dor" },
+        new[] { "--pod", "hunter2-tr0ub4dor" },
+        new[] { "--pod=new:hunter2-tr0ub4dor" },
+        new[] { "--pod-id-file", "/run/hunter2-tr0ub4dor.pod" },
+        new[] { "--read-only-tmpfs=hunter2-tr0ub4dor" },
+        new[] { "--use-api-socket=hunter2-tr0ub4dor" },
+        new[] { "--systemd=hunter2-tr0ub4dor" },
+        new[] { "--systemd", "hunter2-tr0ub4dor" },
         new[] { "--entrypoint", "/host/hunter2-tr0ub4dor" },
         new[] { "--entrypoint=/host/hunter2-tr0ub4dor" },
         new[] { "--env", "PASSWORD=hunter2-tr0ub4dor" },

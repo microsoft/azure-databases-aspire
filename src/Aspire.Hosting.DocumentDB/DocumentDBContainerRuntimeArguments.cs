@@ -77,7 +77,7 @@ internal readonly record struct DocumentDBRuntimeArgumentFinding(
 /// mount however the token after it reads. Only options that can actually reach storage, this
 /// package's environment or the entry point are refused; everything else the runtime accepts is
 /// passed through, which is what keeps <c>--cap-add</c>, <c>--network</c>, <c>--memory</c>,
-/// <c>--label</c>, <c>--pull</c>, <c>--pod</c>, <c>--tz</c> and the rest usable.
+/// <c>--label</c>, <c>--pull</c>, <c>--sysctl</c>, <c>--tz</c> and the rest usable.
 /// </para>
 /// <para>
 /// The grammar is the union of the two runtimes Aspire drives, because which one is behind the
@@ -90,6 +90,16 @@ internal readonly record struct DocumentDBRuntimeArgumentFinding(
 /// <c>--rootfs</c> makes the operand a root filesystem path instead of an image. Their arities are
 /// taken from the <c>podman-run</c> option reference, so an operand of a Podman-only option is
 /// never mistaken for one of these or for the image.
+/// </para>
+/// <para>
+/// Storage is not only what a <c>--mount</c> spells. An option that selects where a volume comes
+/// from (<c>--volume-driver</c>), how the container's own root filesystem is built
+/// (<c>--storage-opt</c>), which directories the runtime bind-mounts its managed files into
+/// (<c>--chrootdirs</c>), whose <c>/dev/shm</c> the container gets (<c>--ipc</c>), which pod
+/// supplies the container's infra namespaces and mounts (<c>--pod</c>, <c>--pod-id-file</c>), or
+/// which mounts the runtime creates by itself (<c>--read-only-tmpfs</c>, <c>--systemd</c>,
+/// <c>--use-api-socket</c>) reaches the same place a mount does, and reaches it without a
+/// <c>ContainerMountAnnotation</c> for any rule to read. All of them are storage here.
 /// </para>
 /// <para>
 /// Unknown options are read as flags rather than as value-taking options. That is the fail-closed
@@ -120,12 +130,34 @@ internal static class DocumentDBContainerRuntimeArguments
     /// Options that add, remove or re-point container storage.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// <c>--read-only</c> is here because it makes every path that is not a mount unwritable, which
     /// is the same failure as mounting the data directory read-only. The Podman-only three are
     /// storage by the same test: <c>--secret</c> mounts a file into the container (and with
     /// <c>type=env</c> sets a variable instead, which is no better), <c>--image-volume</c> decides
     /// whether the image's own <c>VOLUME</c> declarations become volumes, a tmpfs or nothing, and
     /// <c>--init-path</c> bind-mounts a host binary into the container.
+    /// </para>
+    /// <para>
+    /// The rest create, select or alter storage without naming a mount. <c>--storage-opt</c> sets
+    /// the storage driver's options for this container, which is the size and backing of the root
+    /// filesystem the data directory sits on when nothing is mounted over it.
+    /// <c>--volume-driver</c> chooses which driver supplies every <c>-v</c> volume, so the same
+    /// declaration can be backed by a different host, and <c>--chrootdirs</c> makes the runtime
+    /// bind-mount its own managed files into further directories inside the container.
+    /// <c>--ipc</c> decides whose <c>/dev/shm</c> the container gets — <c>host</c> mounts the
+    /// host's and <c>container:</c><em>id</em> another container's. <c>--pod</c> and
+    /// <c>--pod-id-file</c> join a pod, whose infra container brings namespaces and the pod's own
+    /// volumes with it, and <c>--pod</c> also accepts <c>new:</c><em>name</em>, which creates one.
+    /// <c>--read-only-tmpfs</c> is what mounts a read-write tmpfs over <c>/dev</c>, <c>/dev/shm</c>,
+    /// <c>/run</c>, <c>/tmp</c> and <c>/var/tmp</c> under <c>--read-only</c>; <c>--systemd</c> puts
+    /// the container in systemd mode, which mounts tmpfs on <c>/run</c>, <c>/run/lock</c>,
+    /// <c>/tmp</c> and <c>/var/log/journal</c> and mounts the cgroup filesystem; and
+    /// <c>--use-api-socket</c> bind-mounts the runtime's own API socket and a synthesized
+    /// credential file into the container. Every one of them is storage the application model never
+    /// sees, and any of them can put the data directory somewhere <c>DATA_PATH</c> does not
+    /// describe.
+    /// </para>
     /// </remarks>
     private static readonly HashSet<string> s_storageOptions = new(StringComparer.Ordinal)
     {
@@ -135,9 +167,18 @@ internal static class DocumentDBContainerRuntimeArguments
         "--volumes-from",
         "--tmpfs",
         "--read-only",
+        "--read-only-tmpfs",
         "--secret",
         "--image-volume",
         "--init-path",
+        "--storage-opt",
+        "--volume-driver",
+        "--chrootdirs",
+        "--ipc",
+        "--pod",
+        "--pod-id-file",
+        "--systemd",
+        "--use-api-socket",
     };
 
     /// <summary>
@@ -199,10 +240,23 @@ internal static class DocumentDBContainerRuntimeArguments
     /// bare operand the runtime would read as the image.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The union of the two references. Options this package refuses outright are in the set too,
     /// because their arity still decides how the rest of the line is read. Boolean options are
     /// deliberately absent, and so is anything neither runtime documents: an unknown option is read
     /// as a flag, which keeps a following <c>--mount</c> visible.
+    /// </para>
+    /// <para>
+    /// "Boolean" here means every option that does not consume the token after it. The flag parser
+    /// both runtimes use gives a boolean flag a default value for the bare spelling, so
+    /// <c>--read-only</c>, <c>--read-only-tmpfs</c> and <c>--use-api-socket</c> take their value
+    /// only after an <c>=</c>. <c>--systemd</c> is kept out of this table for the same reason it is
+    /// refused: it is <c>--systemd=true|false|always</c>, and reading it as consuming the next token
+    /// would let a bare <c>--systemd</c> swallow a following <c>--mount=type=bind,...</c> as its
+    /// operand and hide it. Refused in every form but an explicit <c>=false</c>, it can never
+    /// consume anything; the cost is that a split <c>--systemd false</c> is refused as well, and
+    /// <c>--systemd=false</c> is the spelling that passes.
+    /// </para>
     /// </remarks>
     private static readonly HashSet<string> s_valueTakingOptions = new(StringComparer.Ordinal)
     {
@@ -226,7 +280,7 @@ internal static class DocumentDBContainerRuntimeArguments
         "--volume", "-v", "--volume-driver", "--volumes-from", "--workdir", "-w",
 
         // Podman only. Present so that their operands are read as operands: without them a
-        // '--pod mypod' would leave 'mypod' looking like the bare operand the runtime reads as the
+        // '--tz local' would leave 'local' looking like the bare operand the runtime reads as the
         // image, and ordinary Podman configuration would be refused.
         "--arch", "--authfile", "--cert-dir", "--cgroup-conf", "--cgroups", "--chrootdirs",
         "--conmon-pidfile", "--creds", "--decryption-key", "--env-merge", "--gidmap",
@@ -237,7 +291,7 @@ internal static class DocumentDBContainerRuntimeArguments
         "--os", "--passwd-entry", "--personality", "--pidfile", "--pod", "--pod-id-file",
         "--preserve-fd", "--preserve-fds", "--rdt-class", "--requires", "--retry", "--retry-delay",
         "--sdnotify", "--seccomp-policy", "--secret", "--shm-size-systemd", "--signature-policy",
-        "--subgidname", "--subuidname", "--systemd", "--timeout", "--tz", "--uidmap", "--umask",
+        "--subgidname", "--subuidname", "--timeout", "--tz", "--uidmap", "--umask",
         "--unsetenv", "--variant",
     };
 
@@ -407,29 +461,47 @@ internal static class DocumentDBContainerRuntimeArguments
     }
 
     /// <summary>
-    /// The options this package refuses that take no value, and which the runtime therefore also
-    /// accepts as <c>--option=false</c>.
-    /// </summary>
-    /// <remarks>
-    /// An explicit <c>false</c> is the caller saying "do not do the thing", which is what this
-    /// package wants; refusing it would be a refusal of the safe spelling. Only spellings the
-    /// runtime's own boolean parser reads as false are treated that way — anything else, including
-    /// a value neither runtime would accept, is read as the option being set.
-    /// </remarks>
-    private static readonly HashSet<string> s_valuelessOptions = new(StringComparer.Ordinal)
-    {
-        "--read-only",
-        "--env-host",
-        "--unsetenv-all",
-        "--rootfs",
-    };
-
-    /// <summary>
-    /// The spellings <c>pflag</c> — the flag parser both runtimes use — reads as <see langword="false"/>.
+    /// The spellings <c>pflag</c> — the flag parser both runtimes use — reads as <see langword="false"/>
+    /// for a boolean flag.
     /// </summary>
     private static readonly HashSet<string> s_falseFlagValues = new(StringComparer.Ordinal)
     {
         "0", "f", "F", "false", "FALSE", "False",
+    };
+
+    /// <summary>
+    /// The spellings Podman reads as "not systemd mode". <c>--systemd</c> is not a boolean flag but
+    /// a three-valued one — <c>true</c>, <c>false</c> or <c>always</c>, matched without regard to
+    /// case — so <c>pflag</c>'s boolean spellings are not what reads it, and <c>--systemd=0</c> is
+    /// a value Podman rejects rather than a request to turn it off.
+    /// </summary>
+    private static readonly HashSet<string> s_systemdFalseValues = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "false",
+    };
+
+    /// <summary>
+    /// The options this package refuses that never consume the token after them, mapped to the
+    /// values the runtime reads as the caller declining them.
+    /// </summary>
+    /// <remarks>
+    /// These take a value only after an <c>=</c>, so the bare spelling is the option being set and
+    /// the token after it is the next option — which is why <c>--systemd --mount=type=bind,...</c>
+    /// cannot hide the mount as an operand. An explicit off value is the caller saying "do not do
+    /// the thing", which is what this package wants; refusing it would be a refusal of the safe
+    /// spelling. Only spellings the runtime's own parser reads that way are treated as off —
+    /// anything else, including a value neither runtime would accept, is read as the option being
+    /// set.
+    /// </remarks>
+    private static readonly Dictionary<string, HashSet<string>> s_valuelessOptions = new(StringComparer.Ordinal)
+    {
+        ["--read-only"] = s_falseFlagValues,
+        ["--read-only-tmpfs"] = s_falseFlagValues,
+        ["--use-api-socket"] = s_falseFlagValues,
+        ["--env-host"] = s_falseFlagValues,
+        ["--unsetenv-all"] = s_falseFlagValues,
+        ["--rootfs"] = s_falseFlagValues,
+        ["--systemd"] = s_systemdFalseValues,
     };
 
     /// <summary>
@@ -444,8 +516,8 @@ internal static class DocumentDBContainerRuntimeArguments
         out DocumentDBRuntimeArgumentFinding finding)
     {
         if (inlineValue is not null &&
-            s_valuelessOptions.Contains(name) &&
-            s_falseFlagValues.Contains(inlineValue))
+            s_valuelessOptions.TryGetValue(name, out var declined) &&
+            declined.Contains(inlineValue))
         {
             finding = DocumentDBRuntimeArgumentFinding.Harmless;
             return true;
