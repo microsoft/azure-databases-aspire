@@ -29,6 +29,118 @@ public static class DocumentDBBuilderExtensions
         Required,
     }
 
+    /// <summary>
+    /// The callbacks this package is allowed to own on a resource, and the ordered steps each one
+    /// runs. See <see cref="EnsureTerminalGuard"/> for the contract.
+    /// </summary>
+    private sealed class TerminalGuardAnnotation : IResourceAnnotation
+    {
+        private readonly List<(int Rank, int Sequence, Action<TerminalCommandLineState> Step)> _commandLineSteps = [];
+        private readonly List<Action<TerminalCommandLineState>> _commandLineValidations = [];
+        private int _sequence;
+
+        /// <summary>
+        /// The command-line callback whose position in the annotation collection is what makes this
+        /// guard terminal. The instance never changes, so Aspire's per-callback result cache
+        /// survives every move.
+        /// </summary>
+        public CommandLineArgsCallbackAnnotation CommandLineCallback { get; set; } = null!;
+
+        /// <summary>
+        /// The container-runtime-arguments callback. It contributes nothing and exists only to be
+        /// a checkpoint: Aspire never caches these, so it is the one piece of this package's code
+        /// that is guaranteed to run on every container creation.
+        /// </summary>
+        public ContainerRuntimeArgsCallbackAnnotation RuntimeCheckpoint { get; set; } = null!;
+
+        /// <summary>
+        /// What the resource looked like when the command-line callback last produced a result, or
+        /// <see langword="null"/> if it has not run yet.
+        /// </summary>
+        public TerminalConfigurationSeal? Seal { get; set; }
+
+        public void AddCommandLineStep(int rank, Action<TerminalCommandLineState> step) =>
+            _commandLineSteps.Add((rank, _sequence++, step));
+
+        public void AddCommandLineValidation(Action<TerminalCommandLineState> validation) =>
+            _commandLineValidations.Add(validation);
+
+        public void RunCommandLine(CommandLineArgsCallbackContext context)
+        {
+            var state = new TerminalCommandLineState(context);
+
+            foreach (var (_, _, step) in _commandLineSteps.OrderBy(step => step.Rank).ThenBy(step => step.Sequence))
+            {
+                step(state);
+            }
+
+            foreach (var validation in _commandLineValidations)
+            {
+                validation(state);
+            }
+        }
+
+    }
+
+    /// <summary>
+    /// Everything the container's command depends on, as it stood when the command-line callback
+    /// produced the result Aspire cached.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Aspire evaluates each callback annotation at most once per run and reuses the recorded
+    /// result afterwards, so a callback that validated a configuration cannot notice the
+    /// configuration changing behind it. Worse, the gatherer takes the <em>last</em> annotation's
+    /// recorded result as the final argument list, so an annotation appended after a first
+    /// evaluation does not merely reorder the command line - it replaces it, because the earlier
+    /// annotations no longer write into the shared list at all.
+    /// </para>
+    /// <para>
+    /// The seal is what makes that detectable. It is compared at the checkpoints that Aspire never
+    /// caches, so the answer the wrapper gave is either still the answer or the resource is failed.
+    /// </para>
+    /// </remarks>
+    private sealed record TerminalConfigurationSeal(
+        System.Collections.Immutable.ImmutableArray<CommandLineArgsCallbackAnnotation> CommandLineCallbacks,
+        System.Collections.Immutable.ImmutableArray<EnvironmentCallbackAnnotation> EnvironmentCallbacks,
+        System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
+        string? Entrypoint,
+        DocumentDBEffectiveImage Image);
+
+    /// <summary>
+    /// What one evaluation of the terminal command-line guard produced. Scoped to the evaluation
+    /// rather than stored on an annotation, so a validation always judges the arguments its own
+    /// steps built.
+    /// </summary>
+    private sealed class TerminalCommandLineState(CommandLineArgsCallbackContext context)
+    {
+        public CommandLineArgsCallbackContext Context { get; } = context;
+
+        public IList<object> Args => Context.Args;
+
+        /// <summary>
+        /// The exact OpenTelemetry wrapper script instance this evaluation inserted, or
+        /// <see langword="null"/> when the wrapper was not applied.
+        /// </summary>
+        public string? WrapperScript { get; set; }
+    }
+
+    /// <summary>
+    /// Rank of the data-storage rules among the terminal guard's steps. Lowest in the package: the
+    /// rule models the container entrypoint's own <c>--option value</c> grammar, so it has to see
+    /// the caller's arguments as the entrypoint will, before the OpenTelemetry wrapper turns the
+    /// list into a <c>/bin/bash -c</c> command line.
+    /// </summary>
+    private const int TerminalCommandLineDataStorageRank = 0;
+
+    /// <summary>
+    /// Rank of the OpenTelemetry gateway wrapper among the terminal guard's steps. It is the
+    /// highest-ranked step in this package on purpose: the wrapper turns the argument list into a
+    /// <c>/bin/bash -c</c> command line, so every step that reads arguments as the container
+    /// entrypoint's own <c>--option value</c> grammar has to have run first.
+    /// </summary>
+    private const int TerminalCommandLineOpenTelemetryWrapperRank = 100;
+
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
     // default PostgreSQL coordinator port inside the documentdb-local container.
@@ -69,6 +181,7 @@ public static class DocumentDBBuilderExtensions
     private const string PackagedLayoutProbeUtils = "/usr/share/documentdb/scripts/utils.sh";
     private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
     private const string GatewayConfigurationShell = "/bin/bash";
+    private const string GatewayConfigurationShellCommandOption = "-c";
     private const string GatewayConfigurationShellArgumentZero = "--";
     private const string GatewayValueTakingOptionsShellPattern =
         "--allow-external-connections|--cert-path|--create-user|--documentdb-port|--enable-telemetry|" +
@@ -1252,18 +1365,30 @@ public static class DocumentDBBuilderExtensions
     /// stateful callback is evaluated once and the guard and the container cannot disagree.
     /// </para>
     /// <para>
-    /// Being last is established twice and then verified. The callbacks are appended when
-    /// <see cref="BeforeStartEvent"/> is published, which is before Aspire gathers anything but
-    /// before <see cref="Lifecycle.IDistributedApplicationLifecycleHook.BeforeStartAsync"/> and
-    /// before any later <see cref="BeforeStartEvent"/> subscriber, either of which may append more
-    /// callbacks. They are therefore moved back to the end of their pipelines when
+    /// Being last is established and then verified, in two different ways for the two pipelines.
+    /// The environment callback is appended when <see cref="BeforeStartEvent"/> is published, which
+    /// is before Aspire gathers anything but before
+    /// <see cref="Lifecycle.IDistributedApplicationLifecycleHook.BeforeStartAsync"/> and before any
+    /// later <see cref="BeforeStartEvent"/> subscriber, either of which may append more callbacks.
+    /// It is therefore moved back to the end of its pipeline when
     /// <see cref="BeforeResourceStartedEvent"/> is published, the last phase Aspire offers before
-    /// the container's environment and arguments are gathered. Anything that appends after
-    /// <em>that</em> — a <see cref="BeforeResourceStartedEvent"/> subscriber registered after
-    /// <c>AddDocumentDB</c>, or a lifecycle hook in publish mode, where no per-resource event is
-    /// published — is caught by the callbacks themselves: each one checks that it is still the last
-    /// of its kind and fails the resource rather than validating a configuration something else can
-    /// still change.
+    /// the container's environment is gathered. Anything that appends after <em>that</em> — a
+    /// <see cref="BeforeResourceStartedEvent"/> subscriber registered after <c>AddDocumentDB</c>,
+    /// or a lifecycle hook in publish mode, where no per-resource event is published — is caught by
+    /// the callback itself, which checks that it is still the last of its kind and fails the
+    /// resource rather than validating a configuration something else can still change.
+    /// </para>
+    /// <para>
+    /// The command-line rule is a step of the resource's terminal command-line guard
+    /// (<see cref="EnsureTerminalGuard"/>) rather than a callback of its own, and gets
+    /// the same three-phase treatment and the same fail-closed check from it. One callback for the
+    /// whole package is what makes that expressible: the OpenTelemetry gateway wrapper also has to
+    /// be the last word on the command line, and two callbacks that each demanded the last position
+    /// would be an impossible requirement rather than a check. The storage rule runs first among
+    /// the steps, on the caller's own arguments, because it models the container entrypoint's
+    /// <c>--option value</c> grammar and the wrapper turns the list into a <c>/bin/bash -c</c>
+    /// command line; it is then re-checked on the finished list, past the wrapper prefix, so the
+    /// last thing that runs has judged both rules.
     /// </para>
     /// </remarks>
     private static IResourceBuilder<DocumentDBServerResource> SubscribeDataStorageGuard(
@@ -1271,6 +1396,13 @@ public static class DocumentDBBuilderExtensions
     {
         var resource = builder.Resource;
         var coordinator = DataStorageCoordinator.For(builder.ApplicationBuilder);
+
+        var commandLineGuard = EnsureTerminalGuard(builder);
+        commandLineGuard.AddCommandLineStep(
+            TerminalCommandLineDataStorageRank,
+            state => RejectReservedDataPathArguments(resource, state.Args));
+        commandLineGuard.AddCommandLineValidation(
+            state => RejectReservedDataPathArguments(resource, CallerArguments(state)));
 
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((evt, _) =>
         {
@@ -1300,12 +1432,30 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
-    /// Appends the guard's environment and command-line callbacks to <paramref name="resource"/>,
-    /// or moves the ones already installed back to the end of their pipelines.
+    /// The arguments the container entrypoint itself receives: everything past the OpenTelemetry
+    /// wrapper prefix when that wrapper is in place, and the whole list otherwise.
     /// </summary>
     /// <remarks>
-    /// Moving re-uses the same annotation instances, so Aspire's per-callback result cache is
-    /// untouched and the guard is still evaluated exactly once per run.
+    /// The prefix is identified by the exact script instance this evaluation inserted, so a list
+    /// the wrapper does not actually own is scanned whole and left for
+    /// <see cref="ValidateOpenTelemetryGatewayCommand"/> to report — no rule is skipped on the
+    /// strength of a shape that is already wrong.
+    /// </remarks>
+    private static IEnumerable<object> CallerArguments(TerminalCommandLineState state) =>
+        state.WrapperScript is { } script &&
+        state.Args.Count >= 3 &&
+        ReferenceEquals(state.Args[1], script)
+            ? state.Args.Skip(3)
+            : state.Args;
+
+    /// <summary>
+    /// Appends the guard's environment callback to <paramref name="resource"/>, or moves the one
+    /// already installed back to the end of its pipeline.
+    /// </summary>
+    /// <remarks>
+    /// Moving re-uses the same annotation instance, so Aspire's per-callback result cache is
+    /// untouched and the guard is still evaluated exactly once per run. The command-line half is
+    /// owned by the terminal command-line guard, which moves itself at the same phases.
     /// </remarks>
     private static void InstallDataStorageGuard(
         DocumentDBServerResource resource,
@@ -1316,7 +1466,6 @@ public static class DocumentDBBuilderExtensions
         {
             installed.Services ??= services;
             MoveToEnd(resource, installed.Environment);
-            MoveToEnd(resource, installed.Arguments);
             return;
         }
 
@@ -1327,7 +1476,6 @@ public static class DocumentDBBuilderExtensions
 
         DataStorageGuardAnnotation? guard = null;
         EnvironmentCallbackAnnotation? environmentCallback = null;
-        CommandLineArgsCallbackAnnotation? argumentsCallback = null;
 
         environmentCallback = new EnvironmentCallbackAnnotation(async context =>
         {
@@ -1389,37 +1537,13 @@ public static class DocumentDBBuilderExtensions
             }
         });
 
-        argumentsCallback = new CommandLineArgsCallbackAnnotation(context =>
-        {
-            EnsureGuardRunsLast(resource, argumentsCallback!, "command-line");
-
-            RejectReservedDataPathArguments(resource, context);
-            return Task.CompletedTask;
-        });
-
-        guard = new DataStorageGuardAnnotation(environmentCallback, argumentsCallback) { Services = services };
+        guard = new DataStorageGuardAnnotation(environmentCallback) { Services = services };
         resource.Annotations.Add(guard);
         resource.Annotations.Add(environmentCallback);
-        resource.Annotations.Add(argumentsCallback);
     }
 
     /// <summary>
-    /// Moves an annotation the resource already carries to the end of the collection, so it is the
-    /// last of its kind when Aspire gathers it. The instance is preserved, so its cached result —
-    /// and with it the guarantee of a single evaluation — is preserved too.
-    /// </summary>
-    private static void MoveToEnd(DocumentDBServerResource resource, IResourceAnnotation annotation)
-    {
-        if (!resource.Annotations.Remove(annotation))
-        {
-            return;
-        }
-
-        resource.Annotations.Add(annotation);
-    }
-
-    /// <summary>
-    /// Fails the resource when something appended a callback of the same kind after the guard's.
+    /// Fails the resource when something appended an environment callback after the guard's.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -1431,18 +1555,22 @@ public static class DocumentDBBuilderExtensions
     /// otherwise be able to move the data directory past every rule.
     /// </para>
     /// <para>
+    /// The command-line pipeline has the same rule, enforced once for the whole package by
+    /// <see cref="EnsureTerminalCallbackRunsLast{TAnnotation}"/>, because the storage rules and the
+    /// OpenTelemetry gateway wrapper share one terminal callback there.
+    /// </para>
+    /// <para>
     /// That is reported rather than tolerated. No value is included in the message: the point is
     /// the shape of the configuration, and the callback that ran last may well be carrying a
     /// secret.
     /// </para>
     /// </remarks>
-    private static void EnsureGuardRunsLast<TAnnotation>(
+    private static void EnsureGuardRunsLast(
         DocumentDBServerResource resource,
-        TAnnotation guardCallback,
+        EnvironmentCallbackAnnotation guardCallback,
         string pipeline)
-        where TAnnotation : class, IResourceAnnotation
     {
-        var last = resource.Annotations.OfType<TAnnotation>().LastOrDefault();
+        var last = resource.Annotations.OfType<EnvironmentCallbackAnnotation>().LastOrDefault();
         if (ReferenceEquals(last, guardCallback))
         {
             return;
@@ -1463,16 +1591,13 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
-    /// Carries the guard's own callbacks so a later phase can move them back to the end of their
-    /// pipelines without re-creating them.
+    /// Carries the guard's own environment callback so a later phase can move it back to the end
+    /// of its pipeline without re-creating it.
     /// </summary>
     private sealed class DataStorageGuardAnnotation(
-        EnvironmentCallbackAnnotation environment,
-        CommandLineArgsCallbackAnnotation arguments) : IResourceAnnotation
+        EnvironmentCallbackAnnotation environment) : IResourceAnnotation
     {
         public EnvironmentCallbackAnnotation Environment { get; } = environment;
-
-        public CommandLineArgsCallbackAnnotation Arguments { get; } = arguments;
 
         /// <summary>
         /// The AppHost's services, captured from whichever event installed or re-established the
@@ -1875,7 +2000,7 @@ public static class DocumentDBBuilderExtensions
     /// else it could resolve to <c>--data-path</c>, and the resource is failed instead.
     /// </para>
     /// </remarks>
-    private static void RejectReservedDataPathArguments(IResource resource, CommandLineArgsCallbackContext context)
+    private static void RejectReservedDataPathArguments(IResource resource, IEnumerable<object> arguments)
     {
         // Mirrors the entrypoint's own cursor: an option that takes a value consumes exactly the
         // next token, whatever that token looks like. Tracking that for literal tokens too is what
@@ -1884,7 +2009,7 @@ public static class DocumentDBBuilderExtensions
         // have believed 'X' was sheltered.
         var expectOperand = false;
 
-        foreach (var argument in context.Args)
+        foreach (var argument in arguments)
         {
             if (expectOperand)
             {
@@ -2499,10 +2624,11 @@ public static class DocumentDBBuilderExtensions
     /// the image tag is routinely selected after this method runs (for example
     /// <c>WithOpenTelemetryMetrics().WithDocumentDBVersion(...)</c>). The entrypoint is applied
     /// from <see cref="BeforeStartEvent"/>, which the manifest publisher raises before it
-    /// serializes the resource, and the arguments from a command-line-arguments callback. That
-    /// callback re-checks that the wrapper still owns the entrypoint, because it runs after every
-    /// event subscriber and is therefore the last chance to catch one that replaced the entrypoint
-    /// later in the same startup.
+    /// serializes the resource — and which is the last phase that can still change the entrypoint
+    /// a manifest carries, because the publisher writes <c>entrypoint</c> before it evaluates
+    /// <c>args</c>. The arguments come from the terminal command-line guard
+    /// (<see cref="EnsureTerminalGuard"/>), which is the last command-line callback the
+    /// resource has and fails the resource if it is not.
     /// </para>
     /// </remarks>
     private static void EnsureOpenTelemetryGatewayConfiguration(
@@ -2573,7 +2699,9 @@ public static class DocumentDBBuilderExtensions
             return Task.CompletedTask;
         });
 
-        builder.WithArgs(context =>
+        var guard = EnsureTerminalGuard(builder);
+
+        guard.AddCommandLineStep(TerminalCommandLineOpenTelemetryWrapperRank, state =>
         {
             if (ResolveOpenTelemetryGatewayConfigurationRequirement(builder.Resource) !=
                 GatewayConfigurationRequirement.Required)
@@ -2581,11 +2709,11 @@ public static class DocumentDBBuilderExtensions
                 return;
             }
 
-            // The arguments are only meaningful to the entrypoint this wrapper installs. Resolving
-            // them happens after every BeforeStartEvent subscriber has run, so this is the last
-            // point at which a subscriber or lifecycle hook that replaced the entrypoint later in
-            // the same startup can still be caught - after which these arguments would be spliced
-            // into someone else's command line.
+            // The arguments are only meaningful to the entrypoint this wrapper installs. This step
+            // runs from the resource's last command-line callback, after every event subscriber
+            // and lifecycle hook, so it is the last point at which one that replaced the
+            // entrypoint later in the same startup can still be caught - after which these
+            // arguments would be spliced into someone else's command line.
             if (!configuration.EntrypointOwned ||
                 !string.Equals(builder.Resource.Entrypoint, GatewayConfigurationShell, StringComparison.Ordinal))
             {
@@ -2603,10 +2731,429 @@ public static class DocumentDBBuilderExtensions
                     $"entrypoint.");
             }
 
-            context.Args.Insert(0, GatewayConfigurationShellArgumentZero);
-            context.Args.Insert(0, BuildOpenTelemetryGatewayConfigurationScript(configuration));
-            context.Args.Insert(0, "-c");
+            var script = BuildOpenTelemetryGatewayConfigurationScript(configuration);
+
+            state.Args.Insert(0, GatewayConfigurationShellArgumentZero);
+            state.Args.Insert(0, script);
+            state.Args.Insert(0, GatewayConfigurationShellCommandOption);
+            state.WrapperScript = script;
         });
+
+        guard.AddCommandLineValidation(state => ValidateOpenTelemetryGatewayCommand(builder.Resource, state));
+    }
+
+    /// <summary>
+    /// Returns the resource's terminal guard, installing it the first time it is asked for.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This package owns exactly one <see cref="CommandLineArgsCallbackAnnotation"/> and one
+    /// <see cref="ContainerRuntimeArgsCallbackAnnotation"/> per resource. Everything it needs to do
+    /// to the container command line is a step of that one command-line callback, ordered by rank,
+    /// followed by the validations that judge the finished list. One callback per pipeline is what
+    /// makes the contract expressible at all: Aspire evaluates callbacks in annotation order over
+    /// one shared value, so "last" is a single position, and two package callbacks that each
+    /// demanded it would be an impossible requirement rather than a check.
+    /// </para>
+    /// <para>
+    /// Being last is established at every phase and then verified. The callbacks are appended when
+    /// the API that needs them is called, and moved back to the end of their pipelines at
+    /// <see cref="BeforeStartEvent"/> — which covers every builder-time <c>WithArgs</c> and
+    /// <c>WithEnvironment</c>, whatever the call order, in run and publish mode alike — then again
+    /// at <see cref="ResourceEndpointsAllocatedEvent"/> and
+    /// <see cref="BeforeResourceStartedEvent"/>, the last per-resource phases a run publishes.
+    /// Anything appended after that is caught by the checks themselves.
+    /// </para>
+    /// <para>
+    /// Position alone is not enough, because Aspire caches each callback's result for the run. A
+    /// caller who builds the resource's configuration through the public
+    /// <see cref="ExecutionConfigurationBuilder"/> — from an
+    /// <see cref="Lifecycle.IDistributedApplicationLifecycleHook"/>, say — and only then changes
+    /// the model gets a validated answer recorded before the change and reused after it. That is
+    /// what the seal is for: the command-line callback records what the resource looked like when
+    /// it produced its result, and the two checkpoints Aspire never caches compare it.
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>Run: the container-runtime-arguments callback. Aspire re-invokes those on
+    /// every container creation without caching, and it does so after the last opportunity a
+    /// caller has to change anything — a caller's own runtime-arguments callback — and before the
+    /// container's command, arguments and environment are read.</description></item>
+    /// <item><description>Publish: <see cref="Publishing.BeforePublishEvent"/>, which is raised
+    /// after every lifecycle hook has run and before the publishing pipeline serializes anything.
+    /// Publish raises no per-resource event, so this is the only phase there that is both after all
+    /// caller code and before the manifest.</description></item>
+    /// </list>
+    /// <para>
+    /// The annotation instances are moved, never re-created, so Aspire's per-callback result cache
+    /// is untouched: the steps are evaluated exactly once per run and re-evaluated on restart,
+    /// which is what keeps a deferred or secret-bearing value from being resolved twice.
+    /// </para>
+    /// </remarks>
+    private static TerminalGuardAnnotation EnsureTerminalGuard(
+        IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        var resource = builder.Resource;
+
+        if (resource.Annotations.OfType<TerminalGuardAnnotation>().LastOrDefault() is { } installed)
+        {
+            return installed;
+        }
+
+        var guard = new TerminalGuardAnnotation();
+
+        guard.CommandLineCallback = new CommandLineArgsCallbackAnnotation(context =>
+        {
+            EnsureTerminalCallbackRunsLast(resource, guard.CommandLineCallback, "command-line");
+            guard.RunCommandLine(context);
+            guard.Seal = CaptureTerminalConfigurationSeal(resource);
+            return Task.CompletedTask;
+        });
+
+        guard.RuntimeCheckpoint = new ContainerRuntimeArgsCallbackAnnotation(_ =>
+        {
+            EnsureTerminalCallbackRunsLast(resource, guard.RuntimeCheckpoint, "container-runtime-arguments");
+            VerifyTerminalConfigurationSeal(resource, guard);
+            return Task.CompletedTask;
+        });
+
+        resource.Annotations.Add(guard);
+        resource.Annotations.Add(guard.CommandLineCallback);
+        resource.Annotations.Add(guard.RuntimeCheckpoint);
+
+        void RetakeLastPosition() => RetakeTerminalGuardPositions(resource, guard);
+
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            RetakeLastPosition();
+            return Task.CompletedTask;
+        });
+
+        builder.ApplicationBuilder.Eventing.Subscribe<ResourceEndpointsAllocatedEvent>(resource, (_, _) =>
+        {
+            RetakeLastPosition();
+            return Task.CompletedTask;
+        });
+
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(resource, (_, _) =>
+        {
+            RetakeLastPosition();
+            return Task.CompletedTask;
+        });
+
+        builder.ApplicationBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, _) =>
+        {
+            // Publish has no per-resource phase, so this is both the last point after every
+            // lifecycle hook and the last point before the manifest is written.
+            RetakeLastPosition();
+            VerifyTerminalConfigurationSeal(resource, guard);
+            return Task.CompletedTask;
+        });
+
+        return guard;
+    }
+
+    /// <summary>
+    /// Moves an annotation the resource already carries to the end of the collection, so it is the
+    /// last of its kind when Aspire gathers it. The instance is preserved, so its cached result —
+    /// and with it the guarantee of a single evaluation — is preserved too.
+    /// </summary>
+    private static void MoveToEnd(DocumentDBServerResource resource, IResourceAnnotation annotation)
+    {
+        if (!resource.Annotations.Remove(annotation))
+        {
+            return;
+        }
+
+        resource.Annotations.Add(annotation);
+    }
+
+    /// <summary>
+    /// Puts both of the package's callbacks back at the end of their pipelines.
+    /// </summary>
+    /// <remarks>
+    /// Called at every lifecycle phase, and again by any API that adds a callback of its own after
+    /// the guard was installed, so the guard is last from the moment the model is written rather
+    /// than only from the moment the application starts.
+    /// </remarks>
+    private static void RetakeTerminalGuardPositions(
+        DocumentDBServerResource resource,
+        TerminalGuardAnnotation guard)
+    {
+        MoveToEnd(resource, guard.CommandLineCallback);
+        MoveToEnd(resource, guard.RuntimeCheckpoint);
+    }
+
+    /// <summary>
+    /// Records what the container's command depends on, at the moment the command-line callback
+    /// produced the result Aspire will reuse for the rest of the run.
+    /// </summary>
+    private static TerminalConfigurationSeal CaptureTerminalConfigurationSeal(DocumentDBServerResource resource) =>
+        new(
+            [.. resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
+            resource.Entrypoint,
+            ResolveEffectiveImage(resource));
+
+    /// <summary>
+    /// Fails the resource when anything the container's command depends on changed after the
+    /// command-line callback produced the answer Aspire cached.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Called from the two uncached checkpoints the integration owns: the
+    /// container-runtime-arguments callback in a run and
+    /// <see cref="Publishing.BeforePublishEvent"/> in a publish. Together they cover every
+    /// supported way to change the model after the command line has been decided: appending or
+    /// inserting a callback in either pipeline, re-pointing the entrypoint, and swapping the image,
+    /// tag, digest or Dockerfile.
+    /// </para>
+    /// <para>
+    /// Nothing is repaired. Re-running the wrapper is not an option — Aspire would keep the cached
+    /// result anyway — and starting a container on an answer that has since been contradicted is
+    /// the failure this exists to prevent.
+    /// </para>
+    /// <para>
+    /// No value is reported, only what kind of thing changed: the callback that changed the model
+    /// may well be the one carrying a secret.
+    /// </para>
+    /// </remarks>
+    private static void VerifyTerminalConfigurationSeal(
+        DocumentDBServerResource resource,
+        TerminalGuardAnnotation guard)
+    {
+        EnsureTerminalCallbackRunsLast(resource, guard.CommandLineCallback, "command-line");
+        EnsureTerminalCallbackRunsLast(resource, guard.RuntimeCheckpoint, "container-runtime-arguments");
+
+        if (guard.Seal is not { } seal)
+        {
+            return;
+        }
+
+        var current = CaptureTerminalConfigurationSeal(resource);
+
+        if (!SameCallbacks(current.CommandLineCallbacks, seal.CommandLineCallbacks))
+        {
+            throw StaleConfiguration(resource, "a command-line callback was added or removed");
+        }
+
+        if (!SameCallbacks(current.EnvironmentCallbacks, seal.EnvironmentCallbacks))
+        {
+            throw StaleConfiguration(resource, "an environment callback was added or removed");
+        }
+
+        if (!SameCallbacks(current.RuntimeCallbacks, seal.RuntimeCallbacks))
+        {
+            throw StaleConfiguration(resource, "a container-runtime-argument callback was added or removed");
+        }
+
+        if (!string.Equals(current.Entrypoint, seal.Entrypoint, StringComparison.Ordinal))
+        {
+            throw StaleConfiguration(resource, "its container entrypoint changed");
+        }
+
+        if (!current.Image.Equals(seal.Image))
+        {
+            throw StaleConfiguration(resource, "the image it will run changed");
+        }
+    }
+
+    /// <summary>
+    /// Compares two recordings of one pipeline by membership rather than by order.
+    /// </summary>
+    /// <remarks>
+    /// What the seal has to detect is a callback appearing or disappearing, because the app host
+    /// evaluates each one at most once and then reuses the recorded result: a callback added after
+    /// the recording runs unrecorded, and for arguments its result replaces the whole list. Order
+    /// is deliberately not compared. This package moves its own callbacks to the end of their
+    /// pipelines at every phase, so an order comparison would report the guard's own repositioning
+    /// as a change; ordering is guaranteed instead by
+    /// <see cref="EnsureTerminalCallbackRunsLast{TAnnotation}"/>, which puts this package last, and
+    /// with it last the recorded result that Aspire keeps.
+    /// </remarks>
+    private static bool SameCallbacks<TAnnotation>(
+        System.Collections.Immutable.ImmutableArray<TAnnotation> current,
+        System.Collections.Immutable.ImmutableArray<TAnnotation> sealed_)
+        where TAnnotation : class, IResourceAnnotation
+    {
+        if (current.Length != sealed_.Length)
+        {
+            return false;
+        }
+
+        // Identity, not equality: two annotations can be indistinguishable by value and still be
+        // two separate recordings.
+        var recorded = new HashSet<object>(sealed_, ReferenceEqualityComparer.Instance);
+
+        return current.All(annotation => recorded.Contains(annotation));
+    }
+
+    private static InvalidOperationException StaleConfiguration(
+        DocumentDBServerResource resource,
+        string change) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' was changed after its container command line " +
+            $"had already been built: {change}. Aspire records each callback's result the first " +
+            $"time it runs and reuses it for the rest of the run, so a configuration built before " +
+            $"the change is the one the container would receive, and the checks that ran with it " +
+            $"cannot be repeated. This usually comes from building the resource's configuration " +
+            $"early — ExecutionConfigurationBuilder or GetArgumentValuesAsync from an " +
+            $"IDistributedApplicationLifecycleHook or an event subscriber — and then changing the " +
+            $"resource. The resource is failed instead of being started or published on a command " +
+            $"line that was decided and then contradicted. Recovery: finish configuring the " +
+            $"resource before anything reads its configuration, or make the change part of the " +
+            $"application model (WithArgs(...), WithEnvironment(...), WithImageTag(...)) while it " +
+            $"is being built.");
+
+    /// <summary>
+    /// Fails the resource when something appended a callback after the one this package owns.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every rule this package applies is about the configuration the container receives, and a
+    /// callback that runs afterwards can prepend to it, clear it, or reorder it. The wrapper is
+    /// the sharpest case: <c>/bin/bash</c> reads its command from the first arguments, so a single
+    /// value inserted in front turns the whole wrapper into an operand and the container starts
+    /// nothing.
+    /// </para>
+    /// <para>
+    /// That is reported rather than tolerated, and no value appears in the message: the point is
+    /// the shape of the pipeline, and the callback that ran last may well be carrying a secret.
+    /// </para>
+    /// </remarks>
+    private static void EnsureTerminalCallbackRunsLast<TAnnotation>(
+        DocumentDBServerResource resource,
+        TAnnotation guardCallback,
+        string pipeline)
+        where TAnnotation : class, IResourceAnnotation
+    {
+        var last = resource.Annotations.OfType<TAnnotation>().LastOrDefault();
+        if (ReferenceEquals(last, guardCallback))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' has a later {pipeline} callback registered " +
+            $"after the one this package owns, so the configuration it built is not the one the " +
+            $"container would receive. That callback is appended when the application starts and " +
+            $"moved back to the end of the pipeline at the latest per-resource phase the run " +
+            $"offers; a callback added after that usually comes from a subscriber registered " +
+            $"after AddDocumentDB, or from an IDistributedApplicationLifecycleHook. The resource " +
+            $"is failed instead of being started on a configuration that was checked and then " +
+            $"changed. Recovery: make that configuration part of the application model " +
+            $"(WithArgs(...), WithEnvironment(...)) while it is being built, or register the " +
+            $"subscriber before AddDocumentDB.");
+    }
+
+    /// <summary>
+    /// Verifies that the finished command line is exactly the one the gateway configuration
+    /// wrapper needs, whenever the wrapper is required at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The wrapper is a <c>/bin/bash -c &lt;script&gt; -- &lt;image arguments&gt;</c> command line,
+    /// and every part of that shape is load-bearing: bash reads the script from the value after
+    /// <c>-c</c> and assigns the values after <c>--</c> to <c>$@</c>, which is what the script
+    /// forwards to the image's own entrypoint. Anything in front of <c>-c</c> is a bash option or
+    /// operand instead, a different script is a different container, and a second copy of the
+    /// prefix would be handed to the image as an argument.
+    /// </para>
+    /// <para>
+    /// The image is classified again here rather than trusted from the step that applied the
+    /// wrapper, so an image, tag, digest or Dockerfile selected in between is judged on what the
+    /// container will actually run.
+    /// </para>
+    /// <para>
+    /// Nothing but the fixed tokens this package wrote is compared or reported. Caller arguments
+    /// are counted, never read: one of them may be a parameter or an expression whose value is a
+    /// secret, and resolving it here would both duplicate Aspire's own evaluation and risk putting
+    /// it in an exception message.
+    /// </para>
+    /// </remarks>
+    private static void ValidateOpenTelemetryGatewayCommand(
+        DocumentDBServerResource resource,
+        TerminalCommandLineState state)
+    {
+        var required = ResolveOpenTelemetryGatewayConfigurationRequirement(resource) ==
+            GatewayConfigurationRequirement.Required;
+
+        if (!required)
+        {
+            if (state.WrapperScript is null)
+            {
+                return;
+            }
+
+            throw new InvalidOperationException(
+                $"DocumentDB resource '{resource.Name}' stopped needing the " +
+                $"WithOpenTelemetryMetrics() compatibility wrapper while its container command " +
+                $"line was being built, after that wrapper had already been written into it. " +
+                $"Select the image before configuring metrics.");
+        }
+
+        if (state.WrapperScript is not { } script)
+        {
+            throw new InvalidOperationException(
+                $"DocumentDB resource '{resource.Name}' needs the WithOpenTelemetryMetrics() " +
+                $"compatibility wrapper on its container command line, but the finished command " +
+                $"line does not carry it. On DocumentDB " +
+                $"v{FirstGatewayTelemetryConfigurationVersion} and later the OTEL_* environment " +
+                $"variables would be silently ignored. Recovery: select the image before " +
+                $"configuring metrics.");
+        }
+
+        if (!string.Equals(resource.Entrypoint, GatewayConfigurationShell, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"DocumentDB resource '{resource.Name}' finished building its container command " +
+                $"line with the entrypoint set to '{resource.Entrypoint ?? "<image default>"}' " +
+                $"instead of the '{GatewayConfigurationShell}' wrapper " +
+                $"WithOpenTelemetryMetrics() installs. Those arguments mean nothing to any other " +
+                $"entrypoint. Recovery: stop overriding the entrypoint of this resource - " +
+                $"including from a BeforeStartEvent subscriber or lifecycle hook - or drop " +
+                $"WithOpenTelemetryMetrics() and configure telemetry from your own entrypoint.");
+        }
+
+        var args = state.Args;
+
+        var intact = args.Count >= 3
+            && args[0] is string option
+            && string.Equals(option, GatewayConfigurationShellCommandOption, StringComparison.Ordinal)
+            && ReferenceEquals(args[1], script)
+            && args[2] is string delimiter
+            && string.Equals(delimiter, GatewayConfigurationShellArgumentZero, StringComparison.Ordinal);
+
+        if (!intact)
+        {
+            throw new InvalidOperationException(
+                $"DocumentDB resource '{resource.Name}' finished building a container command " +
+                $"line that does not start with the " +
+                $"'{GatewayConfigurationShellCommandOption} <script> " +
+                $"{GatewayConfigurationShellArgumentZero}' prefix " +
+                $"WithOpenTelemetryMetrics() installs; {args.Count} argument(s) were built. " +
+                $"'{GatewayConfigurationShell}' reads its command from those first arguments, so " +
+                $"anything placed in front of them, a cleared or reordered list, or a replaced " +
+                $"script or '{GatewayConfigurationShellArgumentZero}' delimiter leaves a " +
+                $"container that does not start DocumentDB. Recovery: add container arguments " +
+                $"with WithArgs(...), which appends them after the wrapper, rather than by " +
+                $"rewriting the argument list in place.");
+        }
+
+        for (var index = 3; index < args.Count; index++)
+        {
+            if (args[index] is string duplicate &&
+                string.Equals(duplicate, script, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{resource.Name}' finished building a container " +
+                    $"command line carrying the WithOpenTelemetryMetrics() wrapper script more " +
+                    $"than once. Only the first copy is the command " +
+                    $"'{GatewayConfigurationShell}' runs; the rest are passed to DocumentDB as " +
+                    $"arguments. Recovery: configure metrics on this resource through " +
+                    $"WithOpenTelemetryMetrics() alone, and do not copy its arguments.");
+            }
+        }
     }
 
     /// <summary>
