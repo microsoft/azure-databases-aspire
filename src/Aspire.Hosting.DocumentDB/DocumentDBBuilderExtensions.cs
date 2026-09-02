@@ -4,6 +4,7 @@
 using System.Globalization;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.DocumentDB;
+using Aspire.Hosting.Lifecycle;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
@@ -181,6 +182,22 @@ public static class DocumentDBBuilderExtensions
 
     /// <summary>
     /// Resolves what this package knows about the container image <paramref name="resource"/> will
+    /// run: the sealed image when a run has sealed one, and the live model otherwise.
+    /// </summary>
+    /// <remarks>
+    /// Every version-dependent decision goes through this method, so making the seal the authority
+    /// here is what makes all of them judge the image DCP will really launch rather than whatever
+    /// the model happens to say at the moment they run. Outside a run no seal is ever taken and
+    /// this is exactly <see cref="ResolveModelImage"/> — a publish reads the model at serialization
+    /// time, which is the only image a publish has.
+    /// </remarks>
+    private static DocumentDBEffectiveImage ResolveEffectiveImage(IResource resource) =>
+        resource.Annotations.OfType<DocumentDBImageSealAnnotation>().LastOrDefault() is { } seal
+            ? seal.Image
+            : ResolveModelImage(resource);
+
+    /// <summary>
+    /// Resolves what this package knows about the container image <paramref name="resource"/> will
     /// run, from the image annotation that is effective now.
     /// </summary>
     /// <remarks>
@@ -192,7 +209,7 @@ public static class DocumentDBBuilderExtensions
     /// including the <see langword="null"/> tag a digest pin leaves behind — carries no version,
     /// so no floor is enforced on it.
     /// </remarks>
-    private static DocumentDBEffectiveImage ResolveEffectiveImage(IResource resource)
+    private static DocumentDBEffectiveImage ResolveModelImage(IResource resource)
     {
         var image = resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
 
@@ -300,6 +317,158 @@ public static class DocumentDBBuilderExtensions
             .Any(endpoint => endpoint.Name == DocumentDBServerResource.PostgresEndpointName);
 
     /// <summary>
+    /// The image and build origin a DocumentDB resource was sealed with, captured once per run at
+    /// the last phase that is guaranteed to precede DCP's container preparation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="Reference"/> is composed by <c>ResourceExtensions.TryGetContainerImageName</c>,
+    /// which is the very method <c>ContainerCreator.PrepareObjects()</c> calls to fill the DCP
+    /// container spec. Recording that string rather than the annotation's parts means the seal is
+    /// literally what DCP snapshots, including the <c>registry/</c> prefix, the <c>@sha256:</c>
+    /// form a digest pin takes, and the built-image name a Dockerfile origin substitutes.
+    /// </para>
+    /// <para>
+    /// <see cref="BuildOrigin"/> holds the resource's <see cref="DockerfileBuildAnnotation"/>s by
+    /// identity and in order, because that annotation is what decides whether
+    /// <c>TryGetContainerImageName</c> returns the built image instead of the curated one, and
+    /// whether the resource publishes <c>build</c> instead of <c>image</c>. Adding, removing or
+    /// replacing one after the seal changes which image runs even when the composed reference
+    /// happens to be spelled the same, so identity is compared rather than value.
+    /// </para>
+    /// </remarks>
+    private sealed class DocumentDBImageSealAnnotation : IResourceAnnotation
+    {
+        public required string? Reference { get; init; }
+
+        public required DocumentDBEffectiveImage Image { get; init; }
+
+        public required DockerfileBuildAnnotation[] BuildOrigin { get; init; }
+    }
+
+    /// <summary>
+    /// Seals the image of every DocumentDB resource in the model, once per application, at the
+    /// latest phase that still precedes DCP.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>BeforeStartAsync</c> rather than a <see cref="BeforeStartEvent"/> subscription because
+    /// the two are not interchangeable in ordering. Aspire's <c>ExecuteBeforeStartHooksAsync</c>
+    /// publishes <see cref="BeforeStartEvent"/> to every subscriber first and only then runs the
+    /// lifecycle hooks, so a hook is strictly later than <em>every</em>
+    /// <see cref="BeforeStartEvent"/> subscriber — including ones an app host registers after
+    /// <c>AddDocumentDB</c>, which is precisely the position this package cannot outrun by
+    /// subscribing. It is still earlier than <c>DcpExecutor.RunApplicationAsync</c>, whose
+    /// <c>ContainerCreator.PrepareObjects()</c> is where the image is snapshotted into the DCP
+    /// container spec. That makes the hook the one point that is after all normal model building
+    /// and before anything reads the image.
+    /// </para>
+    /// <para>
+    /// Only a run is sealed. In a publish DCP never runs, no container spec exists, and the
+    /// manifest is written from the model at serialization time — so the manifest checkpoint has
+    /// to keep judging the live model, and sealing would make it judge an image that is not the
+    /// one being published.
+    /// </para>
+    /// </remarks>
+#pragma warning disable CS0618 // The lifecycle-hook phase has no eventing equivalent that runs after every BeforeStartEvent subscriber.
+    private sealed class DocumentDBImageSealLifecycleHook(DistributedApplicationExecutionContext executionContext)
+        : Lifecycle.IDistributedApplicationLifecycleHook
+    {
+        public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            if (!executionContext.IsRunMode)
+            {
+                return Task.CompletedTask;
+            }
+
+            foreach (var resource in appModel.Resources.OfType<DocumentDBServerResource>())
+            {
+                if (resource.Annotations.OfType<DocumentDBImageSealAnnotation>().Any())
+                {
+                    continue;
+                }
+
+                resource.TryGetContainerImageName(out var reference);
+
+                resource.Annotations.Add(new DocumentDBImageSealAnnotation
+                {
+                    Reference = reference,
+                    Image = ResolveModelImage(resource),
+                    BuildOrigin = [.. resource.Annotations.OfType<DockerfileBuildAnnotation>()],
+                });
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+#pragma warning restore CS0618
+
+    /// <summary>
+    /// Rejects an image or build origin that no longer matches what was sealed.
+    /// </summary>
+    /// <remarks>
+    /// This fails closed rather than re-judging the new image, because by the time it can run the
+    /// new image is unreachable: DCP has already created the container spec from the sealed
+    /// reference, so accepting the change would let the model report a release the container
+    /// runtime never launched — in either direction. Silence is the dangerous outcome here, so a
+    /// change nothing can act on is reported instead of tolerated.
+    /// </remarks>
+    private static InvalidOperationException? DescribeImageChangedAfterSeal(IResource resource)
+    {
+        if (resource.Annotations.OfType<DocumentDBImageSealAnnotation>().LastOrDefault() is not { } seal)
+        {
+            return null;
+        }
+
+        resource.TryGetContainerImageName(out var current);
+        var buildOrigin = resource.Annotations.OfType<DockerfileBuildAnnotation>().ToArray();
+
+        if (string.Equals(seal.Reference, current, StringComparison.Ordinal) &&
+            HasSameBuildOrigin(seal.BuildOrigin, buildOrigin))
+        {
+            return null;
+        }
+
+        return new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' changed the container image it will run after " +
+            $"this package sealed it. Aspire snapshots the image into the DCP container spec while " +
+            $"it prepares the application's containers, which is before endpoints are allocated and " +
+            $"before the resource-start event is published, so a change made after that point is " +
+            $"judged by the application model but never reaches the container runtime: the model " +
+            $"would report one release while the container runs another. " +
+            $"Sealed reference: '{Describe(seal.Reference)}'. " +
+            $"Current reference: '{Describe(current)}'. " +
+            $"Recovery: choose the image while the application model is being built — " +
+            $"'.WithImageTag(...)', '.WithImageRegistry(...)', '.WithDockerfile(...)' — rather than " +
+            $"from a ResourceEndpointsAllocatedEvent or BeforeResourceStartedEvent subscriber, or " +
+            $"from a lifecycle hook that runs after this package's.");
+
+        static string Describe(string? reference) => reference ?? "<none>";
+    }
+
+    /// <summary>
+    /// Whether the resource still carries the same <see cref="DockerfileBuildAnnotation"/>
+    /// instances, in the same order, as when it was sealed.
+    /// </summary>
+    private static bool HasSameBuildOrigin(DockerfileBuildAnnotation[] sealedOrigin, DockerfileBuildAnnotation[] current)
+    {
+        if (sealedOrigin.Length != current.Length)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < sealedOrigin.Length; i++)
+        {
+            if (!ReferenceEquals(sealedOrigin[i], current[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// The two callbacks that re-apply the hard image floors where nothing is cached: immediately
     /// before a container is created, and while a publish serializes the resource.
     /// </summary>
@@ -336,6 +505,14 @@ public static class DocumentDBBuilderExtensions
     /// publish.
     /// </para>
     /// <para>
+    /// A run additionally seals the image before DCP can snapshot it — see
+    /// <see cref="DocumentDBImageSealLifecycleHook"/> — because re-checking is only worth anything
+    /// while the answer can still change what runs. The hook is registered with
+    /// <c>TryAddLifecycleHook</c>, which deduplicates on service and implementation type, so an
+    /// app host calling <c>AddDocumentDB</c> several times still seals exactly once per
+    /// application rather than once per resource.
+    /// </para>
+    /// <para>
     /// The manifest checkpoint has to hold the last position to run at all — the publisher reads
     /// the last <see cref="ManifestPublishingCallbackAnnotation"/> and no other — and hands the
     /// writing on to whatever it displaced, so the manifest is byte-for-byte the one Aspire would
@@ -346,11 +523,16 @@ public static class DocumentDBBuilderExtensions
     private static IResourceBuilder<DocumentDBServerResource> InstallImageCompatibilityCheckpoints(
         this IResourceBuilder<DocumentDBServerResource> builder)
     {
+#pragma warning disable CS0618 // The lifecycle-hook phase has no eventing equivalent that runs after every BeforeStartEvent subscriber.
+        builder.ApplicationBuilder.Services.TryAddLifecycleHook<DocumentDBImageSealLifecycleHook>();
+#pragma warning restore CS0618
+
         var resource = builder.Resource;
         var checkpoints = new ImageCompatibilityCheckpointAnnotation
         {
             RuntimeCheckpoint = new ContainerRuntimeArgsCallbackAnnotation(_ =>
             {
+                VerifyImageSeal(resource);
                 VerifyImageCompatibility(resource);
                 return Task.CompletedTask;
             }),
@@ -400,6 +582,23 @@ public static class DocumentDBBuilderExtensions
         if (DescribeIncompatibleImage(resource) is { } incompatible)
         {
             throw incompatible;
+        }
+    }
+
+    /// <summary>
+    /// Fails the run when the model's image or build origin no longer matches the seal.
+    /// </summary>
+    /// <remarks>
+    /// Called from the uncached container-runtime-arguments checkpoint, which Aspire runs on every
+    /// container creation, and from the <see cref="BeforeResourceStartedEvent"/> handlers so the
+    /// same failure is also surfaced on the resource's own start path. Outside a run there is no
+    /// seal and this does nothing.
+    /// </remarks>
+    private static void VerifyImageSeal(IResource resource)
+    {
+        if (DescribeImageChangedAfterSeal(resource) is { } changed)
+        {
+            throw changed;
         }
     }
 
@@ -462,6 +661,8 @@ public static class DocumentDBBuilderExtensions
             builder.Resource,
             (evt, ct) =>
             {
+                VerifyImageSeal(evt.Resource);
+
                 if (DescribeUnpublishedPostgresVariant(evt.Resource, ResolveEffectiveImage(evt.Resource)) is { } incompatible)
                 {
                     throw incompatible;
@@ -659,6 +860,8 @@ public static class DocumentDBBuilderExtensions
             builder.Resource,
             (evt, ct) =>
             {
+                VerifyImageSeal(evt.Resource);
+
                 var image = ResolveEffectiveImage(evt.Resource);
                 if (!image.Exists)
                 {

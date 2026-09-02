@@ -44,6 +44,39 @@ Common causes:
 - Corrupted data volume (remove the volume and restart)
 - A username beginning with a reserved DocumentDB `0.116.0` prefix (`documentdb`, `citus`, `pg`, or `internal_role`)
 
+### The container image changed after it was sealed
+
+**Symptom:** Startup fails with:
+
+```
+DocumentDB resource 'documentdb' changed the container image it will run after this
+package sealed it. Aspire snapshots the image into the DCP container spec while it
+prepares the application's containers, ...
+Sealed reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.111.0'.
+Current reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0'.
+```
+
+**Cause:** Aspire composes the image reference once, while it prepares the
+application's containers, and writes it into the DCP container spec. That happens
+before endpoints are allocated and before `BeforeResourceStartedEvent` is published,
+so an image chosen after that point is only visible to the application model — the
+container runtime still launches the earlier one. Rather than let the model and the
+running container disagree in either direction, the integration refuses the run.
+
+**Solution:** Choose the image while the application model is being built:
+
+```csharp
+var db = builder.AddDocumentDB("documentdb")
+                .WithDocumentDBVersion(DocumentDBVersion.V0_116_0);
+```
+
+`WithImageTag(...)`, `WithImageRegistry(...)`, `WithImage(...)`, `WithImageSHA256(...)`
+and `WithDockerfile(...)` are all still honoured anywhere during model building,
+including from a `BeforeStartEvent` subscriber. Only a change made from a
+`ResourceEndpointsAllocatedEvent` / `BeforeResourceStartedEvent` subscriber, or from a
+lifecycle hook that runs after this package's, is refused. Publish mode is unaffected:
+no container is prepared, so the manifest is written from the model as usual.
+
 ## Connection issues
 
 ### TLS certificate errors

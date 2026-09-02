@@ -443,14 +443,23 @@ builder.AddProject<Projects.Worker>("worker")
 > `.WithImageTag(...)` shown above.
 >
 > **Scope of the guard:**
-> - **Judged on the image that will actually run.** The floor is reported by a
->   `BeforeResourceStartedEvent` subscriber, and applied again where Aspire
->   caches nothing — immediately before each container is created, and while
->   `azd publish` / `--publisher manifest` serializes the resource — so a
->   subscriber or lifecycle hook that swaps the image after the event cannot
->   slip a pre-`0.112.0` image past it. Publishing a manifest for such a
->   resource is refused with the same message; `ExcludeFromManifest()` remains
->   the way to keep a resource out of the manifest entirely.
+> - **Judged on the image that will actually run.** In run mode the integration
+>   seals the resource's image reference and build origin at the last point that
+>   precedes Aspire's container preparation, and every floor is judged on that
+>   sealed value. Aspire writes the image into the DCP container spec before
+>   endpoints are allocated and before `BeforeResourceStartedEvent` is
+>   published, so a `ResourceEndpointsAllocatedEvent` /
+>   `BeforeResourceStartedEvent` subscriber that swaps the image can no longer
+>   slip a pre-`0.112.0` image past the floor, nor make the model report a
+>   release the container runtime was never given — such a change is refused
+>   outright. Choosing the image while the application model is being built
+>   (including from a `BeforeStartEvent` subscriber) keeps working exactly as
+>   before. The floor is also applied where Aspire caches nothing —
+>   immediately before each container is created, and while `azd publish` /
+>   `--publisher manifest` serializes the resource. Publishing a manifest for a
+>   resource below the floor is refused with the same message;
+>   `ExcludeFromManifest()` remains the way to keep a resource out of the
+>   manifest entirely.
 > - **Curated image only.** A custom image (any
 >   `ContainerImageAnnotation.Image` other than
 >   `documentdb/documentdb-local`, e.g. a fork via `.WithImage("myorg/build", "pg17-0.110.0")`)
