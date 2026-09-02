@@ -33,6 +33,18 @@ internal enum DocumentDBRuntimeArgumentVerdict
 }
 
 /// <summary>
+/// How an environment-variable owner should compare the parser's input with its own names.
+/// </summary>
+internal enum DocumentDBEnvironmentVariableMatch
+{
+    /// <summary>The input is one complete variable name.</summary>
+    Exact,
+
+    /// <summary>The input is the prefix before Podman's trailing import wildcard.</summary>
+    Prefix,
+}
+
+/// <summary>
 /// The single reading of a resource's final container-runtime arguments.
 /// </summary>
 /// <param name="Verdict">What the arguments do.</param>
@@ -186,10 +198,11 @@ internal static class DocumentDBContainerRuntimeArguments
     /// matter is decided by that name.
     /// </summary>
     /// <remarks>
-    /// <c>--env</c>/<c>-e</c> set one variable; Podman's <c>--env-merge</c> rewrites one the image
-    /// already carries, and <c>--unsetenv</c> removes one. All three name their variable to the
-    /// left of the first <c>=</c>, so one that names a variable this package does not own is
-    /// ordinary configuration and is passed through.
+    /// <c>--env</c>/<c>-e</c> set one variable, or in Podman import every host variable matching a
+    /// value-less name's trailing-asterisk prefix; Podman's <c>--env-merge</c> rewrites one the
+    /// image already carries, and <c>--unsetenv</c> removes one. Assigned forms name their
+    /// variable to the left of the first <c>=</c>, so an assignment to a name this package does
+    /// not own is ordinary configuration and is passed through.
     /// </remarks>
     private static readonly HashSet<string> s_scopedEnvironmentOptions = new(StringComparer.Ordinal)
     {
@@ -317,14 +330,14 @@ internal static class DocumentDBContainerRuntimeArguments
     /// evaluation of it, and rendering one would pull a parameter's value into this package.
     /// </param>
     /// <param name="resolveOwnedVariable">
-    /// Given a variable name, the owner's own spelling of it when it is one whose value this
-    /// package has already decided, and <see langword="null"/> otherwise. The owner's spelling is
-    /// what a finding carries, so a name read from the arguments is used to look up and then
-    /// discarded.
+    /// Given an exact variable name or a Podman import prefix and the required match kind, the
+    /// owner's own spelling of a matching variable whose value this package has already decided,
+    /// and <see langword="null"/> otherwise. The owner's spelling is what a finding carries, so
+    /// text read from the arguments is used to look up and then discarded.
     /// </param>
     internal static DocumentDBRuntimeArgumentFinding Read(
         IEnumerable<object> arguments,
-        Func<string, string?> resolveOwnedVariable)
+        Func<string, DocumentDBEnvironmentVariableMatch, string?> resolveOwnedVariable)
     {
         ArgumentNullException.ThrowIfNull(arguments);
         ArgumentNullException.ThrowIfNull(resolveOwnedVariable);
@@ -423,7 +436,7 @@ internal static class DocumentDBContainerRuntimeArguments
     /// </summary>
     private static bool ReadShortOptionCluster(
         string token,
-        Func<string, string?> resolveOwnedVariable,
+        Func<string, DocumentDBEnvironmentVariableMatch, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding,
         out string? pendingOption)
     {
@@ -512,7 +525,7 @@ internal static class DocumentDBContainerRuntimeArguments
     private static bool JudgeOption(
         string name,
         string? inlineValue,
-        Func<string, string?> resolveOwnedVariable,
+        Func<string, DocumentDBEnvironmentVariableMatch, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding)
     {
         if (inlineValue is not null &&
@@ -567,7 +580,7 @@ internal static class DocumentDBContainerRuntimeArguments
     private static bool JudgeOperand(
         string option,
         object operand,
-        Func<string, string?> resolveOwnedVariable,
+        Func<string, DocumentDBEnvironmentVariableMatch, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding)
     {
         if (!s_scopedEnvironmentOptions.TryGetValue(option, out var scoped))
@@ -590,21 +603,33 @@ internal static class DocumentDBContainerRuntimeArguments
     /// <summary>
     /// Whether an environment assignment names a variable this package owns. A bare name with no
     /// <c>=</c> is the runtime's "import this one from the host environment" for <c>--env</c>, and
-    /// the whole of the argument for <c>--unsetenv</c>; either way it sets or clears the variable
-    /// just as surely.
+    /// in Podman a trailing <c>*</c> imports every host variable with the preceding prefix.
+    /// Assigned names containing <c>=</c> stay exact even when the name itself ends in
+    /// <c>*</c>. A bare name is the whole argument for <c>--unsetenv</c>; either way the option
+    /// sets or clears the variable just as surely.
     /// </summary>
     private static bool JudgeEnvironmentAssignment(
         string option,
         string assignment,
-        Func<string, string?> resolveOwnedVariable,
+        Func<string, DocumentDBEnvironmentVariableMatch, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding)
     {
         var separator = assignment.IndexOf('=', StringComparison.Ordinal);
         var variable = separator < 0 ? assignment : assignment[..separator];
+        var match = DocumentDBEnvironmentVariableMatch.Exact;
+
+        if (separator < 0 &&
+            (string.Equals(option, "--env", StringComparison.Ordinal) ||
+             string.Equals(option, "-e", StringComparison.Ordinal)) &&
+            assignment.EndsWith('*'))
+        {
+            variable = assignment[..^1];
+            match = DocumentDBEnvironmentVariableMatch.Prefix;
+        }
 
         // The owner's own spelling, not the one that was read: this is the only part of the
         // argument that reaches a diagnostic, and it has to be a name this package chose.
-        if (resolveOwnedVariable(variable) is { } owned)
+        if (resolveOwnedVariable(variable, match) is { } owned)
         {
             finding = new(DocumentDBRuntimeArgumentVerdict.Environment, option, owned);
             return false;

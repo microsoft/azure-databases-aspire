@@ -266,6 +266,14 @@ package owns; and `--rootfs` replaces the image with a directory, so it is refus
 sealed image. An explicit `--option=false` on a value-less option is the caller declining it, and is
 passed through.
 
+Podman also reads a value-less `--env`/`-e` name ending in `*` as an import of every host variable
+with that prefix, so `--env DATA_*` and the bare `--env *` reach `DATA_PATH` without ever spelling
+it. Those are refused whenever the prefix could pull in `DATA_PATH`, `USERNAME` or `PASSWORD`, and
+an unrelated prefix such as `--env UNRELATED_*` is passed through. The `*` is only a wildcard where
+Podman treats it as one: `--env "DATA_*=literal"` assigns a variable that happens to be named
+`DATA_*`, so it is compared exactly and passes through. The diagnostic names this package's own
+variable, never the pattern that was read.
+
 Storage is not only what a `--mount` spells, so an option that creates, selects or alters mounts or
 the root filesystem without naming one is refused as storage too: `--storage-opt` (the storage
 driver's options for this container, which is the size and backing of the root filesystem the data

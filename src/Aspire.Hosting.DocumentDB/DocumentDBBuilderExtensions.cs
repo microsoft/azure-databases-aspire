@@ -2993,12 +2993,12 @@ public static class DocumentDBBuilderExtensions
     /// disagreeing about how to log in — and because a raw <c>--env</c> is where a password would
     /// be written in the clear.
     /// </remarks>
-    private static readonly HashSet<string> s_guardOwnedEnvironmentVariables = new(StringComparer.Ordinal)
-    {
+    private static readonly string[] s_guardOwnedEnvironmentVariables =
+    [
         DataPathEnvVarName,
         UserEnvVarName,
         PasswordEnvVarName,
-    };
+    ];
 
     /// <summary>
     /// Fails the resource when its container-runtime arguments carry an option that would add
@@ -3115,15 +3115,42 @@ public static class DocumentDBBuilderExtensions
 
     /// <summary>
     /// This package's own spelling of a guard-owned environment variable, or <see langword="null"/>
-    /// when the name is not one of them.
+    /// when the name or prefix does not match one.
     /// </summary>
     /// <remarks>
     /// The name that comes back is the one held in
     /// <see cref="s_guardOwnedEnvironmentVariables"/>, never the caller's token, which is what lets
     /// a diagnostic name the variable without naming anything that was read.
     /// </remarks>
-    private static string? ResolveGuardOwnedEnvironmentVariable(string name) =>
-        s_guardOwnedEnvironmentVariables.TryGetValue(name, out var owned) ? owned : null;
+    private static string? ResolveGuardOwnedEnvironmentVariable(
+        string value,
+        DocumentDBEnvironmentVariableMatch match) =>
+        ResolveOwnedEnvironmentVariable(s_guardOwnedEnvironmentVariables, value, match);
+
+    /// <summary>
+    /// The owner's own spelling of the first owned variable an exact name equals, or that a Podman
+    /// import prefix would pull in, and <see langword="null"/> when none does. A prefix match is
+    /// deliberately generous: <c>--env DATA_*</c> and the bare <c>--env *</c> both import
+    /// <c>DATA_PATH</c> from the host, so both have to be refused.
+    /// </summary>
+    private static string? ResolveOwnedEnvironmentVariable(
+        IReadOnlyList<string> ownedVariables,
+        string value,
+        DocumentDBEnvironmentVariableMatch match)
+    {
+        foreach (var owned in ownedVariables)
+        {
+            if ((match == DocumentDBEnvironmentVariableMatch.Exact &&
+                 string.Equals(owned, value, StringComparison.Ordinal)) ||
+                (match == DocumentDBEnvironmentVariableMatch.Prefix &&
+                 owned.StartsWith(value, StringComparison.Ordinal)))
+            {
+                return owned;
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// The container entrypoint options that consume the token after them, so that a deferred
