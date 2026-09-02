@@ -52,6 +52,12 @@ public class Program
     /// <summary>Telemetry wrapper with DATA_PATH set to /tmp.</summary>
     public const string TelemetryTemporaryDataPathScenario = "telemetry-temporary-data-path";
 
+    /// <summary>
+    /// Telemetry wrapper with a caller argument callback registered afterwards that inserts at the
+    /// front of the argument list — the shape that used to displace the wrapper's own command.
+    /// </summary>
+    public const string TelemetryWrapperArgumentOrderScenario = "telemetry-wrapper-argument-order";
+
     /// <summary>WithPostgresVersion(Pg15).</summary>
     public const string Pg15Scenario = "pg15";
 
@@ -221,6 +227,15 @@ public class Program
                     endpoint: "http://localhost:4317",
                     enabled: bool.Parse(GetRequired(OtelEnabledEnvironmentVariable)),
                     exportInterval: TimeSpan.FromSeconds(1));
+                break;
+
+            case TelemetryWrapperArgumentOrderScenario:
+                // '--disable-extended-rum' takes no operand, so it is a complete image-entrypoint
+                // argument on its own. Inserting it at the front is exactly what used to produce
+                // '/bin/bash --disable-extended-rum -c <script> --', which starts nothing.
+                documentDB
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false)
+                    .WithArgs(context => context.Args.Insert(0, "--disable-extended-rum"));
                 break;
 
             case Pg15Scenario:

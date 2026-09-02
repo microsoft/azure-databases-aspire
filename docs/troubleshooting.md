@@ -131,8 +131,42 @@ that is caught when the wrapper's arguments are resolved, and `aspire publish` r
 `publish-manifest` step as failed. Drop the custom entrypoint, or drop
 `WithOpenTelemetryMetrics(...)` and configure telemetry from your own entrypoint.
 
-### No metrics arrive at the collector
+### `WithOpenTelemetryMetrics()` throws about a later command-line callback
 
+The wrapper's `-c <script> --` prefix has to be the first thing on the container command line, so
+its callback is the resource's last command-line callback and retakes that position at every phase
+a run offers. A callback added after the last of them — a `BeforeResourceStartedEvent` subscriber
+registered after `AddDocumentDB`, or any `IDistributedApplicationLifecycleHook` in publish mode,
+where no per-resource event is raised — could still put a value in front of the wrapper, which
+would leave `/bin/bash` running your value with the wrapper as its operands. That fails the
+resource instead, and `aspire publish` reports the `publish-manifest` step as failed. The message
+does not repeat the value, because the callback that displaced the wrapper may be the one carrying
+a secret. Add the arguments with `WithArgs(...)` while the application model is being built — any
+order and any mutation is fine there, including inserting at the front — or register the subscriber
+before `AddDocumentDB`.
+
+### `WithOpenTelemetryMetrics()` throws about a configuration that changed
+
+The app host records each callback's result the first time it runs and reuses it, and it takes the
+last callback's recorded result as the whole argument list. Building the resource's configuration
+early — `ExecutionConfigurationBuilder`, or the obsolete `GetArgumentValuesAsync`, typically from an
+`IDistributedApplicationLifecycleHook` — and *then* changing the resource therefore drops the
+recorded wrapper from the command line without re-running anything that would notice.
+
+The wrapper records what its answer depended on and compares it at the last point the app host runs
+unconditionally: a container-runtime-arguments callback in a run, `BeforePublishEvent` in a publish.
+A mismatch fails the resource before the container is created or the manifest is written, and names
+what kind of thing changed — callbacks, entrypoint, or image — without repeating a value, because
+whatever changed the model may be carrying a secret.
+
+Finish configuring the resource before anything reads its configuration. If a lifecycle hook has to
+contribute arguments, let it add them without reading first: they are ordered behind the wrapper
+automatically. Changing the entrypoint or the image of a resource that uses
+`WithOpenTelemetryMetrics(...)` is never supported after the fact — select the image and leave the
+entrypoint alone, or drop `WithOpenTelemetryMetrics(...)` and configure telemetry from your own
+entrypoint.
+
+### No metrics arrive at the collector
 1. Confirm the collector is reachable from *inside* the container network and that you passed an
    explicit `endpoint:`. The gateway default (`http://localhost:4317`) resolves to the DocumentDB
    container itself.

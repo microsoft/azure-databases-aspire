@@ -365,6 +365,51 @@ instead of guessing:
   uninstalled, and dropping its arguments would leave `/bin/bash` with nothing to run. Select the
   image before configuring metrics.
 
+**Argument ordering is fixed, and enforced.** `/bin/bash` reads its command from the first
+arguments, so the wrapper's `-c <script> --` prefix has to stay in front of everything else: one
+value inserted before it would turn the whole wrapper into bash operands and start nothing. The
+wrapper therefore contributes the container's *last* command-line callback, and retakes that
+position at every phase the app host offers — `BeforeStartEvent`,
+`ResourceEndpointsAllocatedEvent`, `BeforeResourceStartedEvent` and, in publish,
+`BeforePublishEvent`. In practice:
+
+- `WithArgs(...)` works in either order and however it is written. Static values, an appending
+  callback, and a callback that inserts at the front, clears, or rewrites the list all run *before*
+  the wrapper, so what they produce becomes arguments of the image entrypoint rather than of
+  `bash`. `.WithOpenTelemetryMetrics().WithArgs(context => context.Args.Insert(0, "--help"))`
+  publishes and runs `/bin/bash -c <script> -- --help`.
+- The same holds for arguments added later than the model: from a `BeforeStartEvent` subscriber
+  registered after `AddDocumentDB`, or from an
+  `IDistributedApplicationLifecycleHook.BeforeStartAsync`.
+- Adding a command-line callback after the last of those phases — a `BeforeResourceStartedEvent` or
+  `BeforePublishEvent` subscriber registered after `AddDocumentDB` — **fails the resource** rather
+  than shipping a command line that was built and then taken apart.
+- The finished command line is checked before it is used: the entrypoint must still be `/bin/bash`,
+  the arguments must begin with exactly `-c`, this run's script, `--`, and the script must not
+  appear twice.
+
+**Reading the configuration early freezes it.** The app host records each callback's result the
+first time it runs and reuses it for the rest of the run, and it takes the *last* callback's
+recorded result as the whole argument list. So a caller who builds the resource's configuration
+early — `ExecutionConfigurationBuilder` or `GetArgumentValuesAsync`, typically from an
+`IDistributedApplicationLifecycleHook` — and only then changes the resource does not merely reorder
+the command line: the recorded wrapper is dropped from it entirely, and nothing re-validates.
+
+The wrapper closes that by recording what the container's command depended on when it produced its
+answer — the callbacks in every pipeline, the entrypoint, and the image the resource will run — and
+comparing it at the two points the app host never caches:
+
+| Mode | Checkpoint | Runs |
+| --- | --- | --- |
+| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read |
+| Publish | `BeforePublishEvent` | after every lifecycle hook and before the pipeline serializes anything |
+
+If anything changed, the resource is failed — a publish before the manifest is written, a run
+before the container is created. Nothing is repaired at that point: the recorded configuration is
+the one the container would receive, and re-running the wrapper would not replace it. Configure the
+resource fully before anything reads it, and it never comes up. See
+[the troubleshooting entry](troubleshooting.md#withopentelemetrymetrics-throws-about-a-configuration-that-changed).
+
 The wrapper needs `bash`, `jq`, `realpath`, and `mktemp`, all of which the official image provides.
 If one is missing, the configuration file cannot be read, or no safe temporary directory is
 available, the container fails to start with a diagnostic rather than starting silently without

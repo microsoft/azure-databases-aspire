@@ -6,10 +6,12 @@ using System.Net.Sockets;
 using System.Text.Json.Nodes;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Eventing;
+using Aspire.Hosting.Lifecycle;
 using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
 
@@ -1478,6 +1480,828 @@ public class AddDocumentDBTests
         Assert.Equal("--log-level", args[3]);
         Assert.Equal("trace", args[4]);
     }
+
+    // ---------------------------------------------------------------------
+    // The wrapper has to be the last word on the command line
+    //
+    // Aspire evaluates command-line callbacks in annotation order over one
+    // shared list, so a callback registered after WithOpenTelemetryMetrics()
+    // used to run after the wrapper and could put anything in front of it.
+    // /bin/bash reads its command from the first arguments, so one value
+    // inserted at the front turns '-c <script> --' into operands and the
+    // container starts nothing. The wrapper's callback retakes the last
+    // position at every phase a run offers, and refuses to answer at all if
+    // something got in after that.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The reported case: a callback registered after <c>WithOpenTelemetryMetrics()</c> that
+    /// prepends to the argument list. It now runs before the wrapper, so what it prepends becomes
+    /// an argument of the image entrypoint - which is what it was asking for - instead of
+    /// displacing the shell command.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALaterCallbackPrepends()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs(context => context.Args.Insert(0, "--help"));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+        Assert.Equal(4, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--help", args[3]);
+    }
+
+    /// <summary>
+    /// A callback that rewrites the list wholesale - clearing it, or reordering what is already
+    /// there - cannot take the wrapper apart either, because it runs before the wrapper is
+    /// written.
+    /// </summary>
+    [Theory]
+    [InlineData("clear")]
+    [InlineData("reverse")]
+    [InlineData("replace")]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALaterCallbackRewritesTheList(string mutation)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithArgs("--log-level", "trace")
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithArgs(context =>
+        {
+            switch (mutation)
+            {
+                case "clear":
+                    context.Args.Clear();
+                    break;
+                case "reverse":
+                    var reversed = context.Args.Reverse().ToList();
+                    context.Args.Clear();
+                    foreach (var argument in reversed)
+                    {
+                        context.Args.Add(argument);
+                    }
+
+                    break;
+                default:
+                    context.Args.Clear();
+                    context.Args.Add("--owner");
+                    context.Args.Add("documentdb");
+                    break;
+            }
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+
+        var expectedTail = mutation switch
+        {
+            "clear" => Array.Empty<string>(),
+            "reverse" => ["trace", "--log-level"],
+            _ => new[] { "--owner", "documentdb" },
+        };
+
+        Assert.Equal(expectedTail, args.Skip(3).Cast<string>());
+    }
+
+    /// <summary>
+    /// The control: a callback that only appends is exactly what <c>WithArgs</c> is for, and its
+    /// arguments still reach the image entrypoint in the order they were written.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsAnAppendOnlyCallbackValid()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs(context =>
+            {
+                context.Args.Add("--owner");
+                context.Args.Add("documentdb");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(5, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--owner", args[3]);
+        Assert.Equal("documentdb", args[4]);
+    }
+
+    /// <summary>
+    /// A <see cref="BeforeStartEvent"/> subscriber registered after the DocumentDB APIs runs after
+    /// the wrapper retakes the last position there. The per-resource phases a run publishes
+    /// afterwards are what put the wrapper back in front of it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALaterBeforeStartSubscriberPrepends()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            documentDB.WithArgs(context => context.Args.Insert(0, "--help"));
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(4, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--help", args[3]);
+    }
+
+    /// <summary>
+    /// Lifecycle hooks run after <see cref="BeforeStartEvent"/> too, and are the documented way to
+    /// mutate the model late. In a run the per-resource phases still come after them.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALifecycleHookPrepends()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+        appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+            new PrependArgumentLifecycleHook("DocumentDB", "--help"));
+#pragma warning restore CS0618
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RunLifecycleHooksAsync(app);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(4, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--help", args[3]);
+    }
+
+    /// <summary>
+    /// Nothing runs between <see cref="BeforeResourceStartedEvent"/> and the container's
+    /// configuration except another subscriber to that same event. One registered after the
+    /// DocumentDB APIs can still append a callback, and the wrapper would then be building a
+    /// command line something else takes apart. It fails the resource instead.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenACommandLineCallbackIsAddedAfterTheLastPhase()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithArgs(context => context.Args.Insert(0, "--help"));
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("has a later command-line callback registered after", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Publish publishes no per-resource event, but it does publish
+    /// <see cref="Aspire.Hosting.Publishing.BeforePublishEvent"/> after every lifecycle hook and
+    /// before the pipeline serializes anything. A hook that only adds arguments is therefore
+    /// repaired rather than rejected: the guard retakes the last position there, so the hook's
+    /// arguments land behind the wrapper where they belong.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesArgumentsALifecycleHookAddedBehindTheWrapper()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new PrependArgumentLifecycleHook("DocumentDB", "--help"));
+#pragma warning restore CS0618
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+
+        var args = resource["args"]?.AsArray();
+        Assert.NotNull(args);
+        Assert.Equal(4, args!.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+        Assert.Equal("--help", args[3]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// What publish cannot repair: a subscriber to the very event the guard uses to retake the last
+    /// position, registered after the DocumentDB APIs so that it runs afterwards. Nothing is
+    /// published after that, so the callback itself refuses.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenABeforePublishSubscriberAddsArguments()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Aspire.Hosting.Publishing.BeforePublishEvent>((_, _) =>
+            {
+                documentDB.WithArgs(context => context.Args.Insert(0, "--help"));
+                return Task.CompletedTask;
+            });
+        });
+
+        Assert.Contains("has a later command-line callback registered", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The failure has to describe the shape of the pipeline and nothing else: the callback that
+    /// displaced the wrapper may well be the one carrying a secret.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailClosedMessageDoesNotRepeatTheDisplacingValue()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithArgs("--password", "hunter2-should-not-appear");
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(SingleServerResource(app)));
+
+        Assert.DoesNotContain("hunter2", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Retaking the last position must not cost a second evaluation: the annotation is moved, not
+    /// rebuilt, so Aspire's cached result for it - and therefore exactly one wrapper prefix -
+    /// survives every phase and every later gather.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsASingleEvaluationAcrossRepeatedPhases()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithOpenTelemetryMetrics(serviceName: "documentdb-local");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var first = await BuildContainerArgsAsync(resource);
+        var second = await BuildContainerArgsAsync(resource);
+
+        Assert.Equal(3, first.Count);
+        Assert.Equal(first, second);
+        Assert.Same(first[1], second[1]);
+    }
+
+    /// <summary>
+    /// A restart re-evaluates the callbacks: Aspire forgets each annotation's cached result and
+    /// republishes the per-resource phases before it recreates the container. The wrapper has to
+    /// come out of that as one prefix, not two. The same evaluation is what an explicitly started
+    /// resource gets, whose configuration is built after those phases rather than at startup.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRebuildsExactlyOneWrapperPrefixOnRestart()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs("--log-level", "trace");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var first = await BuildContainerArgsAsync(resource);
+
+        ForgetCachedCommandLineResults(resource);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var second = await BuildContainerArgsAsync(resource);
+
+        Assert.Equal(5, first.Count);
+        Assert.Equal(5, second.Count);
+        Assert.Equal("-c", second[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, second[2]);
+        Assert.Equal("--log-level", second[3]);
+        Assert.Equal("trace", second[4]);
+    }
+
+    /// <summary>
+    /// Drops every command-line callback's cached result, which is what Aspire's DCP executor does
+    /// before it recreates a container. The cache is an explicit implementation of an internal
+    /// interface, so it is reached by reflection; a failure here means the restart contract this
+    /// wrapper relies on has changed shape.
+    /// </summary>
+    private static void ForgetCachedCommandLineResults(DocumentDBServerResource resource)
+    {
+        foreach (var annotation in resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>())
+        {
+            var callbackInterface = annotation.GetType().GetInterfaces().Single(
+                candidate => candidate.IsGenericType &&
+                    candidate.Name.StartsWith("ICallbackResourceAnnotation", StringComparison.Ordinal));
+
+            var forget = callbackInterface.GetMethod("ForgetCachedResult");
+            Assert.NotNull(forget);
+            forget!.Invoke(annotation, null);
+        }
+    }
+
+    /// <summary>
+    /// The real publisher, end to end: what azd receives has to carry the wrapper prefix first,
+    /// whatever the caller's own argument callbacks do to the list.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesTheWrapperFirstWhenALaterCallbackPrepends()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics()
+                .WithArgs(context => context.Args.Insert(0, "--help")));
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+
+        var args = resource["args"]?.AsArray();
+        Assert.NotNull(args);
+        Assert.Equal(4, args!.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+        Assert.Equal("--help", args[3]?.GetValue<string>());
+
+        var script = args[1]?.GetValue<string>();
+        Assert.NotNull(script);
+        Assert.DoesNotContain("\n", script!, StringComparison.Ordinal);
+        Assert.DoesNotContain("{", script!, StringComparison.Ordinal);
+        Assert.Contains($"exec {GatewayEntrypointScriptPath} \"$@\"", script!, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // Being last is not enough on its own
+    //
+    // Aspire records each callback's result the first time it runs and reuses
+    // it for the rest of the run. Anything that builds the resource's
+    // configuration early - ExecutionConfigurationBuilder from a lifecycle
+    // hook, or the dependency discovery a container creation does before it
+    // builds its spec - freezes the wrapper's answer. A change made after that
+    // is never re-validated, and because the gatherer takes the *last*
+    // annotation's recorded result as the whole argument list, a callback
+    // appended afterwards does not reorder the command line, it replaces it.
+    //
+    // The seal is compared at the two phases Aspire never caches: the
+    // container-runtime-arguments callback in a run, and BeforePublishEvent in
+    // a publish.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The reported bypass: a lifecycle hook builds the resource's configuration through the
+    /// public <see cref="ExecutionConfigurationBuilder"/> — which is what Aspire itself uses — and
+    /// only then appends an argument callback. Publish has no per-resource phase, so nothing would
+    /// re-run; the manifest would carry that callback's list and nothing else.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenAHookGathersArgumentsThenAppends()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Annotations.Add(
+                        new CommandLineArgsCallbackAnnotation(args => args.Insert(0, "--help")))));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its container command line had already been built", log, StringComparison.Ordinal);
+        Assert.Contains("a command-line callback was added or removed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same hook, re-pointing the entrypoint instead. The manifest writes <c>entrypoint</c>
+    /// before it evaluates <c>args</c>, so nothing downstream would notice.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenAHookGathersArgumentsThenChangesTheEntrypoint()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Entrypoint = "/late/entrypoint.sh"));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("its container entrypoint changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And swapping the image: the wrapper is built out of facts about the official image, so an
+    /// image selected after the command line was decided is a different container.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenAHookGathersArgumentsThenChangesTheImage()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Annotations.OfType<ContainerImageAnnotation>().Last().Tag = "pg17-0.114.0"));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("the image it will run changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The run-mode half. A container creation discovers the resource's dependencies first — which
+    /// builds and records its configuration — and only then invokes the container-runtime-argument
+    /// callbacks, before it reads the container's command. A caller callback there can re-point the
+    /// entrypoint after every argument check has already run.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenARuntimeCallbackChangesTheEntrypointAfterTheGather()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithContainerRuntimeArgs(context =>
+        {
+            documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+            context.Args.Add("--label");
+            context.Args.Add("late=1");
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+
+        // What Aspire does first: the dependency pass builds and records the configuration.
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("its container entrypoint changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A runtime-argument callback that appends another argument callback is the run-mode shape of
+    /// the publish bypass.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenARuntimeCallbackAppendsArgumentsAfterTheGather()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithContainerRuntimeArgs(_ =>
+            documentDB.Resource.Annotations.Add(
+                new CommandLineArgsCallbackAnnotation(args => args.Insert(0, "--help"))));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("has a later command-line callback registered", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Environment callbacks can re-point the entrypoint too. Aspire's dependency pass evaluates
+    /// them before the argument callbacks and records both, so the wrapper's own callback is what
+    /// sees the result — and it refuses to build arguments for an entrypoint it does not own.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenAnEnvironmentCallbackChangesTheEntrypoint()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithEnvironment(context => documentDB.Resource.Entrypoint = "/late/entrypoint.sh");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+
+        // The order Aspire's dependency pass uses: environment first, then arguments.
+        await BuildEnvironmentVariablesAsync(resource);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(resource));
+
+        Assert.Contains("/late/entrypoint.sh", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And when the entrypoint moves after the arguments were already recorded, the run's
+    /// unconditional checkpoint is what catches it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenTheEntrypointMovesAfterTheArgumentsWereRecorded()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        resource.Entrypoint = "/late/entrypoint.sh";
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("its container entrypoint changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The guard moves its own callbacks to the end of their pipelines at every phase, so a
+    /// recording taken before one of those moves must not be read as somebody else changing the
+    /// resource. A hook that adds a container-runtime argument and only then reads the
+    /// configuration produces exactly that order, and has to keep working.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsToleratesTheGuardRetakingItsOwnPositionAfterAGather()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        // A lifecycle hook's shape: add a runtime argument and an environment variable, then read
+        // the configuration, all before the per-resource phases run.
+        await RaiseBeforeStartAsync(app);
+        documentDB.WithContainerRuntimeArgs("--label", "team=data");
+        documentDB.WithEnvironment("TEAM", "data");
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        // The phases that move the guard back behind both of those.
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(["--label", "team=data"], await RunContainerRuntimeArgsAsync(resource));
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+    }
+
+    /// <summary>
+    /// The control: a lifecycle hook that reads the configuration and changes nothing still
+    /// publishes, and publishes the same command line it read.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesWhenAHookOnlyReadsTheConfiguration()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics()
+                .WithArgs("--log-level", "trace");
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook("DocumentDB", _ => { }));
+#pragma warning restore CS0618
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+
+        var args = resource["args"]?.AsArray();
+        Assert.NotNull(args);
+        Assert.Equal(5, args!.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+        Assert.Equal("--log-level", args[3]?.GetValue<string>());
+        Assert.Equal("trace", args[4]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// The other control: container runtime arguments that only do what they are for still work,
+    /// and the checkpoint the package adds contributes nothing to them.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsLeavesBenignContainerRuntimeArgumentsAlone()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs("--label", "team=data");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        Assert.Equal(["--label", "team=data"], await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    /// <summary>
+    /// A deferred value keeps its single evaluation: the wrapper's callback is moved between
+    /// phases, never rebuilt, so Aspire's record of it — and of everything before it — survives,
+    /// and a parameter that may be a secret is resolved by Aspire once rather than by this package
+    /// a second time.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsResolvesADeferredArgumentExactlyOnce()
+    {
+        var evaluations = 0;
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:level"] = "trace";
+        var level = appBuilder.AddParameter("level", secret: true);
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs(context =>
+            {
+                Interlocked.Increment(ref evaluations);
+                context.Args.Add("--log-level");
+                context.Args.Add(level.Resource);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var first = await BuildContainerArgsAsync(resource);
+        var second = await BuildContainerArgsAsync(resource);
+
+        Assert.Equal(1, evaluations);
+        Assert.Equal(5, first.Count);
+        Assert.Equal(first, second);
+        Assert.Equal("-c", first[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, first[2]);
+        Assert.Equal("--log-level", first[3]);
+        Assert.Same(level.Resource, first[4]);
+    }
+
+    /// <summary>
+    /// Invokes the resource's container-runtime-argument callbacks the way Aspire's container
+    /// creator does: in annotation order, over one shared list, with no result cache — which is
+    /// what makes this the run's unconditional checkpoint.
+    /// </summary>
+    private static async Task<string[]> RunContainerRuntimeArgsAsync(DocumentDBServerResource resource)
+    {
+        var args = new List<object>();
+        var context = new ContainerRuntimeArgsCallbackContext(args, CancellationToken.None);
+
+        foreach (var annotation in resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>())
+        {
+            await annotation.Callback(context);
+        }
+
+        return [.. args.Select(argument => argument as string ?? argument.ToString()!)];
+    }
+
+    /// <summary>
+    /// A lifecycle hook that builds the resource's configuration through the same public API
+    /// Aspire uses, and then changes the resource — the shape that made a validated command line
+    /// stale.
+    /// </summary>
+#pragma warning disable CS0618 // Type or member is obsolete
+    private sealed class GatherThenMutateLifecycleHook(
+        string resourceName,
+        Action<DocumentDBServerResource> mutate) : IDistributedApplicationLifecycleHook
+    {
+        public async Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            var resource = appModel.Resources.OfType<DocumentDBServerResource>()
+                .Single(candidate => candidate.Name == resourceName);
+
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithArgumentsConfig()
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                    NullLogger.Instance,
+                    cancellationToken);
+
+            mutate(resource);
+        }
+    }
+#pragma warning restore CS0618
+
+    // Lifecycle hooks are obsolete in favour of eventing subscribers, but Aspire still runs
+    // registered hooks - after BeforeStartEvent - so they remain a way to add a command-line
+    // callback late, and the wrapper has to hold against it.
+#pragma warning disable CS0618 // Type or member is obsolete
+    private sealed class PrependArgumentLifecycleHook(string resourceName, string argument) : IDistributedApplicationLifecycleHook
+    {
+        public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            appModel.Resources.OfType<DocumentDBServerResource>().Single(resource => resource.Name == resourceName)
+                .Annotations.Add(new CommandLineArgsCallbackAnnotation(args => args.Insert(0, argument)));
+
+            return Task.CompletedTask;
+        }
+    }
+
+    private static async Task RunLifecycleHooksAsync(DistributedApplication app)
+    {
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        foreach (var hook in app.Services.GetServices<IDistributedApplicationLifecycleHook>())
+        {
+            await hook.BeforeStartAsync(model, CancellationToken.None);
+        }
+    }
+#pragma warning restore CS0618
 
     [Theory]
     [InlineData("/custom/entrypoint.sh")]
@@ -3147,16 +3971,56 @@ public class AddDocumentDBTests
     private static DocumentDBServerResource SingleServerResource(DistributedApplication app) =>
         Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
 
-    private static async Task<IReadOnlyList<object>> BuildContainerArgsAsync(DocumentDBServerResource resource)
+    /// <summary>
+    /// Builds the resource's container arguments through Aspire's own argument gatherer, and
+    /// returns the values the callbacks produced before resolution.
+    /// </summary>
+    /// <remarks>
+    /// Aspire evaluates every command-line callback in annotation order over one shared list and
+    /// caches each callback's result. Invoking the callbacks by hand instead would lose both the
+    /// order the container is really configured in and the single evaluation the wrapper depends
+    /// on, and a wrapper that has to be the last word cannot be tested against a command line the
+    /// container never receives.
+    /// </remarks>
+    private static async Task<IReadOnlyList<object>> BuildContainerArgsAsync(
+        DocumentDBServerResource resource,
+        DistributedApplicationOperation operation = DistributedApplicationOperation.Run)
     {
-        var args = new List<object>();
+        var result = await ExecutionConfigurationBuilder.Create(resource)
+            .WithArgumentsConfig()
+            .BuildAsync(
+                new DistributedApplicationExecutionContext(operation),
+                NullLogger.Instance,
+                CancellationToken.None);
 
-        foreach (var annotation in resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>())
+        if (result.Exception is not null)
         {
-            await annotation.Callback(new CommandLineArgsCallbackContext(args, resource, CancellationToken.None));
+            throw result.Exception is AggregateException { InnerExceptions.Count: 1 } aggregate
+                ? aggregate.InnerException!
+                : result.Exception;
         }
 
-        return args;
+        return [.. result.ArgumentsWithUnprocessed.Select(argument => argument.Unprocessed)];
+    }
+
+    /// <summary>
+    /// Publishes the per-resource events a run publishes between <see cref="BeforeStartEvent"/>
+    /// and the point at which a container's arguments are gathered, in that order.
+    /// </summary>
+    private static async Task RaiseResourceStartPhasesAsync(DistributedApplication app)
+    {
+        var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
+        var resource = SingleServerResource(app);
+
+        await eventing.PublishAsync(
+            new ResourceEndpointsAllocatedEvent(resource, app.Services),
+            EventDispatchBehavior.BlockingSequential,
+            CancellationToken.None);
+
+        await eventing.PublishAsync(
+            new BeforeResourceStartedEvent(resource, app.Services),
+            EventDispatchBehavior.BlockingSequential,
+            CancellationToken.None);
     }
 
     private static async Task<string> GetWrapperScriptAsync(DocumentDBServerResource resource)

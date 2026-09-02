@@ -559,6 +559,50 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
+    /// <summary>
+    /// The wrapper has to be the first thing <c>/bin/bash</c> reads. A caller callback registered
+    /// after <c>WithOpenTelemetryMetrics()</c> that inserts at the front used to run afterwards and
+    /// push the whole wrapper behind its own value, leaving a container that exited immediately.
+    /// This starts the real thing and requires it to become healthy.
+    /// </summary>
+    [Fact]
+    public async Task TelemetryWrapperStaysFirstWhenALaterCallbackPrepends()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryWrapperArgumentOrderScenario),
+            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+
+        // The container only reaches this state if bash ran the wrapper script rather than being
+        // handed '--disable-extended-rum' as its own first argument.
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "argument-order", "wrapper-first", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+
+        Assert.Equal(["/bin/bash"], await GetContainerConfigListAsync(containerId, "Entrypoint"));
+
+        var command = await GetContainerConfigListAsync(containerId, "Cmd");
+        Assert.Equal(4, command.Length);
+        Assert.Equal("-c", command[0]);
+        Assert.Equal("--", command[2]);
+        Assert.Equal("--disable-extended-rum", command[3]);
+        Assert.Contains("del(.TelemetryOptions.Metrics", command[1], StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
