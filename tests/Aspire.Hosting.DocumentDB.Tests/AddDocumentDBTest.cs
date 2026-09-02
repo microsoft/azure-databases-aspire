@@ -5032,6 +5032,225 @@ public class AddDocumentDBTests
     }
 
     /// <summary>
+    /// A subscriber registered after the DocumentDB APIs runs after their
+    /// <c>BeforePublishEvent</c> verification. Gathering there freezes the validated wrapper;
+    /// changing the entrypoint afterwards must still be rejected by the checkpoint that runs
+    /// while the real publisher serializes the resource.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsRealPublicationWhenALateSubscriberChangesTheEntrypointAfterGathering()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+            });
+        });
+
+        Assert.Contains("its container entrypoint changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same late gather followed by a command callback changes which immutable argument list
+    /// Aspire would publish. Serialization must reject the changed callback membership rather than
+    /// trusting the wrapper result cached before the callback existed.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsRealPublicationWhenALateSubscriberAddsArgumentsAfterGathering()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.WithArgs("--late");
+            });
+        });
+
+        Assert.Contains("has a later command-line callback registered", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Every part of the effective image is part of the seal. These mutations use the public
+    /// builder APIs after the cached wrapper has been gathered, including the Dockerfile
+    /// classification that makes an otherwise official-looking annotation caller-owned.
+    /// </summary>
+    [Theory]
+    [InlineData("image")]
+    [InlineData("tag")]
+    [InlineData("digest")]
+    [InlineData("dockerfile")]
+    public async Task WithOpenTelemetryMetricsFailsRealPublicationWhenALateSubscriberChangesTheImageAfterGathering(
+        string mutation)
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+
+                switch (mutation)
+                {
+                    case "image":
+                        documentDB.WithImage("contoso/documentdb-local", InterlockedTag);
+                        break;
+                    case "tag":
+                        documentDB.WithImageTag("pg17-0.114.0");
+                        break;
+                    case "digest":
+                        documentDB.WithImageSHA256(OlderReleaseDigest);
+                        break;
+                    case "dockerfile":
+                        documentDB.WithDockerfile(CreateOfficialLookingDockerfileContext());
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Unknown mutation '{mutation}'.");
+                }
+            });
+        });
+
+        Assert.Contains("the image it will run changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Reading the cached configuration is legal. The serialization checkpoint must be invisible
+    /// when the model still matches the seal, including the exact wrapper command and manifest
+    /// fields the ordinary container writer emits.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAnIdenticalManifestWhenALateSubscriberOnlyGathers()
+    {
+        var baseline = await ManifestUtils.PublishManifestAsync(
+            appBuilder =>
+                appBuilder.AddDocumentDB("DocumentDB")
+                    .WithImageTag(InterlockedTag)
+                    .WithOpenTelemetryMetrics()
+                    .WithArgs("--log-level", "trace"),
+            $"{nameof(WithOpenTelemetryMetricsPublishesAnIdenticalManifestWhenALateSubscriberOnlyGathers)}-baseline");
+
+        var gathered = await ManifestUtils.PublishManifestAsync(
+            appBuilder =>
+            {
+                var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                    .WithImageTag(InterlockedTag)
+                    .WithOpenTelemetryMetrics()
+                    .WithArgs("--log-level", "trace");
+
+                appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, token) =>
+                    GatherPublishConfigurationAsync(documentDB.Resource, token));
+            },
+            $"{nameof(WithOpenTelemetryMetricsPublishesAnIdenticalManifestWhenALateSubscriberOnlyGathers)}-gathered");
+
+        Assert.True(JsonNode.DeepEquals(baseline, gathered));
+    }
+
+    /// <summary>
+    /// <c>WithManifestPublishingCallback</c> is a supported replacement API. A late subscriber
+    /// cannot use it to shadow the package checkpoint after making the cached command stale; the
+    /// checkpoint is restored after model events and rejects the resource before the replacement
+    /// writer runs.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsCannotShadowTheSerializationCheckpointWithALateManifestCallback()
+    {
+        var writerCalls = 0;
+
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+
+                documentDB.WithManifestPublishingCallback(async context =>
+                {
+                    Interlocked.Increment(ref writerCalls);
+                    await context.WriteContainerAsync(documentDB.Resource);
+                });
+            });
+        });
+
+        Assert.Contains("its container entrypoint changed", log, StringComparison.Ordinal);
+        Assert.Equal(0, writerCalls);
+    }
+
+    /// <summary>
+    /// The combined branch has one serialization authority. After one gather records both the
+    /// storage verdict and telemetry command, that callback checks both and delegates the caller's
+    /// writer exactly once rather than installing a second writer for either feature.
+    /// </summary>
+    [Fact]
+    public async Task TheSingleManifestCheckpointChecksStorageAndTelemetryBeforeDelegatingOneWriter()
+    {
+        var writerCalls = 0;
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data")
+                .WithOpenTelemetryMetrics();
+
+            documentDB.WithManifestPublishingCallback(async context =>
+            {
+                Interlocked.Increment(ref writerCalls);
+                await context.WriteContainerAsync(documentDB.Resource);
+            });
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, token) =>
+                GatherPublishConfigurationAsync(documentDB.Resource, token));
+        });
+
+        Assert.Equal(1, writerCalls);
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+        Assert.Equal("/data", resource["env"]?["DATA_PATH"]?.GetValue<string>());
+        Assert.Equal("documentdb-data", Assert.Single(resource["volumes"]!.AsArray())!["name"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// Exclusion is the supported no-output boundary: the pipeline checkpoint must not displace
+    /// Aspire's callback-less manifest annotation and accidentally publish the resource.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsAnExcludedResourceOutOfTheManifest()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume()
+                .WithOpenTelemetryMetrics()
+                .ExcludeFromManifest();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, token) =>
+                GatherPublishConfigurationAsync(documentDB.Resource, token));
+        });
+
+        Assert.Null(manifest["resources"]?["DocumentDB"]);
+    }
+
+    /// <summary>
     /// The other control: container runtime arguments that only do what they are for still work,
     /// and the checkpoint the package adds contributes nothing to them.
     /// </summary>
@@ -5453,6 +5672,19 @@ public class AddDocumentDBTests
         }
 
         return [.. args.Select(argument => argument as string ?? argument.ToString()!)];
+    }
+
+    private static async Task GatherPublishConfigurationAsync(
+        DocumentDBServerResource resource,
+        CancellationToken cancellationToken)
+    {
+        await ExecutionConfigurationBuilder.Create(resource)
+            .WithArgumentsConfig()
+            .WithEnvironmentVariablesConfig()
+            .BuildAsync(
+                new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                NullLogger.Instance,
+                cancellationToken);
     }
 
     /// <summary>

@@ -4,6 +4,7 @@
 using System.Globalization;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.DocumentDB;
+using Aspire.Hosting.Pipelines;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
@@ -55,9 +56,9 @@ public static class DocumentDBBuilderExtensions
 
         /// <summary>
         /// The manifest publishing callback. It is the publish counterpart of
-        /// <see cref="RuntimeCheckpoint"/>: it runs while the resource is being serialized, which
-        /// is later than any model event — so no subscriber can be registered after it — and it
-        /// hands the writing on to whatever would have written the resource anyway.
+        /// <see cref="RuntimeCheckpoint"/>: it verifies the cached terminal state while the
+        /// resource is actually being serialized, then hands writing on to the callback it
+        /// displaced.
         /// </summary>
         public ManifestPublishingCallbackAnnotation ManifestCheckpoint { get; set; } = null!;
 
@@ -73,7 +74,7 @@ public static class DocumentDBBuilderExtensions
         public void AddCommandLineValidation(Action<TerminalCommandLineState> validation) =>
             _commandLineValidations.Add(validation);
 
-        public void RunCommandLine(CommandLineArgsCallbackContext context)
+        public TerminalCommandLineState RunCommandLine(CommandLineArgsCallbackContext context)
         {
             var state = new TerminalCommandLineState(context);
 
@@ -86,6 +87,8 @@ public static class DocumentDBBuilderExtensions
             {
                 validation(state);
             }
+
+            return state;
         }
 
     }
@@ -113,7 +116,20 @@ public static class DocumentDBBuilderExtensions
         System.Collections.Immutable.ImmutableArray<EnvironmentCallbackAnnotation> EnvironmentCallbacks,
         System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
         string? Entrypoint,
-        DocumentDBEffectiveImage Image);
+        DocumentDBEffectiveImage Image,
+        TerminalCommandSeal Command);
+
+    /// <summary>
+    /// The fixed, non-secret-bearing part of the command result the terminal callback returned to
+    /// Aspire's immutable cache.
+    /// </summary>
+    private sealed record TerminalCommandSeal(
+        GatewayConfigurationRequirement GatewayRequirement,
+        string? WrapperScript,
+        string? ShellOption,
+        bool ScriptIsSecondArgument,
+        string? Delimiter,
+        bool HasDuplicateWrapperScript);
 
     /// <summary>
     /// What one evaluation of the terminal command-line guard produced. Scoped to the evaluation
@@ -148,6 +164,9 @@ public static class DocumentDBBuilderExtensions
     /// entrypoint's own <c>--option value</c> grammar has to have run first.
     /// </summary>
     private const int TerminalCommandLineOpenTelemetryWrapperRank = 100;
+    private const string ManifestPublishingPipelineStepName = "publish-manifest";
+    private const string TerminalManifestCheckpointPipelineStepName =
+        "documentdb-terminal-manifest-checkpoint";
 
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
@@ -1708,8 +1727,8 @@ public static class DocumentDBBuilderExtensions
     /// Called from <see cref="VerifyTerminalConfigurationSeal"/>, and so from the two checkpoints
     /// Aspire never caches: the container-runtime-arguments callback, which a run re-invokes on
     /// every container creation after the last opportunity a caller has to change anything, and
-    /// the manifest publishing callback, which a publish runs while it serializes the resource —
-    /// later than any model event, so no subscriber can be registered after it.
+    /// the manifest publishing callback, which the publishing pipeline restores after every model
+    /// event and Aspire runs while it serializes the resource.
     /// </para>
     /// <para>
     /// Nothing is repaired and nothing is re-judged. Re-running the rules is not an option: Aspire
@@ -2938,8 +2957,9 @@ public static class DocumentDBBuilderExtensions
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This package owns exactly one <see cref="CommandLineArgsCallbackAnnotation"/> and one
-    /// <see cref="ContainerRuntimeArgsCallbackAnnotation"/> per resource. Everything it needs to do
+    /// This package owns exactly one <see cref="CommandLineArgsCallbackAnnotation"/>, one
+    /// <see cref="ContainerRuntimeArgsCallbackAnnotation"/>, and one
+    /// <see cref="ManifestPublishingCallbackAnnotation"/> per resource. Everything it needs to do
     /// to the container command line is a step of that one command-line callback, ordered by rank,
     /// followed by the validations that judge the finished list. One callback per pipeline is what
     /// makes the contract expressible at all: Aspire evaluates callbacks in annotation order over
@@ -2969,10 +2989,10 @@ public static class DocumentDBBuilderExtensions
     /// every container creation without caching, and it does so after the last opportunity a
     /// caller has to change anything — a caller's own runtime-arguments callback — and before the
     /// container's command, arguments and environment are read.</description></item>
-    /// <item><description>Publish: <see cref="Publishing.BeforePublishEvent"/>, which is raised
-    /// after every lifecycle hook has run and before the publishing pipeline serializes anything.
-    /// Publish raises no per-resource event, so this is the only phase there that is both after all
-    /// caller code and before the manifest.</description></item>
+    /// <item><description>Publish: the manifest callback itself. A publishing-pipeline prerequisite
+    /// re-establishes it after every <see cref="Publishing.BeforePublishEvent"/> subscriber has
+    /// completed, so a normal model event cannot replace or shadow the checkpoint; the callback
+    /// then verifies while Aspire serializes the resource.</description></item>
     /// </list>
     /// <para>
     /// The annotation instances are moved, never re-created, so Aspire's per-callback result cache
@@ -2995,8 +3015,8 @@ public static class DocumentDBBuilderExtensions
         guard.CommandLineCallback = new CommandLineArgsCallbackAnnotation(context =>
         {
             EnsureTerminalCallbackRunsLast(resource, guard.CommandLineCallback, "command-line");
-            guard.RunCommandLine(context);
-            guard.Seal = CaptureTerminalConfigurationSeal(resource);
+            var state = guard.RunCommandLine(context);
+            guard.Seal = CaptureTerminalConfigurationSeal(resource, state);
             return Task.CompletedTask;
         });
 
@@ -3031,6 +3051,7 @@ public static class DocumentDBBuilderExtensions
         resource.Annotations.Add(guard.CommandLineCallback);
         resource.Annotations.Add(guard.RuntimeCheckpoint);
         EstablishManifestCheckpoint(resource, guard);
+        RegisterTerminalManifestCheckpoint(builder.ApplicationBuilder, resource, guard);
 
         void RetakeLastPosition() => RetakeTerminalGuardPositions(resource, guard);
 
@@ -3054,8 +3075,8 @@ public static class DocumentDBBuilderExtensions
 
         builder.ApplicationBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, _) =>
         {
-            // Publish has no per-resource phase, so this is both the last point after every
-            // lifecycle hook and the last point before the manifest is written.
+            // Retake after every lifecycle hook. A pipeline prerequisite repeats the manifest
+            // retake after later subscribers to this same event have completed.
             RetakeLastPosition();
             VerifyTerminalConfigurationSeal(resource, guard);
             return Task.CompletedTask;
@@ -3134,16 +3155,131 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Registers one application-wide publishing step that restores every DocumentDB manifest
+    /// checkpoint after all model events and before Aspire's manifest writer runs.
+    /// </summary>
+    /// <remarks>
+    /// <c>WithManifestPublishingCallback(...)</c> replaces the last callback through a supported
+    /// public API. A subscriber registered after this package's
+    /// <see cref="Publishing.BeforePublishEvent"/> subscriber can therefore remove the checkpoint
+    /// after the event-level retake. Pipeline resolution happens only after every subscriber has
+    /// completed, so this prerequisite closes that window without competing with the checker: it
+    /// only restores callback ownership, and the single callback still performs both storage and
+    /// telemetry verification at serialization.
+    /// <see cref="ResourceBuilderExtensions.ExcludeFromManifest{T}"/> remains the deliberate
+    /// boundary; a resource that emits nothing has no published configuration to verify.
+    /// An application that rewrites Aspire's publishing pipeline itself owns serialization order
+    /// and is outside this resource-annotation contract; ordinary model events and manifest
+    /// callback replacement are covered.
+    /// </remarks>
+    private static void RegisterTerminalManifestCheckpoint(
+        IDistributedApplicationBuilder appBuilder,
+        DocumentDBServerResource resource,
+        TerminalGuardAnnotation guard)
+    {
+        if (!appBuilder.ExecutionContext.IsPublishMode)
+        {
+            return;
+        }
+
+        var registration = appBuilder.Services
+            .Where(service => service.ServiceType == typeof(TerminalManifestCheckpointPipelineRegistration))
+            .Select(service => service.ImplementationInstance)
+            .OfType<TerminalManifestCheckpointPipelineRegistration>()
+            .SingleOrDefault();
+
+        if (registration is not null)
+        {
+            registration.Guards[resource] = guard;
+            return;
+        }
+
+        registration = new TerminalManifestCheckpointPipelineRegistration();
+        registration.Guards.Add(resource, guard);
+        appBuilder.Services.AddSingleton(registration);
+
+#pragma warning disable ASPIREPIPELINES001
+        appBuilder.Pipeline.AddStep(
+            TerminalManifestCheckpointPipelineStepName,
+            _ =>
+            {
+                if (!registration.ManifestPublishing)
+                {
+                    return Task.CompletedTask;
+                }
+
+                foreach (var (registeredResource, registeredGuard) in registration.Guards)
+                {
+                    EstablishManifestCheckpoint(registeredResource, registeredGuard);
+                }
+
+                return Task.CompletedTask;
+            });
+
+        appBuilder.Pipeline.AddPipelineConfiguration(context =>
+        {
+            var manifestStep = context.Steps.SingleOrDefault(step =>
+                string.Equals(step.Name, ManifestPublishingPipelineStepName, StringComparison.Ordinal));
+            registration.ManifestPublishing = manifestStep is not null;
+
+            if (manifestStep is not null &&
+                !manifestStep.DependsOnSteps.Contains(
+                    TerminalManifestCheckpointPipelineStepName,
+                    StringComparer.Ordinal))
+            {
+                manifestStep.DependsOn(TerminalManifestCheckpointPipelineStepName);
+            }
+
+            return Task.CompletedTask;
+        });
+#pragma warning restore ASPIREPIPELINES001
+    }
+
+    private sealed class TerminalManifestCheckpointPipelineRegistration
+    {
+        public Dictionary<DocumentDBServerResource, TerminalGuardAnnotation> Guards { get; } =
+            new(ReferenceEqualityComparer.Instance);
+
+        public bool ManifestPublishing { get; set; }
+    }
+
+    /// <summary>
     /// Records what the container's command depends on, at the moment the command-line callback
     /// produced the result Aspire will reuse for the rest of the run.
     /// </summary>
-    private static TerminalConfigurationSeal CaptureTerminalConfigurationSeal(DocumentDBServerResource resource) =>
+    private static TerminalConfigurationSeal CaptureTerminalConfigurationSeal(
+        DocumentDBServerResource resource,
+        TerminalCommandLineState state) =>
         new(
             [.. resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>()],
             [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
             [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
             resource.Entrypoint,
-            ResolveEffectiveImage(resource));
+            ResolveEffectiveImage(resource),
+            CaptureTerminalCommandSeal(resource, state));
+
+    private static TerminalCommandSeal CaptureTerminalCommandSeal(
+        DocumentDBServerResource resource,
+        TerminalCommandLineState state)
+    {
+        var requirement = ResolveOpenTelemetryGatewayConfigurationRequirement(resource);
+
+        if (state.WrapperScript is not { } script)
+        {
+            return new(requirement, null, null, false, null, false);
+        }
+
+        var args = state.Args;
+
+        return new(
+            requirement,
+            script,
+            args.Count > 0 ? args[0] as string : null,
+            args.Count > 1 && ReferenceEquals(args[1], script),
+            args.Count > 2 ? args[2] as string : null,
+            args.Skip(3).OfType<string>().Any(argument =>
+                string.Equals(argument, script, StringComparison.Ordinal)));
+    }
 
     /// <summary>
     /// Fails the resource when anything the container's command depends on changed after the
@@ -3152,11 +3288,10 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// <para>
     /// Called from the two uncached checkpoints the integration owns: the
-    /// container-runtime-arguments callback in a run and
-    /// <see cref="Publishing.BeforePublishEvent"/> in a publish. Together they cover every
-    /// supported way to change the model after the command line has been decided: appending or
-    /// inserting a callback in either pipeline, re-pointing the entrypoint, and swapping the image,
-    /// tag, digest or Dockerfile.
+    /// container-runtime-arguments callback in a run and the manifest publishing callback while a
+    /// publish serializes the resource. Together they cover every supported way to change the model
+    /// after the command line has been decided: appending or inserting a callback in either
+    /// pipeline, re-pointing the entrypoint, and swapping the image, tag, digest or Dockerfile.
     /// </para>
     /// <para>
     /// Nothing is repaired. Re-running the wrapper is not an option — Aspire would keep the cached
@@ -3177,38 +3312,97 @@ public static class DocumentDBBuilderExtensions
 
         if (guard.Seal is { } seal)
         {
-            var current = CaptureTerminalConfigurationSeal(resource);
-
-            if (!SameCallbacks(current.CommandLineCallbacks, seal.CommandLineCallbacks))
+            if (!SameCallbacks(
+                [.. resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>()],
+                seal.CommandLineCallbacks))
             {
                 throw StaleConfiguration(resource, "a command-line callback was added or removed");
             }
 
-            if (!SameCallbacks(current.EnvironmentCallbacks, seal.EnvironmentCallbacks))
+            if (!SameCallbacks(
+                [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
+                seal.EnvironmentCallbacks))
             {
                 throw StaleConfiguration(resource, "an environment callback was added or removed");
             }
 
-            if (!SameCallbacks(current.RuntimeCallbacks, seal.RuntimeCallbacks))
+            if (!SameCallbacks(
+                [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
+                seal.RuntimeCallbacks))
             {
                 throw StaleConfiguration(resource, "a container-runtime-argument callback was added or removed");
             }
 
-            if (!string.Equals(current.Entrypoint, seal.Entrypoint, StringComparison.Ordinal))
+            if (!string.Equals(resource.Entrypoint, seal.Entrypoint, StringComparison.Ordinal))
             {
                 throw StaleConfiguration(resource, "its container entrypoint changed");
             }
 
-            if (!current.Image.Equals(seal.Image))
+            if (!ResolveEffectiveImage(resource).Equals(seal.Image))
             {
                 throw StaleConfiguration(resource, "the image it will run changed");
             }
+
+            VerifyTerminalCommandSeal(resource, seal.Command);
         }
 
         // The storage rules answer in the environment pipeline, which is gathered separately from
         // the command line and can be gathered on its own, so they record their own verdict and
         // are checked from the same two checkpoints rather than from a second set.
         VerifyDataStorageSeal(resource);
+    }
+
+    /// <summary>
+    /// Re-checks the load-bearing fixed prefix in the immutable command result against the model
+    /// that is about to be serialized.
+    /// </summary>
+    /// <remarks>
+    /// Aspire freezes a callback result as an immutable list. Once callback membership is
+    /// unchanged, the caller arguments cannot rewrite the recorded prefix behind this check, so
+    /// only the fixed tokens and script need to be retained; caller values are neither stored nor
+    /// resolved.
+    /// </remarks>
+    private static void VerifyTerminalCommandSeal(
+        DocumentDBServerResource resource,
+        TerminalCommandSeal command)
+    {
+        var requirement = ResolveOpenTelemetryGatewayConfigurationRequirement(resource);
+
+        if (requirement != command.GatewayRequirement)
+        {
+            throw StaleConfiguration(
+                resource,
+                "whether its cached command needs the OpenTelemetry compatibility wrapper changed");
+        }
+
+        if (requirement != GatewayConfigurationRequirement.Required)
+        {
+            if (command.WrapperScript is not null)
+            {
+                throw StaleConfiguration(
+                    resource,
+                    "its cached command carries an OpenTelemetry compatibility wrapper that is no longer applicable");
+            }
+
+            return;
+        }
+
+        var configuration = resource.Annotations
+            .OfType<OpenTelemetryGatewayConfigurationAnnotation>()
+            .Single();
+        var expectedScript = BuildOpenTelemetryGatewayConfigurationScript(configuration);
+
+        if (command.WrapperScript is null ||
+            !string.Equals(command.ShellOption, GatewayConfigurationShellCommandOption, StringComparison.Ordinal) ||
+            !command.ScriptIsSecondArgument ||
+            !string.Equals(command.Delimiter, GatewayConfigurationShellArgumentZero, StringComparison.Ordinal) ||
+            command.HasDuplicateWrapperScript ||
+            !string.Equals(command.WrapperScript, expectedScript, StringComparison.Ordinal))
+        {
+            throw StaleConfiguration(
+                resource,
+                "its cached OpenTelemetry wrapper prefix, script or delimiter no longer matches the terminal command");
+        }
     }
 
     /// <summary>
