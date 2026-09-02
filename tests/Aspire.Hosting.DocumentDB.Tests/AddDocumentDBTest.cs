@@ -8,6 +8,7 @@ using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
 
@@ -1604,18 +1605,35 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithPostgresEndpointGuardDoesNotFireDuringManifestGeneration()
+    public async Task WithPostgresEndpointFloorRejectsSerializingAPreV0_112_0Image()
     {
-        // Manifest generation goes through Aspire's publish pipeline, which does NOT
-        // publish BeforeResourceStartedEvent (no container is started). The guard must
-        // not interfere with `azd publish` / `--publisher manifest` flows, even when
-        // pinning a pre-v0.112 tag.
+        // The floor is a property of the image, not of the mode the app host is running in: a
+        // manifest that names an image whose entrypoint cannot accept the credentials the same
+        // manifest publishes describes a deployment that cannot authenticate. Serialization is
+        // the publish counterpart of the run checkpoint, so it refuses with the same guidance.
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
             .WithImageTag("pg17-0.111.0")
             .WithPostgresEndpoint();
 
-        // Generating the manifest must not throw.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ManifestUtils.GetManifest(documentDB.Resource));
+
+        Assert.Contains("pg17-0.111.0", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("0.112.0", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresEndpoint", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ManifestGenerationIsUnaffectedForAnImageThatSatisfiesTheFloor()
+    {
+        // The counterpart of the test above: publishing a resource whose image is legal is
+        // untouched by the checkpoint, bindings and all.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.112.0")
+            .WithPostgresEndpoint();
+
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
         Assert.NotNull(manifest);
@@ -1760,6 +1778,311 @@ public class AddDocumentDBTests
 
         Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
+
+    // ---------------------------------------------------------------------
+    // Final effective image: the floors above are reported by ordinary
+    // BeforeResourceStartedEvent subscribers, and a subscriber registered
+    // after AddDocumentDB runs after them. Nothing publishes another event
+    // between that point and the container's creation, and a publish raises
+    // no per-resource event at all, so the floors are applied again where
+    // Aspire caches nothing: the container-runtime-arguments callback in a
+    // run and the manifest publishing callback in a publish.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ALateSubscriberDowngradingAWithPostgresEndpointResourceFailsTheRunCheckpoint()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag("pg17-0.111.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+        var resource = SingleServerResource(app);
+
+        // Every subscriber the run publishes has completed, and the one this package registered
+        // judged the default image before the change - so the event alone clears the resource.
+        await PublishBeforeResourceStartedAsync(app, resource);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("pg17-0.111.0", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("0.112.0", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresEndpoint", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateSubscriberSelectingAnUnpublishedPg18ImageFailsTheRunCheckpoint()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresVersion(DocumentDBPostgresVersion.Pg18);
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag("pg18-0.113.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+        var resource = SingleServerResource(app);
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("pg18-0.113.0", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("0.114.0", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresVersion", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateSubscriberSwitchingToACompatibleImageIsAccepted()
+    {
+        // Changing the image late is legitimate. Only an image that cannot work is refused.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag("pg17-0.114.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+        var resource = SingleServerResource(app);
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Theory]
+    [InlineData("nightly")]
+    [InlineData("pg18-0.113.0-rc.1")]
+    public async Task ALateSubscriberSwitchingToAnUnrecognisedTagIsNotJudgedByTheRunCheckpoint(string tag)
+    {
+        // The checkpoint applies the same policy as the event, so the documented carve-outs
+        // survive it: a tag outside the curated grammar carries no version to judge.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag(tag);
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+        var resource = SingleServerResource(app);
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task ALateSubscriberSwitchingToACustomImageIsNotJudgedByTheRunCheckpoint()
+    {
+        // A fork publishing under its own name decides its own matrix, late as well as early.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImage("forks/my-build", "pg18-0.110.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+        var resource = SingleServerResource(app);
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task ALateSubscriberPinningADigestIsNotJudgedByTheRunCheckpoint()
+    {
+        // WithImageSHA256 clears the tag, which is what leaves nothing for the floor to read:
+        // the runtime resolves the digest, so no published release is named at all.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag("pg17-0.111.0").WithImageSHA256(OlderReleaseDigest);
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+        var resource = SingleServerResource(app);
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+        Assert.Null(Assert.Single(resource.Annotations.OfType<ContainerImageAnnotation>()).Tag);
+    }
+
+    [Fact]
+    public async Task ALateBeforePublishSubscriberDowngradingAWithPostgresEndpointResourceFailsPublication()
+    {
+        // A subscriber registered after AddDocumentDB gets the last BeforePublishEvent, which is
+        // after every phase this package can use to look at the model. It gathers the resource's
+        // configuration first, so the change lands behind a command line that is already frozen -
+        // which is exactly the sequence that leaves serialization as the only remaining check.
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.WithImageTag("pg17-0.111.0");
+            });
+        });
+
+        Assert.Contains("pg17-0.111.0", log, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresEndpoint() requires DocumentDB", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateBeforePublishSubscriberSelectingAnUnpublishedPg18ImageFailsPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithPostgresVersion(DocumentDBPostgresVersion.Pg18);
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.WithImageTag("pg18-0.113.0");
+            });
+        });
+
+        Assert.Contains("pg18-0.113.0", log, StringComparison.Ordinal);
+        Assert.Contains("upstream only publishes pg18 images from DocumentDB v0.114.0", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateBeforePublishSubscriberSwitchingToACompatibleImagePublishesIt()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.WithImageTag("pg17-0.114.0");
+            });
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(
+            $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-0.114.0",
+            resource!["image"]?.GetValue<string>());
+        Assert.NotNull(resource["bindings"]?["postgres"]);
+    }
+
+    [Fact]
+    public async Task APublishedManifestIsUnchangedForALegalResource()
+    {
+        // The checkpoint holds the last manifest callback, so what it writes has to be exactly
+        // what Aspire would have written without it.
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB"));
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        var expected = $$"""
+            {
+              "type": "container.v0",
+              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true",
+              "image": "{{DocumentDBContainerImageTags.Registry}}/{{DocumentDBContainerImageTags.Image}}:{{DocumentDBContainerImageTags.Tag}}",
+              "env": {
+                "USERNAME": "admin",
+                "PASSWORD": "{DocumentDB-password.value}"
+              },
+              "bindings": {
+                "tcp": {
+                  "scheme": "tcp",
+                  "protocol": "tcp",
+                  "transport": "tcp",
+                  "targetPort": 10260
+                }
+              }
+            }
+            """;
+
+        Assert.Equal(expected, resource!.ToString());
+    }
+
+    [Fact]
+    public async Task ExcludeFromManifestStillOmitsTheResourceAndIsNotJudged()
+    {
+        // ExcludeFromManifest() is the deliberate boundary: a resource that emits nothing has no
+        // published image to judge, so the checkpoint takes itself out rather than failing it.
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg18-0.113.0")
+                .ExcludeFromManifest());
+
+        Assert.Null(manifest["resources"]?["DocumentDB"]);
+    }
+
+    /// <summary>
+    /// Invokes the resource's container-runtime-argument callbacks the way Aspire's container
+    /// creator does: in annotation order, over one shared list, with no result cache — which is
+    /// what makes this the run's unconditional checkpoint.
+    /// </summary>
+    private static async Task<string[]> RunContainerRuntimeArgsAsync(DocumentDBServerResource resource)
+    {
+        var args = new List<object>();
+        var context = new ContainerRuntimeArgsCallbackContext(args, CancellationToken.None);
+
+        foreach (var annotation in resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>())
+        {
+            await annotation.Callback(context);
+        }
+
+        return [.. args.Select(argument => argument as string ?? argument.ToString()!)];
+    }
+
+    /// <summary>
+    /// Reads the resource's arguments and environment through Aspire's own gatherer, which is what
+    /// freezes each callback's result for the rest of the publish.
+    /// </summary>
+    private static async Task GatherPublishConfigurationAsync(
+        DocumentDBServerResource resource,
+        CancellationToken cancellationToken)
+    {
+        await ExecutionConfigurationBuilder.Create(resource)
+            .WithArgumentsConfig()
+            .WithEnvironmentVariablesConfig()
+            .BuildAsync(
+                new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                NullLogger.Instance,
+                cancellationToken);
+    }
+
+    private static DocumentDBServerResource SingleServerResource(DistributedApplication app) =>
+        Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+    // A real digest of a published documentdb-local image, embedded as a literal so nothing here
+    // depends on the registry or on a tag upstream can move.
+    private const string OlderReleaseDigest =
+        "8c8a716e27f398b03c397424c4ddd901bddbc22b9f910b17096b0b246c7c9011";
 
     private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)
     {
