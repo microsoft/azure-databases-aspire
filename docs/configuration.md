@@ -657,8 +657,7 @@ never mistaken for one.
 **A digest beats every tag.** A reference can carry both — `repository:pg17-0.116.0@sha256:...`, or
 an inline tag beside a `WithImageSHA256(...)` digest, or the reverse — and the runtime resolves the
 digest and ignores the tag. The version is therefore unknown for such a reference no matter what the
-tag reads, so no version-dependent behaviour is applied to it: no declared-`/data`-volume warning,
-no interlock and so no `WithExplicitStart()` downgrade of a shared data directory, and neither the
+tag reads, so no version-dependent behaviour is applied to it: neither the
 `WithPostgresEndpoint()` credential floor nor the `Pg18` publish floor is enforced or refused on the
 strength of the tag. The repository is still recognised, which is what lets
 `WithOpenTelemetryMetrics(...)` reject the pin with an actionable message rather than silently skip
