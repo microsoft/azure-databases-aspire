@@ -279,8 +279,9 @@ One narrow case is downgraded to a warning: both resources resolve to a recognis
 later tag **and** one of them is started manually with `WithExplicitStart()`. There the pair may
 never run at the same time, and if they do, the image refuses the second start loudly rather than
 corrupting anything. When either side is an older, unrecognised, or custom image — or is built
-from your own Dockerfile, whatever its image annotation says — the combination stays a hard failure
-even with `WithExplicitStart()`, because there is no interlock to fall back on.
+from your own Dockerfile or pinned by digest, whatever its image annotation says — the combination
+stays a hard failure even with `WithExplicitStart()`, because there is no interlock to fall back
+on.
 
 Sharing storage that is *not* the peer's data directory is not a conflict: a resource may point
 `WithInitData(...)` or `WithTlsCertificate(...)` at the same host directory another resource uses
@@ -513,8 +514,11 @@ publisher carries the required runtime file override. Failing explicitly avoids 
 deployment where metrics are silently disabled. Explicitly disabling metrics does not require the
 override and remains publishable. Direct AppHost run mode is supported. A custom image with
 corrected upstream telemetry configuration is not subject to this guard, and neither is a resource
-built from your own Dockerfile — even one whose image annotation names the official image and that
-exact tag, because what starts is the build output. A private registry mirror that keeps the
+built from your own Dockerfile or pinned by digest — even one whose image annotation names the
+official image and that exact tag, because what starts is the build output or whatever the digest
+resolves to. A digest pin is reported once as a warning rather than passed over in silence, because
+the override it might have needed is withheld: see
+[How the image is recognised](#how-the-image-is-recognised). A private registry mirror that keeps the
 official `documentdb/documentdb-local:pgNN-0.116.0` image path and tag receives the same
 compatibility override and publish guard.
 
@@ -819,8 +823,13 @@ tag reads, so no version-dependent behaviour is applied to it: no declared-`/dat
 no interlock and so no `WithExplicitStart()` downgrade of a shared data directory, and neither the
 `WithPostgresEndpoint()` credential floor nor the `Pg18` publish floor is enforced or refused on the
 strength of the tag. The repository is still recognised, which is what lets
-`WithOpenTelemetryMetrics(...)` reject the pin with an actionable message rather than silently skip
-it; a digest on a repository this package does not publish is left alone as any custom image is.
+`WithOpenTelemetryMetrics(...)` say something about the pin rather than skip it silently: the
+`0.116.0` compatibility configuration is withheld — it rewrites a file at a path known only for
+that release — the resource stays publishable, and a one-time warning goes to the AppHost log under
+`Aspire.Hosting.DocumentDB.WithOpenTelemetryMetrics` stating that the digest supersedes the tag,
+that the override was not applied, that the image's own `SetupConfiguration.json` may shadow the
+`OTEL_*` variables, and that the recovery is to select by tag or configure telemetry inside the
+image. A digest on a repository this package does not publish is left alone as any custom image is.
 
 ### Building your own image from a Dockerfile
 

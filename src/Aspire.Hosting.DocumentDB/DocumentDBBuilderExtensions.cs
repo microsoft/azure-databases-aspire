@@ -18,6 +18,22 @@ public static class DocumentDBBuilderExtensions
     private sealed class OpenTelemetryEnvironmentConfigurationAnnotation : IResourceAnnotation
     {
         public bool MetricsEnabled { get; set; }
+
+        /// <summary>
+        /// The AppHost's services, captured when the application starts. The environment callback
+        /// cannot ask <see cref="DistributedApplicationExecutionContext"/> for them — that
+        /// property throws when no provider is attached — and the pass Aspire makes over the
+        /// callbacks while discovering a container's dependencies carries no logger, so a
+        /// warning written to the context's logger alone would be discarded on a real start.
+        /// </summary>
+        public IServiceProvider? Services { get; set; }
+
+        /// <summary>
+        /// One-shot guard for the digest advisory. It lives on the annotation, not on a callback,
+        /// because every <c>WithOpenTelemetryMetrics</c> call appends its own callback and the
+        /// advisory is about the resource.
+        /// </summary>
+        public int DigestAdvisoryLogged;
     }
 
     // default internal port is 10260.
@@ -48,6 +64,7 @@ public static class DocumentDBBuilderExtensions
     private const string AllowExternalConnectionsEnvVarName = "ALLOW_EXTERNAL_CONNECTIONS";
 
     private const string PostgresEndpointLoggerCategory = "Aspire.Hosting.DocumentDB.WithPostgresEndpoint";
+    private const string OpenTelemetryLoggerCategory = "Aspire.Hosting.DocumentDB.WithOpenTelemetryMetrics";
     private const string StorageLoggerCategory = "Aspire.Hosting.DocumentDB.Storage";
 
     private const string DefaultMountedDataPath = "/data";
@@ -1861,8 +1878,9 @@ public static class DocumentDBBuilderExtensions
               "the data directory'."
             : "At least one of the two runs an image with no data-directory interlock (DocumentDB " +
               "before v" + DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion +
-              ", an unrecognised tag, a custom image, or a Dockerfile build), so nothing refuses " +
-              "the second start: two PostgreSQL instances would open the same data directory and " +
+              ", an unrecognised tag, a custom image, a Dockerfile build, or an image pinned by " +
+              "digest, whose version the tag beside it does not settle), so nothing refuses the " +
+              "second start: two PostgreSQL instances would open the same data directory and " +
               "corrupt it silently.";
 
         var explicitStart = explicitStartNote
@@ -2142,9 +2160,12 @@ public static class DocumentDBBuilderExtensions
     /// image configuration, this method replaces that file when metrics are enabled with the
     /// stable gateway defaults but no telemetry section, so the environment variables documented
     /// below remain authoritative. A caller-supplied <c>CONFIG_DIR</c> remains authoritative and
-    /// is not replaced. Custom images, unrecognised tags and resources built from your own
-    /// Dockerfile are left alone — the last of those even when the resource's image annotation
-    /// names the official image and a recognised tag, because what runs is the build output. Aspire publish mode is rejected with an actionable error when metrics are
+    /// is not replaced. Custom images, unrecognised tags, digest-pinned references and resources
+    /// built from your own Dockerfile are left alone — the last two even when the resource's image
+    /// annotation names the official image and a recognised tag, because what runs is the build
+    /// output or whatever the digest resolves to. A digest pin also stays publishable, and is
+    /// reported once as a warning, because withholding the override silently would leave a caller
+    /// who asked for metrics with none and nothing said about it. Aspire publish mode is rejected with an actionable error when metrics are
     /// enabled for the official v0.116-0 image, because not every publisher carries the required
     /// runtime file override. Explicitly disabled metrics remain publishable. Direct AppHost run
     /// mode is supported.
@@ -2260,6 +2281,12 @@ public static class DocumentDBBuilderExtensions
 
         return builder.WithEnvironment(context =>
         {
+            if (context.Resource is DocumentDBServerResource digestPinnedResource &&
+                ResolveEffectiveImage(digestPinnedResource).Origin == DocumentDBImageOrigin.DigestPinned)
+            {
+                WarnOnceThatADigestPinHidesTheTelemetryCompatibility(digestPinnedResource, context);
+            }
+
             if (context.ExecutionContext.IsPublishMode &&
                 context.Resource is DocumentDBServerResource resource &&
                 IsOpenTelemetryCompatibilityEnabled(resource) &&
@@ -2331,6 +2358,15 @@ public static class DocumentDBBuilderExtensions
             MetricsEnabled = metricsEnabled,
         };
         builder.Resource.Annotations.Add(configuration);
+
+        // Both the orchestrator and the manifest publisher raise this before they read the
+        // resource, so the advisory has a logger to reach in run mode and in publish mode alike.
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((evt, _) =>
+        {
+            configuration.Services ??= evt.Services;
+            return Task.CompletedTask;
+        });
+
         builder.WithContainerFiles(
             DefaultGatewayConfigurationPath,
             (_, _) =>
@@ -2353,6 +2389,56 @@ public static class DocumentDBBuilderExtensions
 
                 return Task.FromResult(entries);
             });
+    }
+
+    /// <summary>
+    /// Warns once that a digest pin leaves the telemetry compatibility question unanswerable, so
+    /// the override is not applied and the environment variables this method writes may be
+    /// ignored by the image.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Withholding the override on an image whose version is unknown is the conservative choice —
+    /// it rewrites a file at a path that is a property of one published release — but withholding
+    /// it silently would leave a caller who asked for metrics with a container that exports none
+    /// and nothing said about it. The advisory is raised whenever the API is configured at all,
+    /// including <c>enabled: false</c>, because a configuration file can turn metrics on from JSON
+    /// and that decision is equally beyond reach here.
+    /// </para>
+    /// <para>
+    /// Nothing but the resource name and a version constant is written. The digest is not repeated:
+    /// the message is about the shape of the configuration, and the resource name already says
+    /// which one.
+    /// </para>
+    /// </remarks>
+    private static void WarnOnceThatADigestPinHidesTheTelemetryCompatibility(
+        DocumentDBServerResource resource,
+        EnvironmentCallbackContext context)
+    {
+        var configuration = resource.Annotations
+            .OfType<OpenTelemetryEnvironmentConfigurationAnnotation>()
+            .SingleOrDefault();
+
+        if (configuration is null ||
+            Interlocked.CompareExchange(ref configuration.DigestAdvisoryLogged, 1, 0) != 0)
+        {
+            return;
+        }
+
+        var logger = configuration.Services?.GetService<ILoggerFactory>()?.CreateLogger(OpenTelemetryLoggerCategory)
+            ?? context.Logger;
+
+        logger?.LogWarning(
+            "DocumentDB resource '{ResourceName}' pins its container image by digest. The digest " +
+            "supersedes the tag, so the DocumentDB version that will run cannot be determined and " +
+            "WithOpenTelemetryMetrics() cannot tell whether that image needs the telemetry " +
+            "configuration compatibility override v{AffectedVersion} requires. The override is " +
+            "therefore NOT applied: if the pinned image is that version, its own " +
+            "SetupConfiguration.json takes precedence over the OTEL_* environment variables this " +
+            "method writes and they will be silently ignored. Recovery: select the image by tag " +
+            "instead of by digest, or configure telemetry inside the image the digest names.",
+            resource.Name,
+            OpenTelemetryConfigurationAffectedVersion);
     }
 
     private static bool IsOpenTelemetryCompatibilityEnabled(DocumentDBServerResource resource) =>

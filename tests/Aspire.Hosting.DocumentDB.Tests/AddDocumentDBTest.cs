@@ -1422,6 +1422,7 @@ public class AddDocumentDBTests
             () => ConfigureResourceAsync(app, "standby"));
 
         Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("an image pinned by digest", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
     }
 
@@ -3790,6 +3791,135 @@ public class AddDocumentDBTests
 
         // The publish rejection follows the same classification, so this stays publishable.
         Assert.NotNull(await ManifestUtils.GetManifest(documentDB.Resource));
+    }
+
+    /// <summary>
+    /// Withholding the compatibility override on an image whose version cannot be determined is
+    /// the conservative choice, but withholding it silently would leave a caller who asked for
+    /// metrics with a container exporting none and nothing said about it.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task WithOpenTelemetryMetricsWarnsOnceAboutADigestPinnedImage(
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithOpenTelemetryMetrics();
+        SetImageAnnotation(documentDB, image, tag, sha256);
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("pins its container image by digest", message, StringComparison.Ordinal);
+        Assert.Contains("digest supersedes the tag", message, StringComparison.Ordinal);
+        Assert.Contains("cannot be determined", message, StringComparison.Ordinal);
+        Assert.Contains("NOT applied", message, StringComparison.Ordinal);
+        Assert.Contains("SetupConfiguration.json takes precedence over the OTEL_* environment variables", message, StringComparison.Ordinal);
+        Assert.Contains("select the image by tag instead of by digest", message, StringComparison.Ordinal);
+        Assert.Contains("configure telemetry inside the image", message, StringComparison.Ordinal);
+
+        // Nothing about the pin itself is repeated: the resource name already identifies it.
+        Assert.DoesNotContain(OlderReleaseDigest, message, StringComparison.Ordinal);
+
+        // The environment half of the API still applies.
+        Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]);
+    }
+
+    /// <summary>
+    /// The advisory is about the resource, so repeated calls do not repeat it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWarnsOnlyOnceAcrossRepeatedCalls()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics(endpoint: "http://collector:4317")
+            .WithOpenTelemetryMetrics(enabled: false);
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+    }
+
+    /// <summary>
+    /// A digest pin is publishable on this branch — the override it would need is withheld, so
+    /// there is nothing for a publisher to carry — and the advisory reaches publish mode too.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesADigestPinnedImageAndWarns()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithOpenTelemetryMetrics();
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Contains($"@sha256:{OlderReleaseDigest}", manifest["image"]?.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Equal("true", manifest["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+
+        var (_, category, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Equal("Aspire.Hosting.DocumentDB.WithOpenTelemetryMetrics", category);
+        Assert.Contains("pins its container image by digest", message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An image selected by tag answers the question, so there is nothing to advise about.
+    /// </summary>
+    [Theory]
+    [InlineData(InterlockedTag)]
+    [InlineData("pg17-0.114.0")]
+    public async Task WithOpenTelemetryMetricsDoesNotWarnWhenTheImageIsSelectedByTag(string tag)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(tag).WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A digest on a repository this package does not publish was never going to get the override,
+    /// so there is nothing withheld and nothing to report.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDoesNotWarnAboutADigestPinnedCustomImage()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage($"contoso/documentdb-local:{InterlockedTag}")
+            .WithImageSHA256(OlderReleaseDigest)
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
 
     [Theory]
