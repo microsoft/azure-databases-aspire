@@ -153,8 +153,9 @@ early — `ExecutionConfigurationBuilder`, or the obsolete `GetArgumentValuesAsy
 `IDistributedApplicationLifecycleHook` — and *then* changing the resource therefore drops the
 recorded wrapper from the command line without re-running anything that would notice.
 
-The wrapper records what its answer depended on and compares it at the last point the app host runs
-unconditionally: a container-runtime-arguments callback in a run, `BeforePublishEvent` in a publish.
+The wrapper records what its answer depended on and compares it at the last points the app host runs
+unconditionally: a container-runtime-arguments callback in a run, and — in a publish —
+`BeforePublishEvent` and again while the resource is being serialized into the manifest.
 A mismatch fails the resource before the container is created or the manifest is written, and names
 what kind of thing changed — callbacks, entrypoint, or image — without repeating a value, because
 whatever changed the model may be carrying a secret.
@@ -363,6 +364,14 @@ Or the application fails to start with an `InvalidOperationException` saying two
 **Cause:** the storage guard is appended when the application starts and moved back to the end of the environment pipeline immediately before the resource starts, so it sees the final `DATA_PATH`; its command-line rule is a step of the resource's single package-owned command-line callback, which gets the same treatment. Something appended another callback after that — a `BeforeResourceStartedEvent` subscriber registered after `AddDocumentDB`, or, in publish mode where no such event is published, an `IDistributedApplicationLifecycleHook`. The guard cannot vouch for a configuration that is still changing, so the resource is failed rather than started on an unchecked data directory. The command-line message is shared with the `WithOpenTelemetryMetrics(...)` gateway wrapper, which needs the same last position for a different reason: `/bin/bash` reads its command from the first arguments, so a callback that ran after it could displace the whole wrapper.
 
 **Solution:** make the configuration part of the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`, `WithArgs(...)` — instead of adding it after the model is built. Any `WithArgs(...)` written while the model is being built is fine, in any order and however it mutates the list. If a subscriber must add it, register that subscriber before `AddDocumentDB`.
+
+### A change made after the storage was checked fails the resource
+
+**Symptom:** starting or publishing the resource fails with an `InvalidOperationException` saying it `was changed after its data directory ('/data') had already been checked`, followed by what changed — for example `a volume or bind mount was added, removed or changed`.
+
+**Cause:** Aspire records each callback's result the first time it runs and reuses it for the rest of the run. Something built the resource's configuration early — `ExecutionConfigurationBuilder` (or the obsolete `GetEnvironmentVariableValuesAsync`) from an `IDistributedApplicationLifecycleHook` or an event subscriber — and then changed the resource. Storage lives in annotations, so a volume or bind mount added afterwards changes what the container really mounts without any rule running again. The guard records what it judged and compares it at the container-runtime-arguments callback in a run and while the resource is serialized in a publish, and fails the resource rather than starting it on a data directory nothing checked.
+
+**Solution:** finish configuring the resource before anything reads its configuration, or make the change part of the application model (`WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`) while it is being built. Re-declaring the same storage is not a change: the mounts are compared by value, so replacing a mount with an identical one, or reordering them, is accepted.
 
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 

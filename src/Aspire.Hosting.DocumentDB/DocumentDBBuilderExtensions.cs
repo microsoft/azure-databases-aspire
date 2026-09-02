@@ -54,6 +54,14 @@ public static class DocumentDBBuilderExtensions
         public ContainerRuntimeArgsCallbackAnnotation RuntimeCheckpoint { get; set; } = null!;
 
         /// <summary>
+        /// The manifest publishing callback. It is the publish counterpart of
+        /// <see cref="RuntimeCheckpoint"/>: it runs while the resource is being serialized, which
+        /// is later than any model event — so no subscriber can be registered after it — and it
+        /// hands the writing on to whatever would have written the resource anyway.
+        /// </summary>
+        public ManifestPublishingCallbackAnnotation ManifestCheckpoint { get; set; } = null!;
+
+        /// <summary>
         /// What the resource looked like when the command-line callback last produced a result, or
         /// <see langword="null"/> if it has not run yet.
         /// </summary>
@@ -1487,7 +1495,10 @@ public static class DocumentDBBuilderExtensions
             if (dataPath is null)
             {
                 // Publish mode with a deferred DATA_PATH: the manifest carries an expression, not
-                // a path, and there is nothing here that can be compared with a mount target.
+                // a path, and there is nothing here that can be compared with a mount target. The
+                // seal is still recorded, because "this resource mounts nothing" is exactly the
+                // observation a mount added afterwards would contradict.
+                guard!.Seal = CaptureDataStorageSeal(resource, dataPath: null);
                 return;
             }
 
@@ -1535,6 +1546,8 @@ public static class DocumentDBBuilderExtensions
                     DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion,
                     DefaultMountedDataPath);
             }
+
+            guard!.Seal = CaptureDataStorageSeal(resource, dataPath);
         });
 
         guard = new DataStorageGuardAnnotation(environmentCallback) { Services = services };
@@ -1600,10 +1613,188 @@ public static class DocumentDBBuilderExtensions
         public EnvironmentCallbackAnnotation Environment { get; } = environment;
 
         /// <summary>
+        /// What the storage rules judged, or <see langword="null"/> before they have run.
+        /// </summary>
+        public DataStorageSeal? Seal { get; set; }
+
+        /// <summary>
         /// The AppHost's services, captured from whichever event installed or re-established the
         /// guard, so its advisory warnings can reach a logger that is really wired up.
         /// </summary>
         public IServiceProvider? Services { get; set; }
+    }
+
+    /// <summary>
+    /// Everything the data-storage rules read, as it stood when they produced the verdict Aspire
+    /// recorded.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The storage counterpart of <see cref="TerminalConfigurationSeal"/>, and it exists for the
+    /// same reason: Aspire evaluates each callback annotation at most once per run and reuses the
+    /// recorded result afterwards. Storage is the sharpest form of that problem, because a volume
+    /// or bind mount is a plain annotation: adding one after the environment pipeline has been
+    /// gathered — from an <see cref="Lifecycle.IDistributedApplicationLifecycleHook"/>, or from any
+    /// subscriber that builds the configuration through the public
+    /// <see cref="ExecutionConfigurationBuilder"/> first — changes what the container really
+    /// mounts without running a single line of this package's code again. A read-only mount over
+    /// the data directory added that way would start a container DocumentDB cannot initialise, and
+    /// a shared volume added that way would put two clusters on one directory.
+    /// </para>
+    /// <para>
+    /// It is a second recording rather than more fields on the command-line seal because the two
+    /// are made at different moments — the storage rules answer in the environment pipeline, which
+    /// a caller can gather on its own — but there is still one authority: both are compared by
+    /// <see cref="VerifyTerminalConfigurationSeal"/>, from the same two uncached checkpoints.
+    /// </para>
+    /// <para>
+    /// Everything the verdict depends on is recorded: the mounts themselves, by value rather than
+    /// by instance so that re-declaring the same storage is not reported as a change and so that a
+    /// bare reordering is not either; the membership of the two callback pipelines that can still
+    /// set <c>DATA_PATH</c> or pass a reserved data-path argument, and of the
+    /// container-runtime-argument pipeline, whose callbacks run between the run's checkpoint and
+    /// the gather it protects; the explicit-start setting, which is what decides whether sharing a
+    /// directory is a warning or a failure; and the image, because holding the data directory's
+    /// lock is a property of the release.
+    /// </para>
+    /// </remarks>
+    private sealed record DataStorageSeal(
+        System.Collections.Immutable.ImmutableArray<string> Mounts,
+        System.Collections.Immutable.ImmutableArray<EnvironmentCallbackAnnotation> EnvironmentCallbacks,
+        System.Collections.Immutable.ImmutableArray<CommandLineArgsCallbackAnnotation> CommandLineCallbacks,
+        System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
+        bool ExplicitlyStarted,
+        DocumentDBEffectiveImage Image,
+        string? DataPath);
+
+    private static DataStorageSeal CaptureDataStorageSeal(DocumentDBServerResource resource, string? dataPath) =>
+        new(
+            CaptureDataStorageMounts(resource),
+            [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
+            resource.Annotations.OfType<ExplicitStartupAnnotation>().Any(),
+            ResolveEffectiveImage(resource),
+            dataPath);
+
+    /// <summary>
+    /// The resource's mounts as the storage rules see them: what each one is, where it comes from,
+    /// where it lands and whether it is writable, in a fixed order.
+    /// </summary>
+    /// <remarks>
+    /// By value, because a mount annotation carries no identity worth comparing: replacing one
+    /// with an identical one leaves the container mounting exactly the same storage, and none of
+    /// the rules reads the order they were declared in. Sorting is what makes that true of a
+    /// reordering as well, while still distinguishing a duplicate from a single mount — two mounts
+    /// on one target is itself a failure the rules report.
+    /// </remarks>
+    private static System.Collections.Immutable.ImmutableArray<string> CaptureDataStorageMounts(IResource resource) =>
+        [.. resource.Annotations.OfType<ContainerMountAnnotation>()
+            .Select(DescribeMountForSeal)
+            .OrderBy(description => description, StringComparer.Ordinal)];
+
+    private static string DescribeMountForSeal(ContainerMountAnnotation mount) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            // An anonymous volume has no source at all, which is not the same as an empty one.
+            $"{(int)mount.Type}\u0000{(mount.Source is null ? "-" : "+" + mount.Source)}\u0000{mount.Target}\u0000{(mount.IsReadOnly ? "ro" : "rw")}");
+
+    /// <summary>
+    /// Fails the resource when anything the storage verdict rests on changed after the verdict was
+    /// recorded.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Called from <see cref="VerifyTerminalConfigurationSeal"/>, and so from the two checkpoints
+    /// Aspire never caches: the container-runtime-arguments callback, which a run re-invokes on
+    /// every container creation after the last opportunity a caller has to change anything, and
+    /// the manifest publishing callback, which a publish runs while it serializes the resource —
+    /// later than any model event, so no subscriber can be registered after it.
+    /// </para>
+    /// <para>
+    /// Nothing is repaired and nothing is re-judged. Re-running the rules is not an option: Aspire
+    /// would keep the recorded environment anyway, so a second verdict would describe a container
+    /// that is not the one being created. Starting or publishing on a verdict that has since been
+    /// contradicted is the failure this exists to prevent.
+    /// </para>
+    /// <para>
+    /// No value is reported, only what kind of thing changed: the callback that changed the model
+    /// may well be the one carrying a secret.
+    /// </para>
+    /// </remarks>
+    private static void VerifyDataStorageSeal(DocumentDBServerResource resource)
+    {
+        if (resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault() is not { } guard ||
+            guard.Seal is not { } seal)
+        {
+            return;
+        }
+
+        // Membership catches a pipeline that grew or shrank; being last catches one whose existing
+        // callbacks were reordered around the guard, which changes the last writer just as surely.
+        // The command-line pipeline gets the same treatment from the terminal guard.
+        EnsureGuardRunsLast(resource, guard.Environment, "environment");
+
+        var current = CaptureDataStorageSeal(resource, seal.DataPath);
+
+        if (!current.Mounts.SequenceEqual(seal.Mounts, StringComparer.Ordinal))
+        {
+            throw StaleDataStorageConfiguration(resource, seal, "a volume or bind mount was added, removed or changed");
+        }
+
+        if (!SameCallbacks(current.EnvironmentCallbacks, seal.EnvironmentCallbacks))
+        {
+            throw StaleDataStorageConfiguration(
+                resource, seal, $"an environment callback was added or removed, so {DataPathEnvVarName} is no longer known to be the value that was judged");
+        }
+
+        if (!SameCallbacks(current.CommandLineCallbacks, seal.CommandLineCallbacks))
+        {
+            throw StaleDataStorageConfiguration(
+                resource, seal, "a command-line callback was added or removed, so the reserved data-path arguments were not all scanned");
+        }
+
+        if (!SameCallbacks(current.RuntimeCallbacks, seal.RuntimeCallbacks))
+        {
+            throw StaleDataStorageConfiguration(
+                resource, seal, "a container-runtime-argument callback was added or removed, and those run after this check and before the container's environment is gathered");
+        }
+
+        if (current.ExplicitlyStarted != seal.ExplicitlyStarted)
+        {
+            throw StaleDataStorageConfiguration(
+                resource, seal, "its explicit-start setting changed, which is what decides whether sharing a data directory is a warning or a failure");
+        }
+
+        if (!current.Image.Equals(seal.Image))
+        {
+            throw StaleDataStorageConfiguration(
+                resource, seal, "the image it will run changed, and whether the data directory is interlocked is a property of the release");
+        }
+    }
+
+    private static InvalidOperationException StaleDataStorageConfiguration(
+        DocumentDBServerResource resource,
+        DataStorageSeal seal,
+        string change)
+    {
+        var judged = seal.DataPath is { } dataPath
+            ? $"its data directory ('{dataPath}')"
+            : "its storage (it mounted none)";
+
+        return new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' was changed after {judged} had already been " +
+            $"checked: {change}. Aspire records each callback's result the first time it runs and " +
+            $"reuses it for the rest of the run, so the storage rules cannot be applied again to " +
+            $"the configuration the container or the manifest would actually receive. This usually " +
+            $"comes from building the resource's configuration early — ExecutionConfigurationBuilder " +
+            $"from an IDistributedApplicationLifecycleHook or an event subscriber — and then " +
+            $"changing the resource. The resource is failed instead of being started or published " +
+            $"on an unchecked data directory: a read-only mount there stops DocumentDB from taking " +
+            $"ownership of it, and a shared one puts two clusters on one directory. Recovery: " +
+            $"finish configuring the resource before anything reads its configuration, or make the " +
+            $"change part of the application model (WithDataVolume(), WithDataBindMount(...), " +
+            $"WithEnvironment(\"{DataPathEnvVarName}\", ...)) while it is being built.");
     }
 
     /// <summary>
@@ -2816,9 +3007,30 @@ public static class DocumentDBBuilderExtensions
             return Task.CompletedTask;
         });
 
+        guard.ManifestCheckpoint = new ManifestPublishingCallbackAnnotation(async context =>
+        {
+            VerifyTerminalConfigurationSeal(resource, guard);
+
+            // Whatever would have written this resource had the checkpoint not been installed
+            // still writes it, so the manifest is byte-for-byte the one Aspire would have
+            // produced. A caller's own writer is honoured; with none, this is a container.
+            var displaced = resource.Annotations.OfType<ManifestPublishingCallbackAnnotation>()
+                .LastOrDefault(annotation => !ReferenceEquals(annotation, guard.ManifestCheckpoint));
+
+            if (displaced is null)
+            {
+                await context.WriteContainerAsync(resource).ConfigureAwait(false);
+            }
+            else if (displaced.Callback is { } callback)
+            {
+                await callback(context).ConfigureAwait(false);
+            }
+        });
+
         resource.Annotations.Add(guard);
         resource.Annotations.Add(guard.CommandLineCallback);
         resource.Annotations.Add(guard.RuntimeCheckpoint);
+        EstablishManifestCheckpoint(resource, guard);
 
         void RetakeLastPosition() => RetakeTerminalGuardPositions(resource, guard);
 
@@ -2868,12 +3080,15 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
-    /// Puts both of the package's callbacks back at the end of their pipelines.
+    /// Puts the package's callbacks back at the end of their pipelines.
     /// </summary>
     /// <remarks>
     /// Called at every lifecycle phase, and again by any API that adds a callback of its own after
     /// the guard was installed, so the guard is last from the moment the model is written rather
-    /// than only from the moment the application starts.
+    /// than only from the moment the application starts. The data-storage guard's environment
+    /// callback is moved from here too: it has to be last in its own pipeline for the same reason
+    /// and by the same phases, and publish raises no per-resource event, so this is the only place
+    /// that can put it back after a lifecycle hook has appended one of its own.
     /// </remarks>
     private static void RetakeTerminalGuardPositions(
         DocumentDBServerResource resource,
@@ -2881,6 +3096,41 @@ public static class DocumentDBBuilderExtensions
     {
         MoveToEnd(resource, guard.CommandLineCallback);
         MoveToEnd(resource, guard.RuntimeCheckpoint);
+
+        if (resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault() is { } storage)
+        {
+            MoveToEnd(resource, storage.Environment);
+        }
+
+        EstablishManifestCheckpoint(resource, guard);
+    }
+
+    /// <summary>
+    /// Puts the guard's manifest checkpoint in the position the manifest publisher reads — last —
+    /// unless the resource is excluded from the manifest, in which case it is taken out again.
+    /// </summary>
+    /// <remarks>
+    /// The publisher runs the <em>last</em> <see cref="ManifestPublishingCallbackAnnotation"/> and
+    /// no other, so the checkpoint has to hold that position to run at all, and has to hand the
+    /// writing on to whatever it displaced. A callback-less annotation is Aspire's
+    /// <c>ExcludeFromManifest()</c>: the resource is not written at all, so there is no published
+    /// configuration to check and the exclusion is left in place.
+    /// </remarks>
+    private static void EstablishManifestCheckpoint(
+        DocumentDBServerResource resource,
+        TerminalGuardAnnotation guard)
+    {
+        var displaced = resource.Annotations.OfType<ManifestPublishingCallbackAnnotation>()
+            .LastOrDefault(annotation => !ReferenceEquals(annotation, guard.ManifestCheckpoint));
+
+        resource.Annotations.Remove(guard.ManifestCheckpoint);
+
+        if (displaced is not null && displaced.Callback is null)
+        {
+            return;
+        }
+
+        resource.Annotations.Add(guard.ManifestCheckpoint);
     }
 
     /// <summary>
@@ -2925,37 +3175,40 @@ public static class DocumentDBBuilderExtensions
         EnsureTerminalCallbackRunsLast(resource, guard.CommandLineCallback, "command-line");
         EnsureTerminalCallbackRunsLast(resource, guard.RuntimeCheckpoint, "container-runtime-arguments");
 
-        if (guard.Seal is not { } seal)
+        if (guard.Seal is { } seal)
         {
-            return;
+            var current = CaptureTerminalConfigurationSeal(resource);
+
+            if (!SameCallbacks(current.CommandLineCallbacks, seal.CommandLineCallbacks))
+            {
+                throw StaleConfiguration(resource, "a command-line callback was added or removed");
+            }
+
+            if (!SameCallbacks(current.EnvironmentCallbacks, seal.EnvironmentCallbacks))
+            {
+                throw StaleConfiguration(resource, "an environment callback was added or removed");
+            }
+
+            if (!SameCallbacks(current.RuntimeCallbacks, seal.RuntimeCallbacks))
+            {
+                throw StaleConfiguration(resource, "a container-runtime-argument callback was added or removed");
+            }
+
+            if (!string.Equals(current.Entrypoint, seal.Entrypoint, StringComparison.Ordinal))
+            {
+                throw StaleConfiguration(resource, "its container entrypoint changed");
+            }
+
+            if (!current.Image.Equals(seal.Image))
+            {
+                throw StaleConfiguration(resource, "the image it will run changed");
+            }
         }
 
-        var current = CaptureTerminalConfigurationSeal(resource);
-
-        if (!SameCallbacks(current.CommandLineCallbacks, seal.CommandLineCallbacks))
-        {
-            throw StaleConfiguration(resource, "a command-line callback was added or removed");
-        }
-
-        if (!SameCallbacks(current.EnvironmentCallbacks, seal.EnvironmentCallbacks))
-        {
-            throw StaleConfiguration(resource, "an environment callback was added or removed");
-        }
-
-        if (!SameCallbacks(current.RuntimeCallbacks, seal.RuntimeCallbacks))
-        {
-            throw StaleConfiguration(resource, "a container-runtime-argument callback was added or removed");
-        }
-
-        if (!string.Equals(current.Entrypoint, seal.Entrypoint, StringComparison.Ordinal))
-        {
-            throw StaleConfiguration(resource, "its container entrypoint changed");
-        }
-
-        if (!current.Image.Equals(seal.Image))
-        {
-            throw StaleConfiguration(resource, "the image it will run changed");
-        }
+        // The storage rules answer in the environment pipeline, which is gathered separately from
+        // the command line and can be gathered on its own, so they record their own verdict and
+        // are checked from the same two checkpoints rather than from a second set.
+        VerifyDataStorageSeal(resource);
     }
 
     /// <summary>

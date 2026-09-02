@@ -176,6 +176,20 @@ hook — makes the resource fail rather than start on a data directory nothing c
 storage through the application model rather than after it is built, or register such a subscriber
 before `AddDocumentDB`.
 
+Position alone is not enough, because the app host records each callback's result the first time it
+runs and reuses it for the rest of the run. Storage is the sharpest form of that: a volume or bind
+mount is a plain annotation, so anything that builds the resource's configuration early —
+`ExecutionConfigurationBuilder`, the same public API the app host uses, from a lifecycle hook or an
+event subscriber — and only then mounts `/data` read-only, or puts a second resource on the same
+volume, changes what the container mounts without running a single check again. The guard therefore
+records what it judged — the mounts by value, the membership of both callback pipelines,
+`WithExplicitStart()` and the effective image — and it is compared by the same authority, and at the
+same two uncached checkpoints, as the container's command line: a container-runtime-arguments
+callback on every container creation in a run, and the manifest publishing callback in a publish,
+which runs while the resource is serialized and so after every model event. A mismatch fails the
+resource, naming what kind of thing changed and no value. Re-declaring the same storage is not a
+change: replacing a mount with an identical one, or reordering them, is accepted.
+
 In publish mode a `DATA_PATH` supplied as a parameter is a manifest expression, not a path.
 Resolving it is not an option — the value belongs to the deployment, and a parameter may be a
 secret — so a resource that supplies one *and* mounts storage is refused: every rule below would
@@ -671,7 +685,7 @@ comparing it at the two points the app host never caches:
 | Mode | Checkpoint | Runs |
 | --- | --- | --- |
 | Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read |
-| Publish | `BeforePublishEvent` | after every lifecycle hook and before the pipeline serializes anything |
+| Publish | the manifest publishing callback the package adds | while the resource is serialized, after every lifecycle hook and every model event, including ones raised by subscribers registered after `AddDocumentDB` |
 
 If anything changed, the resource is failed — a publish before the manifest is written, a run
 before the container is created. Nothing is repaired at that point: the recorded configuration is
