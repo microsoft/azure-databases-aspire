@@ -213,11 +213,27 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 ### `DATA_PATH` is rejected at start
 
-**Symptom:** starting the resource throws an `InvalidOperationException` saying the resource `sets DATA_PATH to '...'`, which resolves to the container root, escapes above it, or is not absolute.
+**Symptom:** starting the resource throws an `InvalidOperationException` saying the resource `sets DATA_PATH to '...'`, which resolves to the container root, reaches above it, or is not absolute.
 
-**Cause:** the container runtime resolves `.`, `..` and repeated separators before it mounts, so `/data/..` is the container root and `/../data` reaches above it. Docker refuses both (`invalid mount config for type "volume": invalid specification: destination can't be '/'`), and neither is a directory that can hold a PostgreSQL cluster. The value checked is the effective one at start: `WithDataVolume()`/`WithDataBindMount(...)` and any `WithEnvironment("DATA_PATH", ...)` contribute in call order, and the last caller wins.
+**Cause:** the container runtime resolves `.`, `..` and repeated separators before it mounts, so `/data/..` is the container root — which Docker refuses outright (`invalid mount config for type "volume": invalid specification: destination can't be '/'`) — and `/../data` reaches above it. Neither is a directory that can hold a PostgreSQL cluster. The value checked is the effective one: `WithDataVolume()`/`WithDataBindMount(...)` and any `WithEnvironment("DATA_PATH", ...)` contribute in call order, and the last caller wins. An empty `DATA_PATH` is *not* rejected: the entrypoint applies `DATA_PATH=${DATA_PATH:-/data}`, so an empty value is the image's `/data` default and is treated as such.
 
 **Solution:** set `DATA_PATH` to an absolute path below the container root, or leave it to `WithDataVolume()`/`WithDataBindMount(...)`, which mount the container default `/data`. The same rule is applied at the API boundary: `WithDataVolume(targetPath: "/data/..")` throws an `ArgumentException` while the model is being built.
+
+### A mount target above the container root is rejected
+
+**Symptom:** starting the resource throws an `InvalidOperationException` saying it `mounts a volume ... at '/../data', which reaches above the container root`.
+
+**Cause:** Docker does **not** refuse that spelling. It clamps the target to the root and mounts on the clamped destination, so `-v name:/../data` inspects back as `Destination: /data` and collides with a plainly written `/data` as `Duplicate mount point: /data`. The mount therefore lands on a directory the call never named, and can silently become — or collide with — the DocumentDB data directory. (Only a target that clamps all the way to `/`, such as `/data/../..`, is refused by the daemon.)
+
+**Solution:** write the resolved target. `WithVolume("data", "/../data")` means `/data`, so say `/data`. `WithDataVolume(targetPath: ...)` applies the same rule while the model is being built, as an `ArgumentException`.
+
+### `--data-path` or `-d` is rejected
+
+**Symptom:** starting the resource throws an `InvalidOperationException` saying it `passes the command-line argument '--data-path'`.
+
+**Cause:** the container entrypoint accepts `--data-path` and documents it as "Overrides DATA_PATH environment variable" — it runs `export DATA_PATH=$1` while parsing arguments. That is a second channel for the same setting, and one the model does not see: the data directory would move to a path the environment never names, past the read-only, duplicate-mount and shared-data-directory checks, and past the mount that was supposed to back it. `-d` is reserved with it (today's entrypoint answers `Unknown option -d` and exits 1).
+
+**Solution:** set the data directory through storage: `WithDataVolume()`, `WithDataBindMount(...)`, or `WithEnvironment("DATA_PATH", ...)`. Remove the argument.
 
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 

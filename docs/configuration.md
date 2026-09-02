@@ -80,7 +80,7 @@ var server = builder.AddDocumentDB("documentdb")
 |---|---|---|---|
 | `name` | `string?` | Auto-generated | Docker volume name. When `null`, a name is generated from the application and resource names. |
 | `isReadOnly` | `bool` | `false` | Unsupported. Passing `true` throws an `ArgumentException` — see [Storage requirements](#storage-requirements). |
-| `targetPath` | `string?` | `/data` | Path inside the container where the volume is mounted when this helper is used. Must be an absolute container path below `/`. Repeated separators, `.`, and `..` are resolved the way the container runtime resolves them, so `/data/`, `//data`, and `/foo/../data` are the same path; one that resolves to the container root (`/data/..`) or reaches above it (`/../data`) is rejected. |
+| `targetPath` | `string?` | `/data` | Path inside the container where the volume is mounted when this helper is used. Must be an absolute container path below `/`. Repeated separators, `.`, and `..` are resolved the way the container runtime resolves them, so `/data/`, `//data`, and `/foo/../data` are the same path; one that resolves to the container root (`/data/..`) or reaches above it (`/../data`, which the runtime silently clamps onto `/data`) is rejected. |
 
 This method mounts the volume at `targetPath` (which defaults to `/data`, matching the container default) and sets the `DATA_PATH` environment variable to match so DocumentDB writes to the mounted directory.
 
@@ -144,21 +144,53 @@ this package supports.
 ### How the data directory is identified
 
 The rules below apply to the directory the container will really write to, which is the effective
-value of `DATA_PATH` at start. `DATA_PATH` is an ordinary environment variable: `WithDataVolume()`
-and `WithDataBindMount(...)` set it to the path they mount on, and a raw
+value of `DATA_PATH`. `DATA_PATH` is an ordinary environment variable: `WithDataVolume()` and
+`WithDataBindMount(...)` set it to the path they mount on, and a raw
 `WithEnvironment("DATA_PATH", ...)` — a literal, a parameter, or a value computed in an environment
 callback — participates on the same "last call wins" terms as every other Aspire environment
 configuration. Set it after a storage helper and it wins; set it before and the helper wins. When
-nothing sets it, the container's own `/data` default applies.
+nothing sets it — or when it is set to an empty value, which the entrypoint's
+`DATA_PATH=${DATA_PATH:-/data}` treats identically — the container's own `/data` default applies.
+
+The checks run inside the resource's own configuration pipeline, as its last environment callback,
+so they read the final value rather than recomputing it: a callback that answers differently each
+time it runs is evaluated once, and the guard and the container cannot see different directories.
+The canonical path replaces `DATA_PATH`, so the value the container receives is the value that was
+checked. Nothing else is read or resolved — the password and every other environment value are left
+exactly as the callbacks produced them. In publish mode a `DATA_PATH` supplied as a parameter stays
+a manifest expression and is left alone; it is checked when the resource starts.
 
 Container paths are compared the way the container runtime resolves them: repeated separators
 collapse, and `.` and `..` segments are resolved before the mount is created. `/data`, `/data/`,
 `//data` and `/foo/../data` are one directory, so an alias cannot slip past any rule below. A path
-that resolves to the container root (`/data/..`) or reaches above it (`/../data`) is rejected — the
-runtime refuses `destination can't be '/'`, and neither is a directory that can hold a cluster.
+that resolves to the container root (`/data/..`) is rejected, because the runtime refuses it
+outright (`destination can't be '/'`) and the root cannot hold a cluster.
 
-Resolving `DATA_PATH` does not resolve anything else: the password and every other environment
-value are left alone.
+A path that reaches above the root (`/../data`) is rejected too, but for the opposite reason: the
+runtime does **not** refuse it. Docker clamps the target and mounts on `/data`, so the storage lands
+on a directory the call never named — and can silently become, or collide with, the data directory.
+Write the resolved path instead.
+
+A mount does not have to be *on* `DATA_PATH` to back it. A volume mounted at `/data` also supplies
+`/data/cluster`, so if `DATA_PATH` is `/data/cluster` that volume is the data mount and the
+read-only and duplicate rules apply to it. The most specific mount wins, matching on segment
+boundaries: a mount on `/data/cluster` takes precedence over one on `/data`, and `/database` is not
+below `/data`.
+
+### The entrypoint's `--data-path` argument is reserved
+
+The container entrypoint accepts `--data-path`, documented by the image as "Overrides DATA_PATH
+environment variable", and exports it while parsing arguments. Passing it from Aspire would move
+the data directory to a path the environment never names, past every rule below and past the mount
+that was supposed to back it, so the integration refuses it with an `InvalidOperationException`
+before the container is created. `-d` is refused with it: today's entrypoint answers `Unknown option
+-d` and exits, and reserving the conventional short form keeps it from becoming a second channel
+later. Use `WithDataVolume()`, `WithDataBindMount(...)` or `WithEnvironment("DATA_PATH", ...)`
+instead.
+
+Only literal string arguments are examined. An argument supplied as a parameter is left alone:
+inspecting it would mean resolving it a second time, and replacing it with its resolved value would
+discard the sensitivity Aspire tracks for parameters.
 
 ### The data directory must be writable
 
@@ -191,7 +223,18 @@ the directory silently.
 
 Because of this, give every DocumentDB resource its own storage. Two DocumentDB resources in one
 application model whose *data directories* resolve to the same volume name or bind-mount source
-fail at start with an explanatory `InvalidOperationException`.
+fail with an explanatory `InvalidOperationException`. Each resource registers the storage its data
+directory occupies while its own configuration is built, so the second one to reach the same
+storage is the one that fails — which is also the one whose container the image would refuse.
+
+"Same storage" means the same source *and* the same directory inside it. Bind-mount sources are
+compared as host paths, so `/srv/documentdb`, `/srv/documentdb/`, `/srv/documentdb/.` and
+`/srv/documentdb/../documentdb` are one directory. (Symbolic links are not followed: two resources
+aimed at one directory through different links are not detected here, and on `0.116.0` and later the
+container's own lock still refuses the overlap.) When a shared volume is mounted at a common
+ancestor, the subdirectory `DATA_PATH` names is part of the comparison: two resources on one volume
+at `/data/alpha` and `/data/beta` are two clusters and are allowed; two at `/data/cluster` are one
+and are refused.
 
 One narrow case is downgraded to a warning: both resources resolve to a recognised `0.116.0`-or-
 later tag **and** one of them is started manually with `WithExplicitStart()`. There the pair may
@@ -226,9 +269,9 @@ mode `0700`. Consequences:
   valid PostgreSQL data directory`, after which PostgreSQL never starts and the container exits
   non-zero a minute later behind the `PostgreSQL failed to start within 60 seconds` banner. Your
   files are left where they are.
-- Do not put two mounts on the data path (for example `WithDataVolume()` *and*
-  `WithDataBindMount(...)`); the container runtime rejects duplicate mount targets, so the
-  integration fails the start with a clear message instead.
+- Do not put two mounts on the directory that backs the data path (for example `WithDataVolume()`
+  *and* `WithDataBindMount(...)`, or two spellings of one path); the container runtime rejects
+  duplicate mount targets, so the integration fails the start with a clear message instead.
 
 ### Initialization is one-shot per data directory (`0.116.0` and later)
 
@@ -712,7 +755,7 @@ The extension passes these environment variables to the DocumentDB container:
 |---|---|---|
 | `USERNAME` | The configured username | Container creates this user on startup |
 | `PASSWORD` | The configured password | Password for the created user |
-| `DATA_PATH` | Path inside the container for the mounted data directory | Set by `WithDataVolume` and `WithDataBindMount`; can also be set directly with `WithEnvironment("DATA_PATH", ...)`, in which case the last caller wins and the storage guards follow it. When nothing sets it the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
+| `DATA_PATH` | Path inside the container for the mounted data directory | Set by `WithDataVolume` and `WithDataBindMount`; can also be set directly with `WithEnvironment("DATA_PATH", ...)`, in which case the last caller wins and the storage guards follow it. The integration rewrites the value to its canonical form before the container receives it. When nothing sets it — or it is set empty — the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
 | `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Set by `WithLogLevel(...)` |
 | `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |

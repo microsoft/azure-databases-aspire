@@ -526,7 +526,7 @@ public static class DocumentDBBuilderExtensions
     /// <param name="isReadOnly">Unsupported. DocumentDB requires a writable data directory; passing <see langword="true"/> throws.</param>
     /// <param name="targetPath">The target path inside the container. Defaults to /data to match the container default (and the path the image declares as a volume) when this helper is used. Canonicalized the way the container runtime resolves a path, so repeated separators and <c>.</c>/<c>..</c> segments are collapsed before the mount is created.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/>.</returns>
-    /// <exception cref="ArgumentException"><paramref name="isReadOnly"/> is <see langword="true"/>, or <paramref name="targetPath"/> is not an absolute container path below the root — including one that only resolves to the root, such as <c>/data/..</c>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="isReadOnly"/> is <see langword="true"/>, or <paramref name="targetPath"/> is not an absolute container path below the root — including one that only resolves to the root, such as <c>/data/..</c>, and one that reaches above it, such as <c>/../data</c>, which the container runtime silently clamps onto <c>/data</c>.</exception>
     /// <example>
     /// <code>
     /// var server = builder.AddDocumentDB("documentdb")
@@ -652,7 +652,7 @@ public static class DocumentDBBuilderExtensions
                 parameterName);
         }
 
-        return TryCanonicalizeContainerPath(targetPath, out var canonical) switch
+        return ClassifyContainerPath(targetPath, out var canonical) switch
         {
             ContainerPathProblem.None => canonical,
 
@@ -664,9 +664,11 @@ public static class DocumentDBBuilderExtensions
                 parameterName),
 
             ContainerPathProblem.EscapesRoot => throw new ArgumentException(
-                $"The DocumentDB data target path '{targetPath}' escapes above the container root: the " +
-                $"container runtime resolves '..' segments before mounting, and there is nothing above " +
-                $"'/'. Omit the argument to use the container default '{DefaultMountedDataPath}'.",
+                $"The DocumentDB data target path '{targetPath}' reaches above the container root. " +
+                $"There is nothing above '/', so the container runtime silently clamps the target to " +
+                $"'{canonical}' — the mount would land somewhere other than the path written here. " +
+                $"Write the resolved path instead, or omit the argument to use the container default " +
+                $"'{DefaultMountedDataPath}'.",
                 parameterName),
 
             _ => throw new ArgumentException(
@@ -679,17 +681,21 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
-    /// Why an absolute container path could not be canonicalized into a usable mount target.
+    /// Why an absolute container path could not be used as a mount target or data directory as
+    /// written.
     /// </summary>
     private enum ContainerPathProblem
     {
-        /// <summary>The path canonicalized successfully.</summary>
+        /// <summary>The path canonicalized to itself.</summary>
         None,
 
         /// <summary>The path is empty or does not start with '/'.</summary>
         NotAbsolute,
 
-        /// <summary>The path's '..' segments reach above the container root.</summary>
+        /// <summary>
+        /// The path's '..' segments reached above the container root and were clamped there. The
+        /// canonical path is still produced, because that is what the runtime mounts.
+        /// </summary>
         EscapesRoot,
 
         /// <summary>The path canonicalizes to the container root '/'.</summary>
@@ -698,28 +704,35 @@ public static class DocumentDBBuilderExtensions
 
     /// <summary>
     /// Canonicalizes an absolute Linux container path the way the container runtime resolves one
-    /// before mounting: repeated separators collapse, <c>.</c> segments drop out, and <c>..</c>
-    /// segments remove the preceding one.
+    /// before mounting: repeated separators collapse, <c>.</c> segments drop out, <c>..</c>
+    /// segments remove the preceding one, and a <c>..</c> at the root is clamped to the root.
     /// </summary>
     /// <remarks>
     /// <para>
     /// Every storage comparison runs on canonical paths, because Docker compares the resolved
-    /// path and not the string the caller wrote: <c>/data</c>, <c>//data/</c> and
-    /// <c>/foo/../data</c> are one and the same mount target, and comparing them as written would
-    /// let an alias slip past the duplicate, read-only and shared-storage rules.
+    /// path and not the string the caller wrote: <c>/data</c>, <c>//data/</c>, <c>/foo/../data</c>
+    /// and <c>/../data</c> are one and the same mount destination — verified against the daemon,
+    /// which reports <c>Duplicate mount point: /data</c> for any two of them and inspects all of
+    /// them back as <c>/data</c>. Comparing them as written would let an alias slip past the
+    /// duplicate, read-only and shared-storage rules.
     /// </para>
     /// <para>
-    /// A path whose <c>..</c> segments reach above the root and a path that collapses to the root
-    /// are both rejected rather than clamped: neither can be a DocumentDB data directory, and
-    /// silently treating either as <c>/</c> would put the guard's model at odds with what the
-    /// runtime does.
+    /// Clamping is reported rather than hidden. A caller who writes <c>/../data</c> and a runtime
+    /// that mounts <c>/data</c> disagree about where the storage lands, so the canonical path is
+    /// produced (it is what really happens) <em>and</em> <see cref="ContainerPathProblem.EscapesRoot"/>
+    /// is returned so the caller can refuse the spelling.
+    /// </para>
+    /// <para>
+    /// A path that collapses to the root is reported separately: the daemon refuses it outright
+    /// (<c>invalid mount config for type "volume": invalid specification: destination can't be
+    /// '/'</c>), and the root cannot hold a PostgreSQL cluster.
     /// </para>
     /// <para>
     /// Only <c>/</c> separates segments. A backslash is an ordinary character in a Linux file
     /// name, so a Windows-style path is not absolute here and is reported as such.
     /// </para>
     /// </remarks>
-    private static ContainerPathProblem TryCanonicalizeContainerPath(string? path, out string canonical)
+    private static ContainerPathProblem ClassifyContainerPath(string? path, out string canonical)
     {
         canonical = string.Empty;
 
@@ -729,6 +742,7 @@ public static class DocumentDBBuilderExtensions
         }
 
         var segments = new List<string>();
+        var escapedRoot = false;
 
         foreach (var segment in path.Split('/'))
         {
@@ -741,7 +755,9 @@ public static class DocumentDBBuilderExtensions
             {
                 if (segments.Count == 0)
                 {
-                    return ContainerPathProblem.EscapesRoot;
+                    // The runtime clamps here rather than failing, so canonicalization continues.
+                    escapedRoot = true;
+                    continue;
                 }
 
                 segments.RemoveAt(segments.Count - 1);
@@ -757,17 +773,38 @@ public static class DocumentDBBuilderExtensions
         }
 
         canonical = "/" + string.Join('/', segments);
-        return ContainerPathProblem.None;
+        return escapedRoot ? ContainerPathProblem.EscapesRoot : ContainerPathProblem.None;
     }
 
     /// <summary>
+    /// The container path a mount really lands on, or <see langword="null"/> when the runtime
+    /// would refuse the target outright (relative, or collapsing to the root). A target that only
+    /// needed clamping resolves to the clamped path, because that is the destination the runtime
+    /// creates.
+    /// </summary>
+    private static string? ResolveMountTarget(ContainerMountAnnotation mount) =>
+        ClassifyContainerPath(mount.Target, out var canonical) is ContainerPathProblem.None or ContainerPathProblem.EscapesRoot
+            ? canonical
+            : null;
+
+    /// <summary>
     /// Whether a mount lands on <paramref name="canonicalPath"/> once the container runtime has
-    /// resolved the raw target. A target that cannot be canonicalized — relative, or collapsing to
-    /// the root — cannot be a DocumentDB data directory, so it matches nothing.
+    /// resolved the raw target.
     /// </summary>
     private static bool TargetsContainerPath(ContainerMountAnnotation mount, string canonicalPath) =>
-        TryCanonicalizeContainerPath(mount.Target, out var canonical) == ContainerPathProblem.None &&
-        string.Equals(canonical, canonicalPath, StringComparison.Ordinal);
+        string.Equals(ResolveMountTarget(mount), canonicalPath, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Whether <paramref name="canonicalDataPath"/> is inside — or is — the directory a mount on
+    /// <paramref name="canonicalTarget"/> supplies. Both paths are canonical, and the comparison
+    /// is made on segment boundaries so <c>/datastore</c> is not treated as living under
+    /// <c>/data</c>.
+    /// </summary>
+    private static bool BacksContainerPath(string canonicalTarget, string canonicalDataPath) =>
+        string.Equals(canonicalTarget, canonicalDataPath, StringComparison.Ordinal) ||
+        (canonicalDataPath.Length > canonicalTarget.Length &&
+         canonicalDataPath[canonicalTarget.Length] == '/' &&
+         canonicalDataPath.StartsWith(canonicalTarget, StringComparison.Ordinal));
 
     // Host paths are compared case-sensitively only where the platform's filesystem is,
     // so a bind mount reused as "C:\Data" and "c:\data" is still recognised as shared.
@@ -775,24 +812,65 @@ public static class DocumentDBBuilderExtensions
         OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
 
     /// <summary>
-    /// Subscribes a <see cref="BeforeResourceStartedEvent"/> handler that rejects data-directory
-    /// mounts the DocumentDB Local container cannot use, before the container is started and fails
-    /// with a misleading message.
+    /// Canonicalizes a bind mount's host path with host semantics, so aliases of one directory
+    /// compare equal: <c>/srv/documentdb</c>, <c>/srv/documentdb/</c>, <c>/srv/documentdb/.</c>
+    /// and <c>/srv/documentdb/../documentdb</c> are the same host directory.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Covers three unsupported shapes, including mounts added with the raw Aspire APIs
+    /// Aspire fully qualifies a relative bind source against the AppHost directory but leaves a
+    /// rooted one exactly as written, so <c>.</c> and <c>..</c> segments survive into the model
+    /// and have to be resolved here. <see cref="Path.GetFullPath(string)"/> is the host's own
+    /// resolution and needs no filesystem access.
+    /// </para>
+    /// <para>
+    /// Symbolic links are deliberately <em>not</em> resolved. Doing so requires the directory to
+    /// exist at model-build time, and would make the answer depend on the state of the host
+    /// filesystem at a moment that has nothing to do with the run — two spellings that resolve to
+    /// one directory only after a link is created would be judged differently before and after.
+    /// Two DocumentDB resources aimed at one directory through different symlinks are therefore
+    /// not detected; the <c>0.116.0</c> and later interlock still refuses the overlap at runtime.
+    /// </para>
+    /// </remarks>
+    private static string CanonicalizeHostPath(string source)
+    {
+        try
+        {
+            var trimmed = source.TrimEnd('/', '\\');
+            // Trimming a rooted path down to nothing ("/" or "C:\") leaves no path to resolve.
+            return Path.GetFullPath(trimmed.Length == 0 ? source : trimmed);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
+        {
+            // An unresolvable spelling is compared as written rather than crashing the guard.
+            return source;
+        }
+    }
+
+    /// <summary>
+    /// Installs the data-storage guard: a final environment callback and a final command-line
+    /// callback that reject data-directory configurations the DocumentDB Local container cannot
+    /// use, before the container is created and fails with a misleading message.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Covers these unsupported shapes, including mounts added with the raw Aspire APIs
     /// (<c>WithVolume</c> / <c>WithBindMount</c>) rather than <see cref="WithDataVolume"/> or
     /// <see cref="WithDataBindMount"/>:
     /// </para>
     /// <list type="bullet">
-    /// <item><description>a read-only mount on the data path — PostgreSQL cannot initialise or
-    /// write there, and the container burns 60 seconds before reporting an unrelated-looking
+    /// <item><description>a mount target that reaches above the container root — the runtime
+    /// silently clamps it, so the mount lands somewhere other than the path that was
+    /// written;</description></item>
+    /// <item><description>a read-only mount backing the data path — PostgreSQL cannot initialise
+    /// or write there, and the container burns 60 seconds before reporting an unrelated-looking
     /// timeout;</description></item>
-    /// <item><description>two mounts on the same data path — the container runtime rejects
+    /// <item><description>two mounts on the same backing target — the container runtime rejects
     /// duplicate mount targets;</description></item>
     /// <item><description>a data directory shared with another DocumentDB resource's data
-    /// directory — two PostgreSQL instances on one data directory corrupt it.</description></item>
+    /// directory — two PostgreSQL instances on one data directory corrupt it;</description></item>
+    /// <item><description>a <c>-d</c> / <c>--data-path</c> command-line argument, which is a
+    /// second, unmodelled channel for the same setting.</description></item>
     /// </list>
     /// <para>
     /// The shared-directory rule is version-sensitive. From
@@ -813,170 +891,462 @@ public static class DocumentDBBuilderExtensions
     /// because for them an unmounted <c>/data</c> is just a directory in the container layer.
     /// </para>
     /// <para>
-    /// The data directory the rules are applied to is the one the container will really use: the
-    /// effective <c>DATA_PATH</c> the environment pipeline produces at start, canonicalized the
-    /// way the container runtime resolves a path. A raw
-    /// <c>WithEnvironment("DATA_PATH", ...)</c> therefore participates with the documented "last
-    /// call wins" precedence, and an alias such as <c>/foo/../data</c> cannot slip past a rule by
-    /// spelling <c>/data</c> differently.
+    /// The guard runs <em>inside</em> the resource's real configuration pipeline rather than
+    /// beside it. Both callbacks are appended when <see cref="BeforeStartEvent"/> is published —
+    /// after every builder call has been made and before Aspire gathers anything — so they are the
+    /// last callbacks in their pipelines and observe the final <c>DATA_PATH</c> and the final
+    /// argument list, including values produced by dynamic callbacks, whatever the call order. The
+    /// environment callback replaces <c>DATA_PATH</c> with the single canonical string it
+    /// validated, so the container is guaranteed to receive exactly the directory that was judged.
+    /// Aspire caches each callback's result for the lifetime of a run and re-evaluates it on
+    /// restart, so a stateful callback is evaluated once and the guard and the container cannot
+    /// disagree.
     /// </para>
     /// <para>
-    /// Like the image guards, this is run-mode only: <see cref="BeforeResourceStartedEvent"/> is
-    /// not published during manifest generation, where no container is started.
+    /// The one ordering the guard cannot be last for is a <c>WithEnvironment</c> call made from a
+    /// <see cref="BeforeStartEvent"/> subscriber registered <em>after</em> <c>AddDocumentDB</c>.
     /// </para>
     /// </remarks>
     private static IResourceBuilder<DocumentDBServerResource> SubscribeDataStorageGuard(
         this IResourceBuilder<DocumentDBServerResource> builder)
     {
+        var resource = builder.Resource;
+        var coordinator = DataStorageCoordinator.For(builder.ApplicationBuilder);
+
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            InstallDataStorageGuard(resource, coordinator);
+            return Task.CompletedTask;
+        });
+
+        return builder;
+    }
+
+    /// <summary>
+    /// Appends the guard's environment and command-line callbacks to <paramref name="resource"/>,
+    /// at most once.
+    /// </summary>
+    private static void InstallDataStorageGuard(DocumentDBServerResource resource, DataStorageCoordinator coordinator)
+    {
+        if (resource.Annotations.OfType<DataStorageGuardAnnotation>().Any())
+        {
+            return;
+        }
+
+        resource.Annotations.Add(new DataStorageGuardAnnotation());
+
         // One-shot so restart attempts don't repeat advisory warnings. Hard failures are
         // deterministic and intentionally re-thrown on every start attempt.
         var sharedStorageWarningLogged = 0;
         var declaredVolumeWarningLogged = 0;
 
-        // Captured from the builder rather than resolved from the event's services: the execution
-        // context is what the environment callbacks branch on, and it is the same instance Aspire
-        // hands them when it builds the container.
-        var executionContext = builder.ApplicationBuilder.ExecutionContext;
+        resource.Annotations.Add(new EnvironmentCallbackAnnotation(async context =>
+        {
+            RejectMountTargetsThatEscapeContainerRoot(resource);
 
-        builder.ApplicationBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(
-            builder.Resource,
-            async (evt, ct) =>
+            var dataPath = await CanonicalizeEffectiveDataPathAsync(resource, context).ConfigureAwait(false);
+            if (dataPath is null)
             {
-                var resource = evt.Resource;
-                var dataPath = await ResolveEffectiveDataPathAsync(resource, executionContext, ct).ConfigureAwait(false);
+                // Publish mode with a deferred DATA_PATH: the manifest carries an expression, not
+                // a path, and there is nothing here that can be compared with a mount target.
+                return;
+            }
 
-                var mounts = resource.Annotations.OfType<ContainerMountAnnotation>().ToList();
-                var dataMounts = mounts
-                    .Where(mount => TargetsContainerPath(mount, dataPath))
-                    .ToList();
+            var (backingTarget, backingMounts) = SelectBackingMount(resource, dataPath);
 
-                if (dataMounts.FirstOrDefault(mount => mount.IsReadOnly) is { } readOnlyMount)
-                {
-                    throw new InvalidOperationException(
-                        $"DocumentDB resource '{resource.Name}' mounts its data directory " +
-                        $"('{dataPath}') read-only. DocumentDB requires a writable data directory: " +
-                        $"the container entrypoint takes ownership of it and PostgreSQL initialises " +
-                        $"and writes WAL there. The container would run for about a minute and then " +
-                        $"fail with the misleading banner 'PostgreSQL failed to start within 60 " +
-                        $"seconds', hiding the real cause ('initdb: error: could not change " +
-                        $"permissions of directory \"{dataPath}\": Read-only file system'). " +
-                        $"Recovery: mount " +
-                        $"{(readOnlyMount.Type == ContainerMountType.BindMount ? $"'{readOnlyMount.Source}'" : $"volume '{readOnlyMount.Source}'")} " +
-                        $"writable, or use WithDataVolume()/WithDataBindMount(...), which reject " +
-                        $"read-only data storage up front.");
-                }
+            if (backingMounts.FirstOrDefault(mount => mount.IsReadOnly) is { } readOnlyMount)
+            {
+                throw new InvalidOperationException(ReadOnlyDataStorageMessage(resource, dataPath, backingTarget!, readOnlyMount));
+            }
 
-                if (dataMounts.Count > 1)
-                {
-                    throw new InvalidOperationException(
-                        $"DocumentDB resource '{resource.Name}' has {dataMounts.Count} mounts on its " +
-                        $"data directory ('{dataPath}'). The container runtime rejects duplicate mount " +
-                        $"targets, so the container would fail to be created. Recovery: configure the " +
-                        $"data directory once — call either WithDataVolume(...) or " +
-                        $"WithDataBindMount(...), not both, and do not add a second volume or bind " +
-                        $"mount on the same path.");
-                }
+            if (backingMounts.Count > 1)
+            {
+                throw new InvalidOperationException(
+                    $"DocumentDB resource '{resource.Name}' has {backingMounts.Count} mounts on " +
+                    $"'{backingTarget}', the directory that backs its data directory " +
+                    $"('{dataPath}'). The container runtime rejects duplicate mount targets — it " +
+                    $"resolves '.', '..' and repeated separators first, so two different spellings " +
+                    $"of one path collide — and the container would fail to be created. Recovery: " +
+                    $"configure the data directory once — call either WithDataVolume(...) or " +
+                    $"WithDataBindMount(...), not both, and do not add a second volume or bind " +
+                    $"mount on the same path.");
+            }
 
-                var dataMount = dataMounts.Count == 1 ? dataMounts[0] : null;
-                var model = evt.Services.GetService<DistributedApplicationModel>();
+            var dataMount = backingMounts.Count == 1 ? backingMounts[0] : null;
 
-                if (dataMount is not null && dataMount.Source is not null && model is not null)
-                {
-                    // Every conflicting peer is inspected before anything is reported: a peer that
-                    // only warrants a warning must not mask a later peer that warrants a failure.
-                    var thisInterlocked = ResolvesToDataVolumeAwareImage(resource);
-                    List<string>? warnings = null;
+            if (dataMount is not null && dataMount.Source is not null)
+            {
+                ClaimDataStorage(coordinator, resource, dataMount, backingTarget!, dataPath, context, ref sharedStorageWarningLogged);
+            }
 
-                    foreach (var other in model.Resources)
-                    {
-                        // Only another DocumentDB server contends for the same data directory. A
-                        // different container mounting the same storage (a backup or inspection
-                        // sidecar, say) is a different question this guard cannot answer.
-                        if (ReferenceEquals(other, resource) || other is not DocumentDBServerResource otherServer)
-                        {
-                            continue;
-                        }
+            if (!string.Equals(dataPath, DefaultMountedDataPath, StringComparison.Ordinal) &&
+                ResolvesToDataVolumeAwareImage(resource) &&
+                !resource.Annotations.OfType<ContainerMountAnnotation>().Any(mount => TargetsContainerPath(mount, DefaultMountedDataPath)) &&
+                Interlocked.CompareExchange(ref declaredVolumeWarningLogged, 1, 0) == 0)
+            {
+                context.Logger?.LogWarning(
+                    "DocumentDB resource '{ResourceName}' stores data at '{DataPath}', but its " +
+                    "image (v{Version} or later) declares '{DefaultDataPath}' as a container " +
+                    "volume. Neither Docker nor Aspire can un-declare an image volume, so the " +
+                    "runtime creates an unused anonymous volume on that declared path on every " +
+                    "run, and container removal can strand it. Leave the data target path at its " +
+                    "default to avoid this.",
+                    resource.Name,
+                    dataPath,
+                    DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion,
+                    DefaultMountedDataPath);
+            }
+        }));
 
-                        // Compare data directory against data directory. The peer reusing this
-                        // volume or host directory as read-only *input* (seed scripts, TLS
-                        // material) is not a second cluster on the same files.
-                        if (!other.TryGetAnnotationsOfType<ContainerMountAnnotation>(out var otherMounts))
-                        {
-                            continue;
-                        }
+        resource.Annotations.Add(new CommandLineArgsCallbackAnnotation(context =>
+        {
+            RejectReservedDataPathArguments(resource, context);
+            return Task.CompletedTask;
+        }));
+    }
 
-                        // Sharing the storage is the cheap half of the test and the necessary
-                        // condition, so it is applied first: a peer that mounts none of this
-                        // resource's storage cannot contend for its data directory, and its
-                        // environment is left alone.
-                        var sharedMounts = otherMounts.Where(mount => IsSameStorage(dataMount, mount)).ToList();
-                        if (sharedMounts.Count == 0)
-                        {
-                            continue;
-                        }
+    /// <summary>Marks a resource whose storage guard callbacks are already installed.</summary>
+    private sealed class DataStorageGuardAnnotation : IResourceAnnotation;
 
-                        var otherDataPath = await ResolveEffectiveDataPathAsync(otherServer, executionContext, ct).ConfigureAwait(false);
-                        var conflict = sharedMounts.FirstOrDefault(mount => TargetsContainerPath(mount, otherDataPath));
+    /// <summary>
+    /// Refuses a mount target whose <c>..</c> segments reach above the container root. Docker does
+    /// not refuse one: it clamps the target and mounts on the clamped path, so <c>/../data</c>
+    /// becomes <c>/data</c> and the caller's storage lands on a directory they did not name. That
+    /// is unsafe in both directions — an unrelated mount can take over the data directory, and a
+    /// mount meant for the data directory can collide with another — so the spelling is refused
+    /// before the container is created.
+    /// </summary>
+    private static void RejectMountTargetsThatEscapeContainerRoot(IResource resource)
+    {
+        foreach (var mount in resource.Annotations.OfType<ContainerMountAnnotation>())
+        {
+            if (ClassifyContainerPath(mount.Target, out var canonical) != ContainerPathProblem.EscapesRoot)
+            {
+                continue;
+            }
 
-                        if (conflict is null)
-                        {
-                            continue;
-                        }
+            var description = mount.Type == ContainerMountType.BindMount
+                ? $"bind mount of '{mount.Source}'"
+                : mount.Source is null ? "anonymous volume" : $"volume '{mount.Source}'";
 
-                        var description = dataMount.Type == ContainerMountType.BindMount
-                            ? $"host directory '{dataMount.Source}'"
-                            : $"volume '{dataMount.Source}'";
+            throw new InvalidOperationException(
+                $"DocumentDB resource '{resource.Name}' mounts a {description} at '{mount.Target}', " +
+                $"which reaches above the container root. The container runtime does not refuse " +
+                $"that spelling — it clamps the target and mounts on '{canonical}' instead, so the " +
+                $"storage lands on a directory the call never named and can silently become, or " +
+                $"collide with, the DocumentDB data directory. Recovery: write the resolved target " +
+                $"('{canonical}') if that is what was meant, or correct the path.");
+        }
+    }
 
-                        // The refusal is a feature of the image, not of Aspire: only a pair that
-                        // both hold the lock can be trusted to fail loudly instead of corrupting
-                        // the cluster, so only such a pair is eligible for the warning downgrade.
-                        var bothInterlocked = thisInterlocked && ResolvesToDataVolumeAwareImage(otherServer);
-                        var explicitlyStarted =
-                            other.Annotations.OfType<ExplicitStartupAnnotation>().Any() ||
-                            resource.Annotations.OfType<ExplicitStartupAnnotation>().Any();
+    /// <summary>
+    /// The container path DocumentDB will really write to on this run, canonicalized and written
+    /// back into the environment so the container consumes exactly the value that was judged.
+    /// Returns <see langword="null"/> when the value cannot be a path on this run.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>DATA_PATH</c> is an ordinary environment variable, so the value that reaches the
+    /// container is whatever the environment callbacks leave behind — the storage helpers' writes,
+    /// a raw <c>WithEnvironment("DATA_PATH", ...)</c>, or a callback that computes one — with the
+    /// last writer winning. This runs as the last callback in that same pipeline, so it reads the
+    /// final value rather than re-running anything.
+    /// </para>
+    /// <para>
+    /// A deferred value (a parameter, a reference expression) is resolved once, here, with the
+    /// context Aspire itself builds for an environment variable, and the canonical result replaces
+    /// it. Aspire then has a string to render and never asks the provider again, so there is
+    /// exactly one evaluation and no way for the guard and the container to see different values.
+    /// In publish mode a deferred value stays a manifest expression and is left untouched.
+    /// </para>
+    /// <para>
+    /// Nothing else is read or resolved: the password and every other environment value are left
+    /// exactly as the callbacks produced them.
+    /// </para>
+    /// <para>
+    /// An absent, null or empty <c>DATA_PATH</c> is the image's own default. The entrypoint
+    /// applies <c>DATA_PATH=${DATA_PATH:-/data}</c>, which treats empty and unset alike, so an
+    /// empty value is judged as <c>/data</c> rather than turned into a failure of this package's
+    /// invention.
+    /// </para>
+    /// </remarks>
+    private static async ValueTask<string?> CanonicalizeEffectiveDataPathAsync(
+        IResource resource,
+        EnvironmentCallbackContext context)
+    {
+        if (!context.EnvironmentVariables.TryGetValue(DataPathEnvVarName, out var value) || value is null)
+        {
+            return DefaultMountedDataPath;
+        }
 
-                        if (bothInterlocked && explicitlyStarted)
-                        {
-                            (warnings ??= []).Add(SharedDataDirectoryMessage(
-                                resource, other, description, interlocked: true, explicitStartNote: true));
-                            continue;
-                        }
+        string? dataPath;
+        if (value is string literal)
+        {
+            dataPath = literal;
+        }
+        else if (context.ExecutionContext.IsPublishMode)
+        {
+            return null;
+        }
+        else if (value is IValueProvider provider)
+        {
+            // The same context Aspire's own environment resolution passes: the resource asking for
+            // the value, in this AppHost invocation.
+            dataPath = await provider.GetValueAsync(
+                new ValueProviderContext { ExecutionContext = context.ExecutionContext, Caller = resource },
+                context.CancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // Matches how Aspire renders a value that is neither a string nor a value provider.
+            dataPath = value.ToString();
+        }
 
-                        throw new InvalidOperationException(SharedDataDirectoryMessage(
-                            resource, other, description, bothInterlocked, explicitStartNote: false));
-                    }
+        if (string.IsNullOrEmpty(dataPath))
+        {
+            // Null is dropped by Aspire and empty is the image's own default; both mean '/data'.
+            // The canonical string is written back so the dashboard and the container agree.
+            context.EnvironmentVariables[DataPathEnvVarName] = DefaultMountedDataPath;
+            return DefaultMountedDataPath;
+        }
 
-                    if (warnings is not null &&
-                        Interlocked.CompareExchange(ref sharedStorageWarningLogged, 1, 0) == 0)
-                    {
-                        var logger = TryGetResourceLogger(evt, StorageLoggerCategory);
-                        foreach (var warning in warnings)
-                        {
-                            logger?.LogWarning("{Message}", warning);
-                        }
-                    }
-                }
+        var canonical = ClassifyContainerPath(dataPath, out var resolved) switch
+        {
+            ContainerPathProblem.None => resolved,
 
-                if (!string.Equals(dataPath, DefaultMountedDataPath, StringComparison.Ordinal) &&
-                    ResolvesToDataVolumeAwareImage(resource) &&
-                    !mounts.Any(mount => TargetsContainerPath(mount, DefaultMountedDataPath)) &&
-                    Interlocked.CompareExchange(ref declaredVolumeWarningLogged, 1, 0) == 0)
-                {
-                    TryGetResourceLogger(evt, StorageLoggerCategory)?.LogWarning(
-                        "DocumentDB resource '{ResourceName}' stores data at '{DataPath}', but its " +
-                        "image (v{Version} or later) declares '{DefaultDataPath}' as a container " +
-                        "volume. Neither Docker nor Aspire can un-declare an image volume, so the " +
-                        "runtime creates an unused anonymous volume on that declared path on every " +
-                        "run, and container removal can strand it. Leave the data target path at its " +
-                        "default to avoid this.",
-                        resource.Name,
-                        dataPath,
-                        DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion,
-                        DefaultMountedDataPath);
-                }
-            });
+            ContainerPathProblem.NotAbsolute => throw new InvalidOperationException(
+                InvalidDataPathMessage(
+                    resource,
+                    dataPath,
+                    "is not an absolute path inside the container (it does not start with '/')")),
 
-        return builder;
+            ContainerPathProblem.EscapesRoot => throw new InvalidOperationException(
+                InvalidDataPathMessage(
+                    resource,
+                    dataPath,
+                    $"reaches above the container root. There is nothing above '/', so the path " +
+                    $"silently becomes '{resolved}' — and a mount written the same way is clamped " +
+                    $"the same way, which is how storage ends up somewhere nobody named")),
+
+            _ => throw new InvalidOperationException(
+                InvalidDataPathMessage(
+                    resource,
+                    dataPath,
+                    "resolves to the container root '/': the runtime collapses '.' and '..' " +
+                    "segments before mounting, so an alias such as '/data/..' is the root itself, " +
+                    "which cannot hold a PostgreSQL cluster")),
+        };
+
+        context.EnvironmentVariables[DataPathEnvVarName] = canonical;
+        return canonical;
+    }
+
+    /// <summary>
+    /// The mount that really supplies the data directory, and the container path it lands on.
+    /// </summary>
+    /// <remarks>
+    /// A mount does not have to be <em>on</em> <c>DATA_PATH</c> to back it: a volume mounted at
+    /// <c>/data</c> also supplies <c>/data/cluster</c>. The most specific mount wins, exactly as
+    /// the kernel resolves it, so a mount on <c>/data/cluster</c> takes precedence over one on
+    /// <c>/data</c>. Matching is on segment boundaries, so <c>/database</c> does not back
+    /// <c>/data</c>.
+    /// </remarks>
+    private static (string? Target, List<ContainerMountAnnotation> Mounts) SelectBackingMount(
+        IResource resource,
+        string canonicalDataPath)
+    {
+        string? bestTarget = null;
+        var mounts = new List<ContainerMountAnnotation>();
+
+        foreach (var mount in resource.Annotations.OfType<ContainerMountAnnotation>())
+        {
+            if (ResolveMountTarget(mount) is not { } target || !BacksContainerPath(target, canonicalDataPath))
+            {
+                continue;
+            }
+
+            if (bestTarget is null || target.Length > bestTarget.Length)
+            {
+                bestTarget = target;
+                mounts.Clear();
+                mounts.Add(mount);
+            }
+            else if (string.Equals(target, bestTarget, StringComparison.Ordinal))
+            {
+                mounts.Add(mount);
+            }
+        }
+
+        return (bestTarget, mounts);
+    }
+
+    private static string ReadOnlyDataStorageMessage(
+        IResource resource,
+        string dataPath,
+        string mountTarget,
+        ContainerMountAnnotation mount)
+    {
+        var backing = string.Equals(mountTarget, dataPath, StringComparison.Ordinal)
+            ? $"its data directory ('{dataPath}')"
+            : $"'{mountTarget}', the directory that backs its data directory ('{dataPath}')";
+
+        var source = mount.Type == ContainerMountType.BindMount
+            ? $"'{mount.Source}'"
+            : mount.Source is null ? "the anonymous volume" : $"volume '{mount.Source}'";
+
+        return
+            $"DocumentDB resource '{resource.Name}' mounts {backing} read-only. DocumentDB requires " +
+            $"a writable data directory: the container entrypoint takes ownership of it and " +
+            $"PostgreSQL initialises and writes WAL there. The container would run for about a " +
+            $"minute and then fail with the misleading banner 'PostgreSQL failed to start within 60 " +
+            $"seconds', hiding the real cause ('initdb: error: could not change permissions of " +
+            $"directory \"{dataPath}\": Read-only file system'). Recovery: mount {source} writable, " +
+            $"or use WithDataVolume()/WithDataBindMount(...), which reject read-only data storage " +
+            $"up front.";
+    }
+
+    /// <summary>
+    /// Registers the host storage this resource's data directory occupies and fails — or warns —
+    /// when another DocumentDB resource has already registered the same one.
+    /// </summary>
+    /// <remarks>
+    /// Each resource registers while its own configuration pipeline runs, so no peer's callbacks
+    /// are ever executed on its behalf and no unrelated value is resolved. Every peer already
+    /// registered on the same storage is examined before anything is reported: a pairing that only
+    /// warrants a warning must not mask a later peer that warrants a failure, and which resource
+    /// reaches the storage first must not change the verdict.
+    /// </remarks>
+    private static void ClaimDataStorage(
+        DataStorageCoordinator coordinator,
+        DocumentDBServerResource resource,
+        ContainerMountAnnotation dataMount,
+        string mountTarget,
+        string dataPath,
+        EnvironmentCallbackContext context,
+        ref int sharedStorageWarningLogged)
+    {
+        // Two resources contend only when they mount the same source *and* place their data
+        // directories at the same place within it: one volume shared as '/data/alpha' and
+        // '/data/beta' is two directories, not one cluster.
+        var subpath = dataPath.Length == mountTarget.Length
+            ? string.Empty
+            : dataPath[(mountTarget.Length + 1)..];
+
+        var source = dataMount.Type == ContainerMountType.BindMount
+            ? CanonicalizeHostPath(dataMount.Source!)
+            : dataMount.Source!;
+
+        if (dataMount.Type == ContainerMountType.BindMount && HostPathComparison != StringComparison.Ordinal)
+        {
+            source = source.ToUpperInvariant();
+        }
+
+        var peers = coordinator.Register($"{dataMount.Type}\u0000{source}\u0000{subpath}", resource);
+        if (peers.Count == 0)
+        {
+            return;
+        }
+
+        var description = dataMount.Type == ContainerMountType.BindMount
+            ? $"host directory '{dataMount.Source}'"
+            : $"volume '{dataMount.Source}'";
+
+        if (subpath.Length > 0)
+        {
+            description += $" (subdirectory '{subpath}')";
+        }
+
+        var thisInterlocked = ResolvesToDataVolumeAwareImage(resource);
+        var thisExplicitlyStarted = resource.Annotations.OfType<ExplicitStartupAnnotation>().Any();
+        List<string>? warnings = null;
+
+        foreach (var other in peers)
+        {
+            // The refusal is a feature of the image, not of Aspire: only a pair that both hold the
+            // lock can be trusted to fail loudly instead of corrupting the cluster, so only such a
+            // pair is eligible for the warning downgrade.
+            var bothInterlocked = thisInterlocked && ResolvesToDataVolumeAwareImage(other);
+            var explicitlyStarted =
+                thisExplicitlyStarted || other.Annotations.OfType<ExplicitStartupAnnotation>().Any();
+
+            if (bothInterlocked && explicitlyStarted)
+            {
+                (warnings ??= []).Add(SharedDataDirectoryMessage(
+                    resource, other, description, interlocked: true, explicitStartNote: true));
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                SharedDataDirectoryMessage(resource, other, description, bothInterlocked, explicitStartNote: false));
+        }
+
+        if (warnings is not null && Interlocked.CompareExchange(ref sharedStorageWarningLogged, 1, 0) == 0)
+        {
+            foreach (var warning in warnings)
+            {
+                context.Logger?.LogWarning("{Message}", warning);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Refuses <c>-d</c> and <c>--data-path</c>, the container entrypoint's own way of setting the
+    /// data directory.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>--data-path</c> is documented by the image as "Overrides DATA_PATH environment variable",
+    /// and the entrypoint does exactly that: <c>export DATA_PATH=$1</c> while parsing arguments,
+    /// before <c>DATA_PATH=${DATA_PATH:-/data}</c> applies the default. A resource that passes it
+    /// would move its data directory somewhere the environment never mentions, past every rule
+    /// this guard applies. <c>-d</c> is not accepted by the images this package supports — the
+    /// entrypoint answers <c>Unknown option -d</c> and exits 1 — and is reserved here so that a
+    /// future short form cannot become a silent second channel.
+    /// </para>
+    /// <para>
+    /// The argument is refused rather than honoured. Following it would mean resolving the
+    /// argument pipeline as well, and the same value can only be trusted if it is resolved exactly
+    /// once; the environment variable already has a single, checked path through this guard, so
+    /// there is nothing to gain by adding a second.
+    /// </para>
+    /// <para>
+    /// Only literal string arguments are examined. A deferred argument is left alone: resolving it
+    /// to look at it would be a second evaluation, and replacing it with its resolved value would
+    /// discard the sensitivity Aspire tracks for parameters.
+    /// </para>
+    /// </remarks>
+    private static void RejectReservedDataPathArguments(IResource resource, CommandLineArgsCallbackContext context)
+    {
+        foreach (var argument in context.Args)
+        {
+            if (argument is not string text)
+            {
+                continue;
+            }
+
+            var name = text;
+            var separator = text.IndexOf('=', StringComparison.Ordinal);
+            if (separator >= 0)
+            {
+                name = text[..separator];
+            }
+
+            if (!string.Equals(name, "--data-path", StringComparison.Ordinal) &&
+                !string.Equals(name, "-d", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"DocumentDB resource '{resource.Name}' passes the command-line argument '{text}'. " +
+                $"The container entrypoint treats '--data-path' as an override of the DATA_PATH " +
+                $"environment variable ('-d' is reserved for the same setting), so it would move " +
+                $"the data directory to a path the environment never names — past the read-only, " +
+                $"duplicate-mount and shared-data-directory checks, and past the mount that was " +
+                $"supposed to back it. Recovery: set the data directory through storage instead — " +
+                $"WithDataVolume(), WithDataBindMount(...), or WithEnvironment(\"{DataPathEnvVarName}\", ...) " +
+                $"— and remove the argument.");
+        }
     }
 
     private static string SharedDataDirectoryMessage(
@@ -1009,99 +1379,6 @@ public static class DocumentDBBuilderExtensions
             $"WithDataVolume(name: \"{resource.Name}-data\")).";
     }
 
-    /// <summary>
-    /// The container path DocumentDB will really write to on this run: the effective
-    /// <c>DATA_PATH</c> the resource's environment pipeline produces, canonicalized the way the
-    /// container runtime resolves a path.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// <c>DATA_PATH</c> is an ordinary environment variable, so the value that reaches the
-    /// container is whatever the environment callbacks leave behind — the storage helpers'
-    /// writes, a raw <c>WithEnvironment("DATA_PATH", ...)</c>, or a callback that computes one —
-    /// with the last writer winning. Running that pipeline here is what makes the guard validate
-    /// the directory the container actually uses instead of the one the helpers intended.
-    /// </para>
-    /// <para>
-    /// Only the <c>DATA_PATH</c> entry is resolved. Every other value the callbacks produced —
-    /// the password parameter among them — is left as the unresolved object it was gathered as,
-    /// so answering a question about a filesystem path never materialises a secret.
-    /// </para>
-    /// <para>
-    /// A <c>DATA_PATH</c> that resolves to <see langword="null"/> is dropped by Aspire rather than
-    /// passed to the container, which leaves the image's own default in place.
-    /// </para>
-    /// </remarks>
-    private static async ValueTask<string> ResolveEffectiveDataPathAsync(
-        IResource resource,
-        DistributedApplicationExecutionContext executionContext,
-        CancellationToken cancellationToken)
-    {
-        if (!resource.TryGetEnvironmentVariables(out var callbacks))
-        {
-            return DefaultMountedDataPath;
-        }
-
-        var environment = new Dictionary<string, object>(StringComparer.Ordinal);
-        var context = new EnvironmentCallbackContext(executionContext, resource, environment, cancellationToken);
-
-        foreach (var callback in callbacks)
-        {
-            await callback.Callback(context).ConfigureAwait(false);
-        }
-
-        if (!environment.TryGetValue(DataPathEnvVarName, out var value) || value is null)
-        {
-            return DefaultMountedDataPath;
-        }
-
-        string? dataPath;
-        if (value is string literal)
-        {
-            dataPath = literal;
-        }
-        else if (value is IValueProvider provider)
-        {
-            dataPath = await provider.GetValueAsync(cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            // Matches how Aspire renders a value that is neither a string nor a value provider.
-            dataPath = value.ToString();
-        }
-
-        if (dataPath is null)
-        {
-            return DefaultMountedDataPath;
-        }
-
-        return TryCanonicalizeContainerPath(dataPath, out var canonical) switch
-        {
-            ContainerPathProblem.None => canonical,
-
-            ContainerPathProblem.NotAbsolute => throw new InvalidOperationException(
-                InvalidDataPathMessage(
-                    resource,
-                    dataPath,
-                    "is not an absolute path inside the container (it does not start with '/')")),
-
-            ContainerPathProblem.EscapesRoot => throw new InvalidOperationException(
-                InvalidDataPathMessage(
-                    resource,
-                    dataPath,
-                    "escapes above the container root: the runtime resolves '..' segments before " +
-                    "mounting, and there is nothing above '/'")),
-
-            _ => throw new InvalidOperationException(
-                InvalidDataPathMessage(
-                    resource,
-                    dataPath,
-                    "resolves to the container root '/': the runtime collapses '.' and '..' " +
-                    "segments before mounting, so an alias such as '/data/..' is the root itself, " +
-                    "which cannot hold a PostgreSQL cluster")),
-        };
-    }
-
     private static string InvalidDataPathMessage(IResource resource, string dataPath, string reason) =>
         $"DocumentDB resource '{resource.Name}' sets {DataPathEnvVarName} to '{dataPath}', which " +
         $"{reason}. The container writes its PostgreSQL cluster to that path, so the value is " +
@@ -1127,16 +1404,62 @@ public static class DocumentDBBuilderExtensions
             version >= DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion;
     }
 
-    private static bool IsSameStorage(ContainerMountAnnotation left, ContainerMountAnnotation right)
+    /// <summary>
+    /// Which DocumentDB resources hold which piece of host storage as their data directory, for
+    /// one application model.
+    /// </summary>
+    /// <remarks>
+    /// Registration happens from inside each resource's own configuration pipeline, so the answer
+    /// is built from what each resource really resolved rather than from a peer's annotations read
+    /// from the outside. Every resource that reaches a piece of storage is recorded, including one
+    /// whose pairing was only a warning, so a later resource is judged against all of them and the
+    /// verdict does not depend on which pipeline ran first. A resource that re-registers (Aspire
+    /// re-evaluates callbacks on restart) keeps its registration, and one that moves to different
+    /// storage releases the old one.
+    /// </remarks>
+    private sealed class DataStorageCoordinator
     {
-        if (left.Type != right.Type || left.Source is null || right.Source is null)
-        {
-            return false;
-        }
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDistributedApplicationBuilder, DataStorageCoordinator> s_byApplication = new();
 
-        return left.Type == ContainerMountType.BindMount
-            ? string.Equals(left.Source.TrimEnd('/', '\\'), right.Source.TrimEnd('/', '\\'), HostPathComparison)
-            : string.Equals(left.Source, right.Source, StringComparison.Ordinal);
+        private readonly object _lock = new();
+        private readonly Dictionary<string, List<DocumentDBServerResource>> _holdersByKey = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, string> _keyByResource = new(StringComparer.Ordinal);
+
+        public static DataStorageCoordinator For(IDistributedApplicationBuilder builder) =>
+            s_byApplication.GetValue(builder, static _ => new DataStorageCoordinator());
+
+        /// <summary>
+        /// Records <paramref name="resource"/> against <paramref name="key"/> and returns the
+        /// resources already recorded against it.
+        /// </summary>
+        public IReadOnlyList<DocumentDBServerResource> Register(string key, DocumentDBServerResource resource)
+        {
+            lock (_lock)
+            {
+                if (_keyByResource.TryGetValue(resource.Name, out var previous) &&
+                    !string.Equals(previous, key, StringComparison.Ordinal) &&
+                    _holdersByKey.TryGetValue(previous, out var previousHolders))
+                {
+                    previousHolders.RemoveAll(held => ReferenceEquals(held, resource));
+                }
+
+                _keyByResource[resource.Name] = key;
+
+                if (!_holdersByKey.TryGetValue(key, out var holders))
+                {
+                    _holdersByKey[key] = holders = [];
+                }
+
+                var peers = holders.Where(held => !ReferenceEquals(held, resource)).ToList();
+
+                if (!holders.Any(held => ReferenceEquals(held, resource)))
+                {
+                    holders.Add(resource);
+                }
+
+                return peers;
+            }
+        }
     }
 
     /// <summary>
