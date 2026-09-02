@@ -6269,6 +6269,13 @@ public class AddDocumentDBTests
         { ["-e", "GATEWAY_HOME=/runtime-secret"] },
         { ["-eOTEL_METRICS_ENABLED=false"] },
         { ["-e=OTEL_EXPORTER_OTLP_ENDPOINT=http://runtime-secret"] },
+        { ["--env=OTEL_METRICS_ENABLED"] },
+        { ["--env", "DATA_*"] },
+        { ["--env", "OTEL_*"] },
+        { ["--env=OTEL_*"] },
+        { ["-e", "OTEL_*"] },
+        { ["-eOTEL_*"] },
+        { ["--env", "*"] },
         { ["--env-file", "/runtime-secret/environment"] },
         { ["--env-file=/runtime-secret/environment"] },
         { ["--env-host"] },
@@ -6299,6 +6306,11 @@ public class AddDocumentDBTests
 
         Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+
+        if (runtimeArguments.Any(argument => argument.Contains('*')))
+        {
+            Assert.DoesNotContain("*", exception.Message, StringComparison.Ordinal);
+        }
     }
 
     [Theory]
@@ -6411,6 +6423,11 @@ public class AddDocumentDBTests
             "--variant", "v8",
             "--env-merge", "UNRELATED=prefix",
             "--unsetenv=UNRELATED",
+            "--env", "UNRELATED_*",
+            "--env=UNRELATED_*",
+            "-eUNRELATED_*",
+            "--env=OTEL_*=literal",
+            "-e", "DATA_*=literal",
             "--",
         ];
 
@@ -6533,6 +6550,32 @@ public class AddDocumentDBTests
         Assert.Equal(1, environment.Evaluations);
         Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredProtectedEnvironmentPrefix()
+    {
+        var environment = new CountingValueProvider("OTEL_*");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--env");
+                context.Args.Add(environment);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, environment.Evaluations);
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("OTEL_*", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]

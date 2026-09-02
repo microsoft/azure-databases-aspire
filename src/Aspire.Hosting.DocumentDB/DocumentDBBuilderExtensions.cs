@@ -3511,35 +3511,34 @@ public static class DocumentDBBuilderExtensions
     /// disagreeing about how to log in — and because a raw <c>--env</c> is where a password would
     /// be written in the clear.
     /// </remarks>
-    private static readonly HashSet<string> s_guardOwnedEnvironmentVariables = new(StringComparer.Ordinal)
-    {
+    private static readonly string[] s_guardOwnedEnvironmentVariables =
+    [
         DataPathEnvVarName,
         UserEnvVarName,
         PasswordEnvVarName,
-    };
+    ];
 
     /// <summary>
     /// The environment variables the OpenTelemetry compatibility wrapper's own command depends on.
     /// They are added to <see cref="s_guardOwnedEnvironmentVariables"/> only while the wrapper is
     /// required, because outside that case this package has made no promise about them.
     /// </summary>
-    private static readonly HashSet<string> s_openTelemetryRuntimeProtectedEnvironmentVariables =
-        new(StringComparer.Ordinal)
-        {
-            "CONFIG_DIR",
-            "GATEWAY_HOME",
-            DataPathEnvVarName,
-            EnableTelemetryEnvVarName,
-            OtelMetricsEnabledEnvVarName,
-            OtelExporterOtlpMetricsEndpointEnvVarName,
-            OtelExporterOtlpMetricsTimeoutEnvVarName,
-            OtelMetricExportIntervalEnvVarName,
-            OtelServiceNameEnvVarName,
-            OtelServiceVersionEnvVarName,
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_TIMEOUT",
-            "OTEL_RESOURCE_ATTRIBUTES",
-        };
+    private static readonly string[] s_openTelemetryRuntimeProtectedEnvironmentVariables =
+    [
+        "CONFIG_DIR",
+        "GATEWAY_HOME",
+        DataPathEnvVarName,
+        EnableTelemetryEnvVarName,
+        OtelMetricsEnabledEnvVarName,
+        OtelExporterOtlpMetricsEndpointEnvVarName,
+        OtelExporterOtlpMetricsTimeoutEnvVarName,
+        OtelMetricExportIntervalEnvVarName,
+        OtelServiceNameEnvVarName,
+        OtelServiceVersionEnvVarName,
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_RESOURCE_ATTRIBUTES",
+    ];
 
     /// <summary>
     /// Reads the finished container-runtime argument list once, with the container runtime's own
@@ -3649,23 +3648,49 @@ public static class DocumentDBBuilderExtensions
 
     /// <summary>
     /// This package's own spelling of a guard-owned environment variable, or <see langword="null"/>
-    /// when the name is not one of them.
+    /// when the name or prefix does not match one.
     /// </summary>
     /// <remarks>
     /// The name that comes back is the one held in
     /// <see cref="s_guardOwnedEnvironmentVariables"/>, never the caller's token, which is what lets
     /// a diagnostic name the variable without naming anything that was read.
     /// </remarks>
-    private static string? ResolveGuardOwnedEnvironmentVariable(string name) =>
-        s_guardOwnedEnvironmentVariables.TryGetValue(name, out var owned) ? owned : null;
+    private static string? ResolveGuardOwnedEnvironmentVariable(
+        string value,
+        DocumentDBEnvironmentVariableMatch match) =>
+        ResolveOwnedEnvironmentVariable(s_guardOwnedEnvironmentVariables, value, match);
 
     /// <summary>
     /// The same for the OpenTelemetry wrapper, which owns everything the storage guard owns and,
     /// while it is required, the variables its own command depends on as well.
     /// </summary>
-    private static string? ResolveOpenTelemetryProtectedEnvironmentVariable(string name) =>
-        ResolveGuardOwnedEnvironmentVariable(name)
-            ?? (s_openTelemetryRuntimeProtectedEnvironmentVariables.TryGetValue(name, out var owned) ? owned : null);
+    private static string? ResolveOpenTelemetryProtectedEnvironmentVariable(
+        string value,
+        DocumentDBEnvironmentVariableMatch match) =>
+        ResolveGuardOwnedEnvironmentVariable(value, match)
+            ?? ResolveOwnedEnvironmentVariable(
+                s_openTelemetryRuntimeProtectedEnvironmentVariables,
+                value,
+                match);
+
+    private static string? ResolveOwnedEnvironmentVariable(
+        IReadOnlyList<string> ownedVariables,
+        string value,
+        DocumentDBEnvironmentVariableMatch match)
+    {
+        foreach (var owned in ownedVariables)
+        {
+            if ((match == DocumentDBEnvironmentVariableMatch.Exact &&
+                 string.Equals(owned, value, StringComparison.Ordinal)) ||
+                (match == DocumentDBEnvironmentVariableMatch.Prefix &&
+                 owned.StartsWith(value, StringComparison.Ordinal)))
+            {
+                return owned;
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Resolves the completed runtime-argument list exactly once, so the parser reads the strings

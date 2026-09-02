@@ -348,9 +348,15 @@ public class DocumentDBRuntimeAuthorityTests
         { new[] { "--env=DATA_PATH=/pgdata" }, "--env DATA_PATH" },
         { new[] { "-e", "DATA_PATH=/pgdata" }, "-e DATA_PATH" },
         { new[] { "-eDATA_PATH=/pgdata" }, "-e DATA_PATH" },
+        { new[] { "--env", "DATA_PATH" }, "--env DATA_PATH" },
         { new[] { "-e", "DATA_PATH" }, "-e DATA_PATH" },
         { new[] { "--env", "PASSWORD=hunter2" }, "--env PASSWORD" },
         { new[] { "--env", "USERNAME=root" }, "--env USERNAME" },
+        { new[] { "--env", "DATA_*" }, "--env DATA_PATH" },
+        { new[] { "--env=USER*" }, "--env USERNAME" },
+        { new[] { "-e", "PASS*" }, "-e PASSWORD" },
+        { new[] { "-eDATA_*" }, "-e DATA_PATH" },
+        { new[] { "--env", "*" }, "--env DATA_PATH" },
     };
 
     [Theory]
@@ -360,6 +366,11 @@ public class DocumentDBRuntimeAuthorityTests
         var exception = await RunWithRuntimeArgumentsExpectingFailureAsync(arguments);
 
         Assert.Contains($"'{option}', which sets, imports or clears an environment variable this package has already decided", exception.Message, StringComparison.Ordinal);
+
+        foreach (var argument in arguments.Where(argument => argument.Contains('*')))
+        {
+            Assert.DoesNotContain(argument, exception.Message, StringComparison.Ordinal);
+        }
     }
 
     /// <summary>
@@ -450,7 +461,7 @@ public class DocumentDBRuntimeAuthorityTests
         {
             using var app = BuildStartedApplication(builder =>
             {
-                var assignment = builder.AddParameter("documentdb-assignment", "DATA_PATH=/pgdata");
+                var assignment = builder.AddParameter("documentdb-assignment", "DATA_*");
 
                 builder.AddDocumentDB("documentdb")
                     .WithImageTag(InterlockedTag)
@@ -466,6 +477,7 @@ public class DocumentDBRuntimeAuthorityTests
         });
 
         Assert.Contains("a value that is only known later", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("DATA_*", exception.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -505,6 +517,13 @@ public class DocumentDBRuntimeAuthorityTests
         new[] { "--env=TZ=UTC" },
         new[] { "-e", "TZ=UTC" },
         new[] { "-eTZ=UTC" },
+        new[] { "--env", "UNRELATED_*" },
+        new[] { "--env=UNRELATED_*" },
+        new[] { "-eUNRELATED_*" },
+        new[] { "--env=OTEL_*" },
+        new[] { "--env", "DATA_*=literal" },
+        new[] { "--env=USERNAME*=literal" },
+        new[] { "-ePASSWORD*=literal" },
         new[] { "-it" },
         new[] { "--pull=always" },
         new[] { "--platform", "linux/amd64" },
