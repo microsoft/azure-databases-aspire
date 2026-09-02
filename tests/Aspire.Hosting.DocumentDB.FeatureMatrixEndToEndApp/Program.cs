@@ -58,6 +58,13 @@ public class Program
     /// </summary>
     public const string TelemetryWrapperArgumentOrderScenario = "telemetry-wrapper-argument-order";
 
+    /// <summary>
+    /// Telemetry wrapper with one host directory bind-mounted twice: as the data directory and at
+    /// <c>/tmp</c>. The two container paths do not contain one another, so only the backing
+    /// storage tells them apart.
+    /// </summary>
+    public const string TelemetryAliasedTemporaryRootScenario = "telemetry-aliased-temporary-root";
+
     /// <summary>WithLogLevel(Debug), exercised with normal MongoDB traffic by the test.</summary>
     public const string DebugLogLevelScenario = "debug-log-level";
 
@@ -245,6 +252,17 @@ public class Program
                 documentDB
                     .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false)
                     .WithArgs(context => context.Args.Insert(0, "--disable-extended-rum"));
+                break;
+
+            case TelemetryAliasedTemporaryRootScenario:
+                // One host directory, two windows onto it. '/tmp' and '/data' do not contain one
+                // another as container paths, so a wrapper that only compared container paths
+                // would write its scratch copy straight into the fresh data directory and
+                // DocumentDB 0.116.0 would refuse to initialise it.
+                documentDB
+                    .WithDataBindMount(GetRequired(BindMountPathEnvironmentVariable))
+                    .WithBindMount(GetRequired(BindMountPathEnvironmentVariable), "/tmp")
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
                 break;
 
             case DebugLogLevelScenario:

@@ -228,6 +228,18 @@ public static class DocumentDBBuilderExtensions
     /// other resolution would sanitize a file the gateway does not read.
     /// </para>
     /// <para>
+    /// The scratch directory the sanitized copy is written to has to be outside <c>DATA_PATH</c>
+    /// <em>and</em> outside the storage that backs it. Two container paths that do not contain one
+    /// another can still be one directory — a bind mount of the same host directory at
+    /// <c>/tmp</c> and at <c>/data</c>, or one named volume mounted twice — and a scratch
+    /// directory created through the second window appears inside the data directory, which
+    /// DocumentDB <c>0.116.0</c> refuses to initialise. The container path test stays in the
+    /// script, because <c>DATA_PATH</c> can still be moved at runtime with <c>--data-path</c>; the
+    /// backing test is decided here, where the mount table is known, and emitted as the exact set
+    /// of data directories each candidate root cannot be used with. See
+    /// <see cref="BuildOpenTelemetryScratchRootAliases"/>.
+    /// </para>
+    /// <para>
     /// Single-line and brace-free on purpose. Publishers post-process container arguments: azd
     /// evaluates <c>{...}</c> in every argument as a manifest binding expression, so a shell
     /// <c>${VAR:-default}</c> is either passed through by luck or rejected outright, and a newline
@@ -235,7 +247,12 @@ public static class DocumentDBBuilderExtensions
     /// </para>
     /// </remarks>
     private static string BuildOpenTelemetryGatewayConfigurationScript(
-        OpenTelemetryGatewayConfigurationAnnotation configuration) =>
+        IResource resource,
+        OpenTelemetryGatewayConfigurationAnnotation configuration)
+    {
+        var aliases = BuildOpenTelemetryScratchRootAliases(resource);
+
+        return
         "set -e; " +
         "c=\"$CONFIG_DIR\"; " +
         "if [ -z \"$c\" ]; then " +
@@ -265,18 +282,286 @@ public static class DocumentDBBuilderExtensions
         "if ! d=\"$(realpath -m -- \"$d\" 2>/dev/null)\"; then echo \"aspire-documentdb -- DATA_PATH could not be canonicalized for the telemetry configuration\" >&2; exit 1; fi; " +
         "if [ \"$d\" = \"/\" ]; then echo \"aspire-documentdb -- no temporary directory can be safely separated from a root DATA_PATH\" >&2; exit 1; fi; " +
         "r=\"\"; " +
-        "for x in /tmp /var/tmp /dev/shm; do " +
-            "if ! x=\"$(realpath -m -- \"$x\" 2>/dev/null)\"; then continue; fi; " +
+        (aliases.Length == 0 ? "" : "w=\"\"; ") +
+        $"for y in {string.Join(' ', s_openTelemetryScratchRoots)}; do " +
+            (aliases.Length == 0 ? "" : $"case \"$y|$d\" in {string.Join('|', aliases)}) w=1; continue;; esac; ") +
+            "if ! x=\"$(realpath -m -- \"$y\" 2>/dev/null)\"; then continue; fi; " +
             "if [ ! -d \"$x\" ] || [ ! -w \"$x\" ]; then continue; fi; " +
             "case \"$x\" in \"$d\"|\"$d\"/*) continue;; esac; " +
             "case \"$d\" in \"$x\"|\"$x\"/*) continue;; esac; " +
             "r=\"$x\"; break; " +
         "done; " +
-        "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi; " +
+        (aliases.Length == 0
+            ? "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi; "
+            : "if [ -z \"$r\" ]; then " +
+                "if [ -n \"$w\" ]; then " +
+                    "echo \"aspire-documentdb -- every temporary directory is on the same host directory or volume as DATA_PATH ($d), so the telemetry configuration cannot be kept out of it\" >&2; " +
+                "else " +
+                    "echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; " +
+                "fi; " +
+                "exit 1; " +
+            "fi; ") +
         "if ! o=\"$(mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\")\"; then echo \"aspire-documentdb -- could not create the temporary gateway configuration\" >&2; exit 1; fi; " +
         $"jq '{BuildOpenTelemetryGatewayConfigurationFilter(configuration)}' \"$s\" >\"$o/SetupConfiguration.json\"; " +
         "export CONFIG_DIR=\"$o\"; " +
         $"exec {GatewayEntrypointScriptPath} \"$@\"";
+    }
+
+    /// <summary>
+    /// The scratch roots the wrapper will try, in order. Each has to exist, be writable, be
+    /// outside <c>DATA_PATH</c> as a container path, and be backed by storage that is not the
+    /// storage <c>DATA_PATH</c> is on.
+    /// </summary>
+    private static readonly string[] s_openTelemetryScratchRoots = ["/tmp", "/var/tmp", "/dev/shm"];
+
+    /// <summary>
+    /// Where a container path really lives: the host directory a bind mount opens onto, or a named
+    /// volume plus the part of the path that falls below its mount point.
+    /// </summary>
+    /// <remarks>
+    /// A bind mount is a window onto the host filesystem, so its region is a single host path —
+    /// the mount source with the container subpath appended — and two windows onto the same
+    /// directory, or onto a directory and one of its ancestors, are the same storage however
+    /// differently their container paths are spelled. A volume name is not a path and cannot be
+    /// combined with one, so a volume's region stays its name plus the subdirectory, compared
+    /// exactly: the container reads that subdirectory on its own case-sensitive filesystem.
+    /// </remarks>
+    private readonly record struct MountBackingRegion(ContainerMountType Type, string Source, string Subpath);
+
+    /// <summary>
+    /// For every scratch root that some mount backs, the canonical <c>DATA_PATH</c> values that
+    /// would put the wrapper's scratch directory on the same storage as the data directory,
+    /// rendered as quoted <c>case</c> patterns over <c>"$y|$d"</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A candidate root that no mount covers lives in the container's own filesystem and cannot
+    /// alias anything the container path test does not already catch, so it contributes nothing
+    /// and the emitted script is exactly the one a resource with no mounts gets.
+    /// </para>
+    /// <para>
+    /// The data directory is only known at runtime — <c>DATA_PATH</c> can be a deferred value and
+    /// <c>--data-path</c> can move it again — but the mount table is known here, so the answer is
+    /// expressed as the set of data directories each candidate is incompatible with rather than as
+    /// a decision. Two shapes produce that set: a mount whose whole region falls inside the
+    /// candidate's region, which makes every path under that mount an alias; and a mount whose
+    /// region contains the candidate's, which makes the one path that lands on the candidate's
+    /// region an alias, together with everything under it and each of its ancestors down to the
+    /// mount point — a data directory above the scratch region contains it just as surely as one
+    /// inside it.
+    /// </para>
+    /// <para>
+    /// Anonymous volumes are left out: nothing else can be mounted from one, so a candidate and a
+    /// data directory on the same anonymous volume are the same container path subtree, which the
+    /// script's own test already refuses.
+    /// </para>
+    /// </remarks>
+    private static System.Collections.Immutable.ImmutableArray<string> BuildOpenTelemetryScratchRootAliases(IResource resource)
+    {
+        var mounts = resource.Annotations.OfType<ContainerMountAnnotation>()
+            .Select(mount => (Mount: mount, Target: ResolveMountTarget(mount)))
+            .Where(entry => entry.Target is not null && entry.Mount.Source is not null)
+            .Select(entry => (entry.Mount, Target: entry.Target!))
+            .ToList();
+
+        if (mounts.Count == 0)
+        {
+            return [];
+        }
+
+        var patterns = new List<string>();
+
+        foreach (var candidate in s_openTelemetryScratchRoots)
+        {
+            // The most specific mount wins, exactly as the kernel resolves it. Duplicate targets
+            // are a configuration the storage rules refuse in their own right; here they are all
+            // taken into account, because either of them could be the one that supplies the root.
+            var depth = -1;
+            var forbidden = new SortedSet<string>(StringComparer.Ordinal);
+
+            foreach (var (mount, target) in mounts)
+            {
+                if (!BacksContainerPath(target, candidate) || target.Length < depth)
+                {
+                    continue;
+                }
+
+                if (target.Length > depth)
+                {
+                    depth = target.Length;
+                    forbidden.Clear();
+                }
+
+                var candidateRegion = DescribeMountBackingRegion(mount, target, candidate);
+
+                foreach (var (other, otherTarget) in mounts)
+                {
+                    var otherRegion = DescribeMountBackingRegion(other, otherTarget, otherTarget);
+
+                    if (TryGetRegionSubpath(candidateRegion, otherRegion, out _))
+                    {
+                        // Everything the other mount supplies is inside the candidate's region.
+                        AddForbiddenDataPath(forbidden, candidate, otherTarget, withDescendants: true);
+                        continue;
+                    }
+
+                    if (!TryGetRegionSubpath(otherRegion, candidateRegion, out var delta))
+                    {
+                        continue;
+                    }
+
+                    // The candidate's region is one directory below the other mount's. That exact
+                    // container path is the alias, and so is anything under it - and so is every
+                    // directory between the mount point and it, which would contain it.
+                    var path = otherTarget;
+                    foreach (var segment in delta.Split('/', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        AddForbiddenDataPath(forbidden, candidate, path, withDescendants: false);
+                        path += "/" + segment;
+                    }
+
+                    AddForbiddenDataPath(forbidden, candidate, path, withDescendants: true);
+                }
+            }
+
+            patterns.AddRange(forbidden);
+        }
+
+        return [.. patterns];
+    }
+
+    /// <summary>
+    /// Records a data directory the candidate root cannot be used with, unless the script's own
+    /// container-path test already refuses that pair.
+    /// </summary>
+    /// <remarks>
+    /// A data directory at or below the candidate root — and, with
+    /// <paramref name="withDescendants"/>, everything below it — is already excluded at runtime by
+    /// <c>case "$d" in "$x"|"$x"/*</c>, whatever storage backs either of them. Emitting it again
+    /// would only make the wrapper report an aliasing problem where the plain container-path rule
+    /// is the reason.
+    /// </remarks>
+    private static void AddForbiddenDataPath(
+        SortedSet<string> forbidden,
+        string candidate,
+        string dataPath,
+        bool withDescendants)
+    {
+        if (BacksContainerPath(candidate, dataPath))
+        {
+            return;
+        }
+
+        forbidden.Add(QuoteScratchAliasPattern(candidate, dataPath));
+
+        if (withDescendants)
+        {
+            forbidden.Add(QuoteScratchAliasPattern(candidate, dataPath) + "/*");
+        }
+    }
+
+    /// <summary>
+    /// The region <paramref name="path"/> occupies, given that <paramref name="mount"/> lands on
+    /// <paramref name="mountTarget"/> and supplies it.
+    /// </summary>
+    private static MountBackingRegion DescribeMountBackingRegion(
+        ContainerMountAnnotation mount,
+        string mountTarget,
+        string path)
+    {
+        var subpath = path.Length == mountTarget.Length ? string.Empty : path[(mountTarget.Length + 1)..];
+
+        return mount.Type == ContainerMountType.BindMount
+            ? new(ContainerMountType.BindMount, CanonicalizeHostDataDirectory(mount.Source!, subpath), string.Empty)
+            : new(ContainerMountType.Volume, mount.Source!, subpath);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="inner"/> is inside — or is — <paramref name="outer"/>, and if so
+    /// how far below it, as a <c>/</c>-separated relative path.
+    /// </summary>
+    private static bool TryGetRegionSubpath(MountBackingRegion outer, MountBackingRegion inner, out string subpath)
+    {
+        subpath = string.Empty;
+
+        if (outer.Type != inner.Type)
+        {
+            return false;
+        }
+
+        if (outer.Type == ContainerMountType.BindMount)
+        {
+            if (string.Equals(outer.Source, inner.Source, HostPathComparison))
+            {
+                return true;
+            }
+
+            if (inner.Source.Length <= outer.Source.Length ||
+                !IsHostPathSeparator(inner.Source[outer.Source.Length]) ||
+                !inner.Source.StartsWith(outer.Source, HostPathComparison))
+            {
+                return false;
+            }
+
+            subpath = inner.Source[(outer.Source.Length + 1)..]
+                .Replace(Path.DirectorySeparatorChar, '/')
+                .Replace(Path.AltDirectorySeparatorChar, '/');
+            return true;
+        }
+
+        if (!string.Equals(outer.Source, inner.Source, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (outer.Subpath.Length == 0)
+        {
+            subpath = inner.Subpath;
+            return true;
+        }
+
+        if (string.Equals(outer.Subpath, inner.Subpath, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (inner.Subpath.Length <= outer.Subpath.Length ||
+            inner.Subpath[outer.Subpath.Length] != '/' ||
+            !inner.Subpath.StartsWith(outer.Subpath, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        subpath = inner.Subpath[(outer.Subpath.Length + 1)..];
+        return true;
+    }
+
+    private static bool IsHostPathSeparator(char value) =>
+        value == Path.DirectorySeparatorChar || value == Path.AltDirectorySeparatorChar;
+
+    /// <summary>
+    /// One <c>case</c> pattern matching the literal candidate root and data directory pair, as a
+    /// quoted shell word so that a path containing a glob character matches only itself.
+    /// </summary>
+    private static string QuoteScratchAliasPattern(string candidate, string dataPath) =>
+        "\"" + EscapeShellDoubleQuoted(candidate) + "|" + EscapeShellDoubleQuoted(dataPath) + "\"";
+
+    private static string EscapeShellDoubleQuoted(string value)
+    {
+        var escaped = new System.Text.StringBuilder(value.Length);
+
+        foreach (var character in value)
+        {
+            if (character is '\\' or '"' or '$' or '`')
+            {
+                escaped.Append('\\');
+            }
+
+            escaped.Append(character);
+        }
+
+        return escaped.ToString();
+    }
 
     /// <summary>
     /// Builds the <c>jq</c> filter that removes exactly the <c>SetupConfiguration.json</c> keys
@@ -851,7 +1136,7 @@ public static class DocumentDBBuilderExtensions
                 targetPort: DefaultPostgresContainerPort,
                 scheme: "postgresql",
                 name: DocumentDBServerResource.PostgresEndpointName)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 // Explicitly opt the upstream entrypoint into accepting external PostgreSQL
                 // connections (sets PGOPTIONS=-e -> listen_addresses='*' + permissive pg_hba.conf).
@@ -1082,7 +1367,7 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly: false)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
             });
@@ -1159,7 +1444,7 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithBindMount(source, targetPath, isReadOnly: false)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
             });
@@ -1520,6 +1805,19 @@ public static class DocumentDBBuilderExtensions
         commandLineGuard.AddCommandLineValidation(
             state => RejectReservedDataPathArguments(resource, CallerArguments(state)));
 
+        // Installed before AddDocumentDB returns, not at the first lifecycle phase. Aspire records
+        // each callback's result the first time a pipeline is gathered and then takes the last
+        // annotation's recording as the answer for the rest of the run, so a callback that appears
+        // after a gather does not add to that answer — it replaces it, and every value recorded
+        // while it did not exist is dropped. A subscriber registered before AddDocumentDB gathers
+        // the environment while BeforeStartEvent is being published, which is before this
+        // package's own subscriber for that event runs, so installing there would have lost
+        // USERNAME, PASSWORD and every other value the resource had already produced. The lifecycle
+        // phases below only move this same annotation instance back to the end of its pipeline and
+        // attach the services the advisory warnings log to; none of them introduces a callback a
+        // gather has not already seen.
+        InstallDataStorageGuard(resource, coordinator, services: null);
+
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((evt, _) =>
         {
             InstallDataStorageGuard(resource, coordinator, evt.Services);
@@ -1664,6 +1962,38 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Adds one of this package's own environment callbacks and puts the package's callbacks back
+    /// at the end of their pipelines.
+    /// </summary>
+    /// <remarks>
+    /// The guards are installed while <c>AddDocumentDB</c> runs, so every configuration API called
+    /// afterwards would otherwise append behind them. Re-taking the last position here keeps the
+    /// two requirements they are built on — being installed before anything can gather, and being
+    /// the last word once it has — true at the same time, for every call order.
+    /// </remarks>
+    private static IResourceBuilder<DocumentDBServerResource> WithDocumentDBEnvironment(
+        this IResourceBuilder<DocumentDBServerResource> builder,
+        Action<EnvironmentCallbackContext> callback)
+    {
+        builder.WithEnvironment(callback);
+        RetakePackageCallbackPositions(builder.Resource);
+
+        return builder;
+    }
+
+    /// <summary>
+    /// Puts every callback this package owns back at the end of its pipeline, when the resource is
+    /// far enough through <c>AddDocumentDB</c> to have them.
+    /// </summary>
+    private static void RetakePackageCallbackPositions(DocumentDBServerResource resource)
+    {
+        if (resource.Annotations.OfType<TerminalGuardAnnotation>().LastOrDefault() is { } guard)
+        {
+            RetakeTerminalGuardPositions(resource, guard);
+        }
+    }
+
+    /// <summary>
     /// Fails the resource when something appended an environment callback after the guard's.
     /// </summary>
     /// <remarks>
@@ -1700,15 +2030,19 @@ public static class DocumentDBBuilderExtensions
         throw new InvalidOperationException(
             $"DocumentDB resource '{resource.Name}' has a later {pipeline} callback registered after " +
             $"its data-storage guard, so the guard cannot be sure the configuration it checked is the " +
-            $"one the container receives. The guard is appended when the application starts, and " +
-            $"moved back to the end of its pipeline at the latest phase the run offers; a callback " +
-            $"added after that usually comes from a subscriber registered after AddDocumentDB, or " +
-            $"from an IDistributedApplicationLifecycleHook where no later phase is published. The " +
-            $"resource is failed instead of being started on an unchecked data directory. " +
-            $"Recovery: make that configuration part of the " +
-            $"application model (WithDataVolume(), WithDataBindMount(...), " +
-            $"WithEnvironment(\"{DataPathEnvVarName}\", ...), WithArgs(...)) rather than adding it " +
-            $"after the model is built, or register the subscriber before AddDocumentDB.");
+            $"one the container receives — Aspire records each callback's result the first time it " +
+            $"runs and then takes the last callback's recording as the answer for the rest of the " +
+            $"run. The guard is installed while AddDocumentDB runs and moved back to the end of its " +
+            $"pipeline by every DocumentDB configuration API and at every lifecycle phase the run " +
+            $"offers, so a callback that is still behind it was either added after the last of those " +
+            $"phases — from an IDistributedApplicationLifecycleHook, or from a subscriber registered " +
+            $"after AddDocumentDB — or added with a raw Aspire API (WithEnvironment(...), " +
+            $"WithArgs(...)) and then read before the application started, by a subscriber registered " +
+            $"before AddDocumentDB. The resource is failed instead of being started on an unchecked " +
+            $"data directory. Recovery: finish building the application model before anything reads " +
+            $"this resource's configuration, and register a subscriber that does read it after " +
+            $"AddDocumentDB rather than before, so this package has put its callbacks back in the " +
+            $"last position first.");
     }
 
     /// <summary>
@@ -1806,6 +2140,117 @@ public static class DocumentDBBuilderExtensions
             CultureInfo.InvariantCulture,
             // An anonymous volume has no source at all, which is not the same as an empty one.
             $"{(int)mount.Type}\u0000{(mount.Source is null ? "-" : "+" + mount.Source)}\u0000{mount.Target}\u0000{(mount.IsReadOnly ? "ro" : "rw")}");
+
+    /// <summary>
+    /// Everything about a resource that decides what its manifest entry says, recorded so that a
+    /// change made while the entry is being written can be detected.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Aspire's container writer emits the image, the entrypoint and the mounts before it
+    /// evaluates the environment callbacks, and the bindings after them. A callback that mutates
+    /// the model from inside that evaluation therefore lands on both sides of the entry at once:
+    /// the fields already written describe the resource as it was, the fields written afterwards
+    /// describe it as it became, and every check this package ran before delegating judged a third
+    /// thing again.
+    /// </para>
+    /// <para>
+    /// Only what is safety-relevant is recorded. Mounts are compared by value and in a fixed order,
+    /// exactly as <see cref="DataStorageSeal"/> compares them, so re-declaring identical storage or
+    /// merely reordering it is not reported — neither changes a byte of the entry, because the
+    /// mounts were written before the callback ran. Endpoints are compared in declaration order,
+    /// because they are written after the callbacks and their order is the order of the manifest's
+    /// own binding keys.
+    /// </para>
+    /// </remarks>
+    private sealed record ManifestStructureSnapshot(
+        System.Collections.Immutable.ImmutableArray<string> Mounts,
+        System.Collections.Immutable.ImmutableArray<string> Endpoints,
+        System.Collections.Immutable.ImmutableArray<EnvironmentCallbackAnnotation> EnvironmentCallbacks,
+        System.Collections.Immutable.ImmutableArray<CommandLineArgsCallbackAnnotation> CommandLineCallbacks,
+        System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
+        string? Entrypoint,
+        DocumentDBEffectiveImage Image,
+        bool ExplicitlyStarted);
+
+    private static ManifestStructureSnapshot CaptureManifestStructure(DocumentDBServerResource resource) =>
+        new(
+            CaptureDataStorageMounts(resource),
+            [.. resource.Annotations.OfType<EndpointAnnotation>().Select(DescribeEndpointForSeal)],
+            [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
+            resource.Entrypoint,
+            ResolveEffectiveImage(resource),
+            resource.Annotations.OfType<ExplicitStartupAnnotation>().Any());
+
+    /// <summary>
+    /// The parts of an endpoint the manifest carries, and nothing else: an allocated address
+    /// belongs to a run and is not written to a manifest at all.
+    /// </summary>
+    private static string DescribeEndpointForSeal(EndpointAnnotation endpoint) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"{endpoint.Name}\u0000{endpoint.UriScheme}\u0000{endpoint.Protocol}\u0000{endpoint.Transport}\u0000{endpoint.Port}\u0000{endpoint.TargetPort}\u0000{endpoint.IsExternal}\u0000{endpoint.TargetHost}");
+
+    /// <summary>
+    /// Fails the publish when the model changed while the resource's manifest entry was being
+    /// written.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Nothing is repaired and the entry is not rewritten. Part of it is already in the writer by
+    /// the time the mutation is observable, and the fields that were written cannot be taken back;
+    /// what can be guaranteed is that the operation fails, which is what the publishing pipeline
+    /// reports and what makes <c>aspire publish</c> exit non-zero without leaving a usable
+    /// manifest behind.
+    /// </para>
+    /// <para>
+    /// No value is reported, only what kind of thing changed: the callback that changed the model
+    /// may well be the one carrying a secret.
+    /// </para>
+    /// </remarks>
+    private static void VerifyManifestStructureUnchanged(
+        DocumentDBServerResource resource,
+        ManifestStructureSnapshot before)
+    {
+        var after = CaptureManifestStructure(resource);
+
+        var change =
+            !after.Mounts.SequenceEqual(before.Mounts, StringComparer.Ordinal)
+                ? "a volume or bind mount was added, removed or changed"
+            : !after.Endpoints.SequenceEqual(before.Endpoints, StringComparer.Ordinal)
+                ? "an endpoint was added, removed, reordered or re-pointed"
+            : !SameCallbacks(after.EnvironmentCallbacks, before.EnvironmentCallbacks)
+                ? "an environment callback was added or removed"
+            : !SameCallbacks(after.CommandLineCallbacks, before.CommandLineCallbacks)
+                ? "a command-line callback was added or removed"
+            : !SameCallbacks(after.RuntimeCallbacks, before.RuntimeCallbacks)
+                ? "a container-runtime-argument callback was added or removed"
+            : !string.Equals(after.Entrypoint, before.Entrypoint, StringComparison.Ordinal)
+                ? "its container entrypoint changed"
+            : !after.Image.Equals(before.Image)
+                ? "the image it will run changed"
+            : after.ExplicitlyStarted != before.ExplicitlyStarted
+                ? "its explicit-start setting changed"
+            : null;
+
+        if (change is null)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' was changed while its manifest entry was being " +
+            $"written: {change}. Aspire writes a container's image, entrypoint and mounts before it " +
+            $"evaluates the environment callbacks and its bindings after them, so a change made from " +
+            $"inside that evaluation lands in the model but not in the fields that have already been " +
+            $"written, and the data-storage rules judged a resource the manifest does not describe. " +
+            $"The publish is failed and the partly written manifest is abandoned rather than " +
+            $"completed. Recovery: configure the resource while the application model is being built " +
+            $"(WithDataVolume(), WithDataBindMount(...), WithEndpoint(...), WithImageTag(...)) " +
+            $"instead of mutating it from a WithEnvironment(...) callback.");
+    }
 
     /// <summary>
     /// Fails the resource when anything the storage verdict rests on changed after the verdict was
@@ -1930,10 +2375,33 @@ public static class DocumentDBBuilderExtensions
         EnvironmentCallbackContext context)
     {
         var services = resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault()?.Services
-            ?? context.ExecutionContext.Services;
+            ?? TryGetExecutionServices(context.ExecutionContext);
 
         return services?.GetService<ILoggerFactory>()?.CreateLogger(StorageLoggerCategory)
             ?? context.Logger;
+    }
+
+    /// <summary>
+    /// The AppHost's services when the execution context carries them, and <see langword="null"/>
+    /// when it does not.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DistributedApplicationExecutionContext.Services"/> is documented to throw when
+    /// the context was built without a service provider, which is what a context constructed by
+    /// hand — the discovery pass, a test harness, a caller reading the configuration itself — looks
+    /// like. Not having somewhere to write an advisory warning is not a reason to fail a resource,
+    /// so the absence is treated as an absence and the callback's own logger is used instead.
+    /// </remarks>
+    private static IServiceProvider? TryGetExecutionServices(DistributedApplicationExecutionContext executionContext)
+    {
+        try
+        {
+            return executionContext.Services;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -2522,7 +2990,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             var value = logLevel.ToEnvironmentValue();
             context.EnvironmentVariables[LogLevelEnvVarName] = value;
@@ -2550,7 +3018,7 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithBindMount(source, InitDataMountPath, isReadOnly: true)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[InitDataEnvVarName] = "false";
                 context.EnvironmentVariables[InitDataPathEnvVarName] = InitDataMountPath;
@@ -2571,7 +3039,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[InitDataEnvVarName] = "false";
             context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
@@ -2592,7 +3060,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[DisableExtendedRumEnvVarName] = "true";
         });
@@ -2629,7 +3097,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[CreateUserEnvVarName] = "false";
         });
@@ -2658,7 +3126,7 @@ public static class DocumentDBBuilderExtensions
         return builder
             .WithBindMount(certPath, certTargetPath, isReadOnly: true)
             .WithBindMount(keyPath, keyTargetPath, isReadOnly: true)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[CertPathEnvVarName] = certTargetPath;
                 context.EnvironmentVariables[KeyFileEnvVarName] = keyTargetPath;
@@ -2690,7 +3158,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[EnableTelemetryEnvVarName] = enabled ? "true" : "false";
         });
@@ -2867,7 +3335,7 @@ public static class DocumentDBBuilderExtensions
             serviceName is not null,
             serviceVersion is not null);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[OtelMetricsEnabledEnvVarName] = enabled ? "true" : "false";
 
@@ -3030,7 +3498,7 @@ public static class DocumentDBBuilderExtensions
                     $"entrypoint.");
             }
 
-            var script = BuildOpenTelemetryGatewayConfigurationScript(configuration);
+            var script = BuildOpenTelemetryGatewayConfigurationScript(builder.Resource, configuration);
 
             state.Args.Insert(0, GatewayConfigurationShellArgumentZero);
             state.Args.Insert(0, script);
@@ -3120,6 +3588,13 @@ public static class DocumentDBBuilderExtensions
         {
             VerifyTerminalCheckpoint(resource, guard);
 
+            // Aspire writes a container's image, entrypoint and mounts before it evaluates the
+            // environment callbacks, so the structure this checkpoint just judged is only the
+            // structure the manifest describes for as long as nothing changes it while the writer
+            // is running. A supported WithEnvironment(...) callback can add, remove or replace a
+            // mount, re-point an endpoint or swap the image from inside that evaluation.
+            var structure = CaptureManifestStructure(resource);
+
             // Whatever would have written this resource had the checkpoint not been installed
             // still writes it, so the manifest is byte-for-byte the one Aspire would have
             // produced. A caller's own writer is honoured; with none, this is a container.
@@ -3134,6 +3609,13 @@ public static class DocumentDBBuilderExtensions
             {
                 await callback(context).ConfigureAwait(false);
             }
+
+            VerifyManifestStructureUnchanged(resource, structure);
+
+            // The command-line and storage verdicts are recorded while those pipelines are
+            // evaluated, which for this resource happens inside the call above. Re-checking here is
+            // what judges a verdict that did not exist when this callback started.
+            VerifyTerminalCheckpoint(resource, guard);
         });
 
         resource.Annotations.Add(guard);
@@ -3512,7 +3994,7 @@ public static class DocumentDBBuilderExtensions
         var configuration = resource.Annotations
             .OfType<OpenTelemetryGatewayConfigurationAnnotation>()
             .Single();
-        var expectedScript = BuildOpenTelemetryGatewayConfigurationScript(configuration);
+        var expectedScript = BuildOpenTelemetryGatewayConfigurationScript(resource, configuration);
 
         if (command.WrapperScript is null ||
             !string.Equals(command.ShellOption, GatewayConfigurationShellCommandOption, StringComparison.Ordinal) ||
@@ -3605,14 +4087,17 @@ public static class DocumentDBBuilderExtensions
         throw new InvalidOperationException(
             $"DocumentDB resource '{resource.Name}' has a later {pipeline} callback registered " +
             $"after the one this package owns, so the configuration it built is not the one the " +
-            $"container would receive. That callback is appended when the application starts and " +
-            $"moved back to the end of the pipeline at the latest per-resource phase the run " +
-            $"offers; a callback added after that usually comes from a subscriber registered " +
-            $"after AddDocumentDB, or from an IDistributedApplicationLifecycleHook. The resource " +
-            $"is failed instead of being started on a configuration that was checked and then " +
-            $"changed. Recovery: make that configuration part of the application model " +
-            $"(WithArgs(...), WithEnvironment(...)) while it is being built, or register the " +
-            $"subscriber before AddDocumentDB.");
+            $"container would receive. That callback is installed while AddDocumentDB runs and " +
+            $"moved back to the end of the pipeline by every DocumentDB configuration API and at " +
+            $"every lifecycle phase the run offers, so a callback that is still behind it was " +
+            $"either added after the last of those phases — from a subscriber registered after " +
+            $"AddDocumentDB, or from an IDistributedApplicationLifecycleHook — or added with a raw " +
+            $"Aspire API and then read before the application started, by a subscriber registered " +
+            $"before AddDocumentDB. The resource is failed instead of being started on a " +
+            $"configuration that was checked and then changed. Recovery: make that configuration " +
+            $"part of the application model (WithArgs(...), WithEnvironment(...)) while it is being " +
+            $"built, and register a subscriber that reads the resource's configuration after " +
+            $"AddDocumentDB rather than before.");
     }
 
     /// <summary>
@@ -3845,7 +4330,7 @@ public static class DocumentDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrEmpty(owner);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[OwnerEnvVarName] = owner;
         });

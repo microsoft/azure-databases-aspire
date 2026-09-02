@@ -260,7 +260,8 @@ public class AddDocumentDBTests
               "image": "{{DocumentDBContainerImageTags.Registry}}/{{DocumentDBContainerImageTags.Image}}:{{DocumentDBContainerImageTags.Tag}}",
               "env": {
                 "USERNAME": "admin",
-                "PASSWORD": "{DocumentDB-password.value}"
+                "PASSWORD": "{DocumentDB-password.value}",
+                "DATA_PATH": "/data"
               },
               "bindings": {
                 "tcp": {
@@ -3205,6 +3206,431 @@ public class AddDocumentDBTests
     }
 
     // ---------------------------------------------------------------------
+    // The guard is part of the model before anything can read it
+    //
+    // Aspire records each callback's result the first time a pipeline is
+    // gathered and then takes the last annotation's recording as the answer
+    // for the rest of the run. A callback that appears after a gather does not
+    // add to that answer, it replaces it - so a guard installed by a lifecycle
+    // event would drop every value produced before that event.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The guard participates in the very first gather, before any event is published. This is the
+    /// negative control for eager installation: with the guard introduced by a lifecycle event
+    /// instead, this gather produces no <c>DATA_PATH</c> at all.
+    /// </summary>
+    [Fact]
+    public async Task TheStorageGuardIsPartOfTheEnvironmentPipelineBeforeAnyEventIsPublished()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single();
+
+        var environment = await BuildEnvironmentVariablesAsync(resource);
+
+        Assert.Equal("/data", environment["DATA_PATH"]);
+        Assert.True(environment.ContainsKey("USERNAME"));
+        Assert.True(environment.ContainsKey("PASSWORD"));
+    }
+
+    /// <summary>
+    /// A subscriber registered before <c>AddDocumentDB</c> runs before this package's own
+    /// <see cref="BeforeStartEvent"/> subscriber, and building the configuration through the public
+    /// <see cref="ExecutionConfigurationBuilder"/> is exactly what Aspire itself does. Every value
+    /// the resource had already produced has to survive that.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherFromASubscriberRegisteredBeforeAddDocumentDBKeepsEveryValue()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        var gathered = 0;
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var early = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(early)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+            Interlocked.Increment(ref gathered);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(targetPath: "/pgdata")
+            .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithOwner("contoso");
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal(1, gathered);
+        Assert.Equal("admin", environment["USERNAME"]);
+        Assert.False(string.IsNullOrEmpty(environment["PASSWORD"]));
+        Assert.Equal("debug", environment["LOG_LEVEL"]);
+        Assert.Equal("contoso", environment["OWNER"]);
+        Assert.Equal("/pgdata", environment["DATA_PATH"]);
+    }
+
+    /// <summary>
+    /// The publish side of the same thing, through Aspire's own manifest writer.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherFromASubscriberRegisteredBeforeAddDocumentDBKeepsEveryValueInTheManifest()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var early = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(early)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithoutSampleData();
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Equal("admin", manifest["env"]?["USERNAME"]?.ToString());
+        Assert.Equal("{DocumentDB-password.value}", manifest["env"]?["PASSWORD"]?.ToString());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.ToString());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
+    }
+
+    /// <summary>
+    /// Installing the guard before <c>AddDocumentDB</c> returns has to leave the storage rules
+    /// exactly as sharp: this is the same read-only mount the guard rejects on a later phase.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherStillAppliesTheStorageRules()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var resource = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB").WithVolume("raw-data", "/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => PublishBeforeStartAsync(app));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The one shape an early gather cannot be made to work for: a raw Aspire
+    /// <c>WithEnvironment(...)</c> added after <c>AddDocumentDB</c> sits behind the guard until the
+    /// first lifecycle phase moves the guard back, and a subscriber registered before
+    /// <c>AddDocumentDB</c> reads the configuration before that phase. Aspire would then answer with
+    /// a recording made in the wrong position, so the resource is failed instead of being started on
+    /// an environment nobody checked.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherBehindACallerCallbackAddedAfterAddDocumentDBIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var resource = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithEnvironment("CONTOSO", "value");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => PublishBeforeStartAsync(app));
+
+        Assert.Contains("has a later environment callback registered after its data-storage guard", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("register a subscriber that does read it after AddDocumentDB", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the recovery the message names actually works: registering the same subscriber after
+    /// <c>AddDocumentDB</c> lets this package take the last position first.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherFromASubscriberRegisteredAfterAddDocumentDBKeepsCallerValues()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithEnvironment("CONTOSO", "value");
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var resource = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal("admin", environment["USERNAME"]);
+        Assert.Equal("value", environment["CONTOSO"]);
+        Assert.Equal("/data", environment["DATA_PATH"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // The manifest entry and the model it was checked against
+    //
+    // Aspire writes a container's image, entrypoint and mounts before it
+    // evaluates the environment callbacks and its bindings after them, so a
+    // supported WithEnvironment(...) callback can change the resource while it
+    // is being serialized. Every test below drives the real
+    // ManifestPublishingContext.WriteResourceAsync.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task AMountAddedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context => context.Resource.Annotations.Add(
+                new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: false)));
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("while its manifest entry was being written", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("a volume or bind mount was added, removed or changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AMountRemovedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "documentdb-data")
+            .WithEnvironment(context =>
+            {
+                var mount = context.Resource.Annotations.OfType<ContainerMountAnnotation>().Single();
+                context.Resource.Annotations.Remove(mount);
+            });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("a volume or bind mount was added, removed or changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnEndpointChangedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context =>
+            {
+                var endpoint = context.Resource.Annotations.OfType<EndpointAnnotation>().First();
+                endpoint.TargetPort = 15000;
+            });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("an endpoint was added, removed, reordered or re-pointed", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnImageChangedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithEnvironment(_ => documentDB.WithImageTag("pg17-0.114.0"));
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("the image it will run changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnEntrypointChangedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context =>
+            {
+                if (context.Resource is ContainerResource container)
+                {
+                    container.Entrypoint = "/bin/sh";
+                }
+            });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("its container entrypoint changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The refusal has to be a refusal of the whole operation, not just of one entry: the fields
+    /// already handed to the writer cannot be taken back, so the only safe outcome is a publish
+    /// that fails and leaves no usable manifest.
+    /// </summary>
+    [Fact]
+    public async Task APublishThatMutatesTheModelWhileWritingFailsClosed()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithEnvironment(context => context.Resource.Annotations.Add(
+                    new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: false))));
+
+        Assert.Contains("while its manifest entry was being written", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Writing environment values is what environment callbacks are for, and a callback that only
+    /// does that changes nothing structural.
+    /// </summary>
+    [Fact]
+    public async Task EnvironmentValuesWrittenWhileTheManifestIsWrittenArePublishedUnchanged()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "documentdb-data")
+            .WithEnvironment(context => context.EnvironmentVariables["CONTOSO"] = "value");
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Equal("value", manifest["env"]?["CONTOSO"]?.ToString());
+        Assert.Equal("documentdb-data", manifest["volumes"]?[0]?["name"]?.ToString());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
+    }
+
+    /// <summary>
+    /// Re-declaring the same storage, or merely reordering it, is a no-op: the mounts were written
+    /// before the callback ran, so the entry is the one an unmutated model produces, byte for byte.
+    /// </summary>
+    [Fact]
+    public async Task AMountReorderedOrReDeclaredIdenticallyWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+
+        var reordered = await PublishOnceAsync(builder => builder.WithEnvironment(context =>
+        {
+            var mounts = context.Resource.Annotations.OfType<ContainerMountAnnotation>().ToList();
+            foreach (var mount in mounts)
+            {
+                context.Resource.Annotations.Remove(mount);
+            }
+
+            foreach (var mount in Enumerable.Reverse(mounts))
+            {
+                context.Resource.Annotations.Add(mount);
+            }
+        }));
+
+        var reDeclared = await PublishOnceAsync(builder => builder.WithEnvironment(context =>
+        {
+            var mount = context.Resource.Annotations.OfType<ContainerMountAnnotation>()
+                .Single(annotation => annotation.Target == "/data");
+            context.Resource.Annotations.Remove(mount);
+            context.Resource.Annotations.Add(
+                new ContainerMountAnnotation(mount.Source, mount.Target, mount.Type, mount.IsReadOnly));
+        }));
+
+        Assert.Equal(expected, reordered);
+        Assert.Equal(expected, reDeclared);
+
+        static async Task<string> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithDataVolume(name: "documentdb-data")
+                .WithInitData("./seed");
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return (await PublishManifestAsync(app, "DocumentDB")).ToString();
+        }
+    }
+
+    /// <summary>
+    /// A resource taken out of the manifest has no published entry to check, and a caller's own
+    /// writer still writes the entry it would have written.
+    /// </summary>
+    [Fact]
+    public async Task ManifestExclusionsAndCustomWritersAreLeftAlone()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("excluded")
+            .WithDataVolume()
+            .ExcludeFromManifest();
+        appBuilder.AddDocumentDB("custom")
+            .WithDataVolume(name: "custom-data")
+            .WithManifestPublishingCallback(context =>
+            {
+                context.Writer.WriteString("type", "custom.v0");
+                return Task.CompletedTask;
+            });
+
+        using var app = appBuilder.Build();
+        await PublishBeforeStartAsync(app);
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        Assert.Null(await ManifestUtils.GetManifestOrNull(
+            model.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "excluded")));
+
+        var custom = await ManifestUtils.GetManifest(
+            model.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "custom"));
+
+        Assert.Equal("custom.v0", custom["type"]?.ToString());
+        Assert.Null(custom["volumes"]);
+    }
+
+    // ---------------------------------------------------------------------
     // DATA_PATH is always stated
     // ---------------------------------------------------------------------
 
@@ -3480,7 +3906,7 @@ public class AddDocumentDBTests
     [Fact]
     public async Task LaterEnvironmentValuesOverrideWithLogLevel()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateAppBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithLogLevel(DocumentDBLogLevel.Debug)
             .WithEnvironment("DOCUMENTDB_LOG_LEVEL", "warn")
@@ -3488,9 +3914,9 @@ public class AddDocumentDBTests
 
         using var app = appBuilder.Build();
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        // Through the phases a real run publishes: a raw WithEnvironment(...) added after
+        // AddDocumentDB sits behind the storage guard until the first of them moves the guard back.
+        var env = await ConfigureResourceAsync(app, "DocumentDB");
 
         Assert.Equal("warn", env["DOCUMENTDB_LOG_LEVEL"]);
         Assert.Equal("error", env["LOG_LEVEL"]);
@@ -3743,12 +4169,189 @@ public class AddDocumentDBTests
         Assert.Contains("--username) q=\"v\"", script, StringComparison.Ordinal);
         Assert.Contains("realpath -m -- \"$d\"", script, StringComparison.Ordinal);
         Assert.Contains("if [ \"$d\" = \"/\" ]", script, StringComparison.Ordinal);
-        Assert.Contains("for x in /tmp /var/tmp /dev/shm", script, StringComparison.Ordinal);
-        Assert.Contains("realpath -m -- \"$x\"", script, StringComparison.Ordinal);
+        Assert.Contains("for y in /tmp /var/tmp /dev/shm", script, StringComparison.Ordinal);
+        Assert.Contains("realpath -m -- \"$y\"", script, StringComparison.Ordinal);
         Assert.Contains("case \"$x\" in \"$d\"|\"$d\"/*) continue;; esac", script, StringComparison.Ordinal);
         Assert.Contains("case \"$d\" in \"$x\"|\"$x\"/*) continue;; esac", script, StringComparison.Ordinal);
         Assert.Contains("mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\"", script, StringComparison.Ordinal);
         Assert.DoesNotContain("o=\"$(mktemp -d)\"", script, StringComparison.Ordinal);
+
+        // Nothing here can alias the data directory, so nothing about the backing storage is
+        // emitted: this is the script every resource without mounts gets.
+        Assert.DoesNotContain("$y|$d", script, StringComparison.Ordinal);
+        Assert.Contains(
+            "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi",
+            script,
+            StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // The scratch root and the storage that backs it
+    //
+    // Two container paths that do not contain one another can still be one
+    // directory: a bind mount of the same host directory at /tmp and at /data,
+    // or one named volume mounted twice. A scratch directory created through
+    // the second window appears inside DATA_PATH, and DocumentDB 0.116.0
+    // refuses to initialise a data directory that is not empty.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ATemporaryRootBoundToTheSameHostDirectoryAsDataPathIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/documentdb", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("case \"$y|$d\" in ", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+
+        // The other two candidates are in the container's own filesystem, so they are left alone
+        // and one of them is what the wrapper falls back to.
+        Assert.DoesNotContain("\"/var/tmp|", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"/dev/shm|", script, StringComparison.Ordinal);
+        Assert.Contains("every temporary directory is on the same host directory or volume as DATA_PATH", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ATemporaryRootOnTheSameNamedVolumeAsDataPathIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataVolume(name: "documentdb-data")
+            .WithVolume("documentdb-data", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A mount target that is an ancestor of the data directory's host directory backs it just as
+    /// surely as one that is exactly it.
+    /// </summary>
+    [Fact]
+    public async Task ATemporaryRootBoundToAnAncestorOfTheDataDirectoryIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other direction: the scratch root is a subdirectory of the data directory's host tree,
+    /// so it aliases the data directory itself and every directory above it inside that tree — but
+    /// not a sibling.
+    /// </summary>
+    [Fact]
+    public async Task ATemporaryRootBoundBelowTheDataDirectoryAliasesOnlyTheDirectoriesThatContainIt()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithBindMount("/srv/documentdb/scratch", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // '/data' contains the scratch region, and '/data/scratch' is it.
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data/scratch\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data/scratch\"/*", script, StringComparison.Ordinal);
+
+        // A sibling data directory is a different host directory and stays usable.
+        Assert.DoesNotContain("\"/tmp|/data/cluster\"", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ATemporaryRootBackedByDifferentStorageIsLeftAlone()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/scratch", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.DoesNotContain("$y|$d", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// With every candidate on the data directory's storage there is nowhere safe left, and the
+    /// wrapper says so rather than writing into the data directory.
+    /// </summary>
+    [Fact]
+    public async Task EveryTemporaryRootAliasingTheDataDirectoryIsReportedByTheWrapper()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/documentdb", "/tmp")
+            .WithBindMount("/srv/documentdb", "/var/tmp")
+            .WithBindMount("/srv/documentdb", "/dev/shm")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/var/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/dev/shm|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains(
+            "if [ -n \"$w\" ]; then echo \"aspire-documentdb -- every temporary directory is on the same host directory or volume as DATA_PATH ($d), so the telemetry configuration cannot be kept out of it\" >&2; ",
+            script,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The wrapper is part of the container command, so the aliasing decision has to survive the
+    /// manifest exactly as it survives a run.
+    /// </summary>
+    [Fact]
+    public async Task TheScratchRootAliasingDecisionIsPublishedInTheManifest()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithDataBindMount("/srv/documentdb")
+                .WithBindMount("/srv/documentdb", "/tmp")
+                .WithOpenTelemetryMetrics());
+
+        var script = manifest["resources"]?["DocumentDB"]?["args"]?[1]?.ToString();
+
+        Assert.NotNull(script);
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
     }
 
     [Fact]

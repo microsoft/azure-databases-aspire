@@ -837,6 +837,64 @@ public class DocumentDBFeatureMatrixEndToEndTests
         Assert.Contains("del(.TelemetryOptions.Metrics", command[1], StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// One host directory bind-mounted twice, as the data directory and at <c>/tmp</c>. The two
+    /// container paths do not contain one another, so a wrapper that compared only container paths
+    /// created its scratch copy through the second window - straight into the fresh data directory,
+    /// which DocumentDB <c>0.116.0</c> then refused to initialise. The container reaching a healthy
+    /// state at all is the assertion.
+    /// </summary>
+    [Fact]
+    public async Task TelemetryWrapperAvoidsATemporaryRootBoundToTheDataDirectory()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var bindMountPath = Path.Combine(Path.GetTempPath(), "aspire-documentdb-e2e", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(bindMountPath);
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryAliasedTemporaryRootScenario),
+            (AppHost.BindMountPathEnvironmentVariable, bindMountPath),
+            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            await using var app = await appHost.BuildAsync(cts.Token);
+
+            await app.StartAsync(cts.Token);
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+            var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+            await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+            var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+            await AssertRoundTripAsync(connectionString!, "appdb", "aliased-tmp", "safe", cts.Token);
+
+            var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+
+            // The wrapper was told, at model-build time, that '/tmp' is the data directory's own
+            // storage, so it fell through to the next candidate.
+            var command = await GetContainerConfigListAsync(containerId, "Cmd");
+            Assert.Contains("\"/tmp|/data\"", command[1], StringComparison.Ordinal);
+
+            var (exitCode, output) = await RunDockerAsync(
+                "exec", containerId, "/bin/bash", "-c",
+                "find /data -maxdepth 1 -type d -name 'aspire-documentdb-otel.*' -print");
+            Assert.True(exitCode == 0, $"Could not inspect DATA_PATH: {output}");
+            Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
+
+            await app.StopAsync(cts.Token);
+        }
+        finally
+        {
+            await TryRelaxBindMountPermissionsAsync(bindMountPath);
+            TryDeleteDirectory(bindMountPath);
+        }
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
