@@ -25,6 +25,11 @@ public class AddDocumentDBTests
     // claims the data directory with an exclusive lock. Pinned explicitly so these tests describe
     // that image's behaviour regardless of which version the package currently defaults to.
     private const string InterlockedTag = "pg17-0.116.0";
+    // The official image with the registry folded into the image annotation instead of kept
+    // beside it. Aspire joins the two and never re-splits them, so this resolves to exactly the
+    // reference the default spelling resolves to.
+    private const string QualifiedOfficialImage =
+        DocumentDBContainerImageTags.Registry + "/" + DocumentDBContainerImageTags.Image;
     private const string GatewayConfigurationShell = "/bin/bash";
     private const string GatewayConfigurationShellArgumentZero = "--";
     private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
@@ -1166,6 +1171,146 @@ public class AddDocumentDBTests
             () => ConfigureResourceAsync(app, "DocumentDB"));
 
         Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The review reproduction, on the capability that is most visible: the declared-volume
+    /// warning is raised only for images known to declare <c>/data</c>, and this resource runs one.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedOfficialImageStillDeclaresItsDataVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("declares '/data' as a container volume", message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And on the capability that is a safety decision: the pair may share a directory only
+    /// because this image refuses the second start.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedOfficialImagePairIsStillInterlocked()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("primary")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "standby", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("exclusive lock", message, StringComparison.Ordinal);
+        Assert.Contains("WithExplicitStart()", message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A private mirror spelled the same way keeps the same treatment: only the registry differs.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedPrivateMirrorStillDeclaresItsDataVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage($"contoso.azurecr.io/{DocumentDBContainerImageTags.Image}", InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.Contains(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A path in front of the repository that is not a registry is part of the repository, so it
+    /// is a different image and keeps the custom-image treatment.
+    /// </summary>
+    [Theory]
+    [InlineData("evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil/documentdb/documentdb-local")]
+    public async Task AnExtraPathSegmentIsNotTheOfficialImage(string image)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// Writing the registry into the image without clearing the registry annotation composes
+    /// <c>ghcr.io/documentdb/ghcr.io/...</c>, which resolves to nothing. It is not the official
+    /// image and must not be treated as one.
+    /// </summary>
+    [Fact]
+    public async Task ADoubledRegistryPrefixIsNotTheOfficialImage()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        Assert.Equal(
+            $"{DocumentDBContainerImageTags.Registry}/{QualifiedOfficialImage}:{InterlockedTag}",
+            manifest["image"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// What the manifest ships is the point: the rearranged spelling publishes the same reference
+    /// as the default one, which is why it has to classify the same way.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedOfficialImagePublishesTheOfficialReference()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!);
+
+        var defaultBuilder = CreateAppBuilder();
+        var byDefault = defaultBuilder.AddDocumentDB("DocumentDB").WithImageTag(InterlockedTag);
+
+        Assert.Equal(
+            (await ManifestUtils.GetManifest(byDefault.Resource))["image"]?.GetValue<string>(),
+            (await ManifestUtils.GetManifest(documentDB.Resource))["image"]?.GetValue<string>());
     }
 
     /// <summary>
@@ -3781,6 +3926,102 @@ public class AddDocumentDBTests
         Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The review reproduction: the official image with its registry folded into the image
+    /// annotation resolves to exactly the reference the default spelling resolves to, so it needs
+    /// the same wrapper.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForAQualifiedOfficialImage()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Theory]
+    // Only the registry differs, in every spelling of the boundary.
+    [InlineData("contoso.azurecr.io/documentdb/documentdb-local", null)]
+    [InlineData("localhost:5000/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb/documentdb-local", "ghcr.io")]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForQualifiedPrivateMirrors(
+        string image,
+        string? registry)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+    }
+
+    [Theory]
+    // A leading path that is not a registry is part of the repository.
+    [InlineData("evil/documentdb/documentdb-local", null)]
+    [InlineData("ghcr.io/evil/documentdb/documentdb-local", null)]
+    // Leaving the registry annotation in place composes a doubled, unresolvable reference.
+    [InlineData("ghcr.io/documentdb/documentdb/documentdb-local", "ghcr.io/documentdb")]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForLookalikeReferences(
+        string image,
+        string? registry)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// A digest pin makes the version opaque whichever way the reference is spelled, and whether
+    /// the digest arrives through <c>WithImageSHA256</c> or inside the reference itself.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedQualifiedOfficialImage(bool digestInline)
+    {
+        const string Digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        if (digestInline)
+        {
+            documentDB.WithImage($"{QualifiedOfficialImage}@sha256:{Digest}");
+        }
+        else
+        {
+            documentDB.WithImage(QualifiedOfficialImage, InterlockedTag).WithImageSHA256(Digest);
+        }
+
+        documentDB.WithImageRegistry(null!).WithOpenTelemetryMetrics();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(Digest, exception.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenDisabled()
     {
@@ -4551,6 +4792,27 @@ public class AddDocumentDBTests
         Assert.Equal("true", resource["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
     }
 
+    /// <summary>
+    /// Through the real publishing pipeline: the rearranged spelling publishes the same image
+    /// reference as the default one, and carries the wrapper with it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAWrappedManifestForAQualifiedOfficialImage()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage(QualifiedOfficialImage, InterlockedTag)
+                .WithImageRegistry(null!)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Equal($"{QualifiedOfficialImage}:{InterlockedTag}", resource!["image"]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+        Assert.Equal(3, resource["args"]?.AsArray().Count);
+    }
+
     [Fact]
     public async Task WithOpenTelemetryMetricsFailsPublishForADigestPinnedOfficialImage()
     {
@@ -5229,6 +5491,92 @@ public class AddDocumentDBTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => PublishBeforeResourceStartedAsync(controlApp, controlResource, useEmptyServices: true));
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardEnforcedForAQualifiedOfficialImage()
+    {
+        // The floor is a property of the published release, and this is the published release —
+        // written with the registry inside the image annotation.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, "pg17-0.110.0")
+            .WithImageRegistry(null!)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true));
+
+        Assert.Contains("requires DocumentDB", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardSkippedForAnExtraPathSegment()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("evil/documentdb/documentdb-local", "pg17-0.110.0")
+            .WithImageRegistry(null!)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("custom image", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorIsEnforcedForAQualifiedOfficialImage()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, "pg18-0.113.0")
+            .WithImageRegistry(null!);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true));
+
+        Assert.Contains("only publishes pg18 images", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A Dockerfile build is decided before the reference is read, so no spelling of the image
+    /// annotation brings the version-dependent behaviour back.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildStaysCustomEvenWithAQualifiedOfficialImage()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, "pg17-0.110.0")
+            .WithImageRegistry(null!)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("Dockerfile", warnings[0].Message, StringComparison.Ordinal);
     }
 
     private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)
