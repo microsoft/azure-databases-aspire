@@ -58,6 +58,13 @@ public class Program
     /// </summary>
     public const string TelemetryWrapperArgumentOrderScenario = "telemetry-wrapper-argument-order";
 
+    /// <summary>
+    /// Telemetry wrapper with one host directory bind-mounted twice: as the data directory and at
+    /// <c>/tmp</c>. The two container paths do not contain one another, so only the backing
+    /// storage tells them apart.
+    /// </summary>
+    public const string TelemetryAliasedTemporaryRootScenario = "telemetry-aliased-temporary-root";
+
     /// <summary>WithPostgresVersion(Pg15).</summary>
     public const string Pg15Scenario = "pg15";
 
@@ -230,12 +237,22 @@ public class Program
                 break;
 
             case TelemetryWrapperArgumentOrderScenario:
-                // '--disable-extended-rum' takes no operand, so it is a complete image-entrypoint
                 // argument on its own. Inserting it at the front is exactly what used to produce
                 // '/bin/bash --disable-extended-rum -c <script> --', which starts nothing.
                 documentDB
                     .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false)
                     .WithArgs(context => context.Args.Insert(0, "--disable-extended-rum"));
+                break;
+
+            case TelemetryAliasedTemporaryRootScenario:
+                // One host directory, two windows onto it. '/tmp' and '/data' do not contain one
+                // another as container paths, so a wrapper that only compared container paths
+                // would write its scratch copy straight into the fresh data directory and
+                // DocumentDB 0.116.0 would refuse to initialise it.
+                documentDB
+                    .WithDataBindMount(GetRequired(BindMountPathEnvironmentVariable))
+                    .WithBindMount(GetRequired(BindMountPathEnvironmentVariable), "/tmp")
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
                 break;
 
             case Pg15Scenario:

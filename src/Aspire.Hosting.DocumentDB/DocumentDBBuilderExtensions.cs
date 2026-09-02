@@ -214,6 +214,18 @@ public static class DocumentDBBuilderExtensions
     /// other resolution would sanitize a file the gateway does not read.
     /// </para>
     /// <para>
+    /// The scratch directory the sanitized copy is written to has to be outside <c>DATA_PATH</c>
+    /// <em>and</em> outside the storage that backs it. Two container paths that do not contain one
+    /// another can still be one directory — a bind mount of the same host directory at
+    /// <c>/tmp</c> and at <c>/data</c>, or one named volume mounted twice — and a scratch
+    /// directory created through the second window appears inside the data directory, which
+    /// DocumentDB <c>0.116.0</c> refuses to initialise. The container path test stays in the
+    /// script, because <c>DATA_PATH</c> can still be moved at runtime with <c>--data-path</c>; the
+    /// backing test is decided here, where the mount table is known, and emitted as the exact set
+    /// of data directories each candidate root cannot be used with. See
+    /// <see cref="BuildOpenTelemetryScratchRootAliases"/>.
+    /// </para>
+    /// <para>
     /// Single-line and brace-free on purpose. Publishers post-process container arguments: azd
     /// evaluates <c>{...}</c> in every argument as a manifest binding expression, so a shell
     /// <c>${VAR:-default}</c> is either passed through by luck or rejected outright, and a newline
@@ -221,7 +233,12 @@ public static class DocumentDBBuilderExtensions
     /// </para>
     /// </remarks>
     private static string BuildOpenTelemetryGatewayConfigurationScript(
-        OpenTelemetryGatewayConfigurationAnnotation configuration) =>
+        IResource resource,
+        OpenTelemetryGatewayConfigurationAnnotation configuration)
+    {
+        var aliases = BuildOpenTelemetryScratchRootAliases(resource);
+
+        return
         "set -e; " +
         "c=\"$CONFIG_DIR\"; " +
         "if [ -z \"$c\" ]; then " +
@@ -251,18 +268,407 @@ public static class DocumentDBBuilderExtensions
         "if ! d=\"$(realpath -m -- \"$d\" 2>/dev/null)\"; then echo \"aspire-documentdb -- DATA_PATH could not be canonicalized for the telemetry configuration\" >&2; exit 1; fi; " +
         "if [ \"$d\" = \"/\" ]; then echo \"aspire-documentdb -- no temporary directory can be safely separated from a root DATA_PATH\" >&2; exit 1; fi; " +
         "r=\"\"; " +
-        "for x in /tmp /var/tmp /dev/shm; do " +
-            "if ! x=\"$(realpath -m -- \"$x\" 2>/dev/null)\"; then continue; fi; " +
+        (aliases.Length == 0 ? "" : "w=\"\"; ") +
+        $"for y in {string.Join(' ', s_openTelemetryScratchRoots)}; do " +
+            (aliases.Length == 0 ? "" : $"case \"$y|$d\" in {string.Join('|', aliases)}) w=1; continue;; esac; ") +
+            "if ! x=\"$(realpath -m -- \"$y\" 2>/dev/null)\"; then continue; fi; " +
             "if [ ! -d \"$x\" ] || [ ! -w \"$x\" ]; then continue; fi; " +
             "case \"$x\" in \"$d\"|\"$d\"/*) continue;; esac; " +
             "case \"$d\" in \"$x\"|\"$x\"/*) continue;; esac; " +
             "r=\"$x\"; break; " +
         "done; " +
-        "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi; " +
+        (aliases.Length == 0
+            ? "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi; "
+            : "if [ -z \"$r\" ]; then " +
+                "if [ -n \"$w\" ]; then " +
+                    "echo \"aspire-documentdb -- every temporary directory is on the same host directory or volume as DATA_PATH ($d), so the telemetry configuration cannot be kept out of it\" >&2; " +
+                "else " +
+                    "echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; " +
+                "fi; " +
+                "exit 1; " +
+            "fi; ") +
         "if ! o=\"$(mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\")\"; then echo \"aspire-documentdb -- could not create the temporary gateway configuration\" >&2; exit 1; fi; " +
         $"jq '{BuildOpenTelemetryGatewayConfigurationFilter(configuration)}' \"$s\" >\"$o/SetupConfiguration.json\"; " +
         "export CONFIG_DIR=\"$o\"; " +
         $"exec {GatewayEntrypointScriptPath} \"$@\"";
+    }
+
+    /// <summary>
+    /// Canonicalizes an absolute Linux container path the way the container runtime resolves one
+    /// before mounting: repeated separators collapse, <c>.</c> segments drop out, <c>..</c>
+    /// segments remove the preceding one, and a <c>..</c> at the root is clamped to the root.
+    /// </summary>
+    /// <remarks>
+    /// Every storage comparison runs on canonical paths, because Docker compares the resolved path
+    /// and not the string the caller wrote: <c>/data</c>, <c>//data/</c>, <c>/foo/../data</c> and
+    /// <c>/../data</c> are one and the same mount destination. Comparing them as written would let
+    /// an alias of the data directory be picked as a scratch root. Returns <see langword="null"/>
+    /// for a path the runtime would refuse outright — one that is not absolute, or that collapses
+    /// to the container root.
+    /// </remarks>
+    private static string? CanonicalizeContainerPath(string? path)
+    {
+        if (string.IsNullOrEmpty(path) || path[0] != '/')
+        {
+            return null;
+        }
+
+        var segments = new List<string>();
+
+        foreach (var segment in path.Split('/'))
+        {
+            if (segment.Length == 0 || string.Equals(segment, ".", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (string.Equals(segment, "..", StringComparison.Ordinal))
+            {
+                if (segments.Count > 0)
+                {
+                    segments.RemoveAt(segments.Count - 1);
+                }
+
+                // The runtime clamps at the root rather than failing, so canonicalization
+                // continues on the clamped path: that is the destination it really creates.
+                continue;
+            }
+
+            segments.Add(segment);
+        }
+
+        return segments.Count == 0 ? null : "/" + string.Join('/', segments);
+    }
+
+    /// <summary>
+    /// The container path a mount really lands on, or <see langword="null"/> when the runtime would
+    /// refuse the target outright.
+    /// </summary>
+    private static string? ResolveMountTarget(ContainerMountAnnotation mount) =>
+        CanonicalizeContainerPath(mount.Target);
+
+    /// <summary>
+    /// Whether <paramref name="canonicalPath"/> is inside — or is — the directory a mount on
+    /// <paramref name="canonicalTarget"/> supplies. Both paths are canonical, and the comparison is
+    /// made on segment boundaries so <c>/datastore</c> is not treated as living under <c>/data</c>.
+    /// </summary>
+    private static bool BacksContainerPath(string canonicalTarget, string canonicalPath) =>
+        string.Equals(canonicalTarget, canonicalPath, StringComparison.Ordinal) ||
+        (canonicalPath.Length > canonicalTarget.Length &&
+         canonicalPath[canonicalTarget.Length] == '/' &&
+         canonicalPath.StartsWith(canonicalTarget, StringComparison.Ordinal));
+
+    // Host paths are compared case-sensitively only where the platform's filesystem is,
+    // so a bind mount reused as "C:\Data" and "c:\data" is still recognised as shared.
+    private static readonly StringComparison HostPathComparison =
+        OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+
+    /// <summary>
+    /// Canonicalizes a bind mount's host path with host semantics, so aliases of one directory
+    /// compare equal: <c>/srv/documentdb</c>, <c>/srv/documentdb/</c>, <c>/srv/documentdb/.</c> and
+    /// <c>/srv/documentdb/../documentdb</c> are the same host directory.
+    /// </summary>
+    /// <remarks>
+    /// Symbolic links are deliberately not resolved: doing so needs the directory to exist at
+    /// model-build time and would make the answer depend on the state of the host filesystem at a
+    /// moment that has nothing to do with the run.
+    /// </remarks>
+    private static string CanonicalizeHostPath(string source)
+    {
+        try
+        {
+            var trimmed = source.TrimEnd('/', '\\');
+            // Trimming a rooted path down to nothing ("/" or "C:\") leaves no path to resolve.
+            return Path.GetFullPath(trimmed.Length == 0 ? source : trimmed);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
+        {
+            // An unresolvable spelling is compared as written rather than crashing the wrapper.
+            return source;
+        }
+    }
+
+    /// <summary>
+    /// The host directory a bind-mounted container path really occupies: the mount source with the
+    /// part of the path that falls below the mount target appended, canonicalized with host
+    /// semantics.
+    /// </summary>
+    private static string CanonicalizeHostDataDirectory(string source, string containerSubpath)
+    {
+        if (containerSubpath.Length == 0)
+        {
+            return CanonicalizeHostPath(source);
+        }
+
+        // The subpath is a container path; its separators become the host's on the way through.
+        var hostSubpath = containerSubpath.Replace('/', Path.DirectorySeparatorChar);
+
+        try
+        {
+            return CanonicalizeHostPath(Path.Combine(CanonicalizeHostPath(source), hostSubpath));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
+        {
+            // Same fallback as CanonicalizeHostPath: compare what was written rather than crash.
+            return source + Path.DirectorySeparatorChar + hostSubpath;
+        }
+    }
+
+    /// <summary>
+    /// The scratch roots the wrapper will try, in order. Each has to exist, be writable, be
+    /// outside <c>DATA_PATH</c> as a container path, and be backed by storage that is not the
+    /// storage <c>DATA_PATH</c> is on.
+    /// </summary>
+    private static readonly string[] s_openTelemetryScratchRoots = ["/tmp", "/var/tmp", "/dev/shm"];
+
+    /// <summary>
+    /// Where a container path really lives: the host directory a bind mount opens onto, or a named
+    /// volume plus the part of the path that falls below its mount point.
+    /// </summary>
+    /// <remarks>
+    /// A bind mount is a window onto the host filesystem, so its region is a single host path —
+    /// the mount source with the container subpath appended — and two windows onto the same
+    /// directory, or onto a directory and one of its ancestors, are the same storage however
+    /// differently their container paths are spelled. A volume name is not a path and cannot be
+    /// combined with one, so a volume's region stays its name plus the subdirectory, compared
+    /// exactly: the container reads that subdirectory on its own case-sensitive filesystem.
+    /// </remarks>
+    private readonly record struct MountBackingRegion(ContainerMountType Type, string Source, string Subpath);
+
+    /// <summary>
+    /// For every scratch root that some mount backs, the canonical <c>DATA_PATH</c> values that
+    /// would put the wrapper's scratch directory on the same storage as the data directory,
+    /// rendered as quoted <c>case</c> patterns over <c>"$y|$d"</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A candidate root that no mount covers lives in the container's own filesystem and cannot
+    /// alias anything the container path test does not already catch, so it contributes nothing
+    /// and the emitted script is exactly the one a resource with no mounts gets.
+    /// </para>
+    /// <para>
+    /// The data directory is only known at runtime — <c>DATA_PATH</c> can be a deferred value and
+    /// <c>--data-path</c> can move it again — but the mount table is known here, so the answer is
+    /// expressed as the set of data directories each candidate is incompatible with rather than as
+    /// a decision. Two shapes produce that set: a mount whose whole region falls inside the
+    /// candidate's region, which makes every path under that mount an alias; and a mount whose
+    /// region contains the candidate's, which makes the one path that lands on the candidate's
+    /// region an alias, together with everything under it and each of its ancestors down to the
+    /// mount point — a data directory above the scratch region contains it just as surely as one
+    /// inside it.
+    /// </para>
+    /// <para>
+    /// Anonymous volumes are left out: nothing else can be mounted from one, so a candidate and a
+    /// data directory on the same anonymous volume are the same container path subtree, which the
+    /// script's own test already refuses.
+    /// </para>
+    /// </remarks>
+    private static System.Collections.Immutable.ImmutableArray<string> BuildOpenTelemetryScratchRootAliases(IResource resource)
+    {
+        var mounts = resource.Annotations.OfType<ContainerMountAnnotation>()
+            .Select(mount => (Mount: mount, Target: ResolveMountTarget(mount)))
+            .Where(entry => entry.Target is not null && entry.Mount.Source is not null)
+            .Select(entry => (entry.Mount, Target: entry.Target!))
+            .ToList();
+
+        if (mounts.Count == 0)
+        {
+            return [];
+        }
+
+        var patterns = new List<string>();
+
+        foreach (var candidate in s_openTelemetryScratchRoots)
+        {
+            // The most specific mount wins, exactly as the kernel resolves it. Duplicate targets
+            // are a configuration the storage rules refuse in their own right; here they are all
+            // taken into account, because either of them could be the one that supplies the root.
+            var depth = -1;
+            var forbidden = new SortedSet<string>(StringComparer.Ordinal);
+
+            foreach (var (mount, target) in mounts)
+            {
+                if (!BacksContainerPath(target, candidate) || target.Length < depth)
+                {
+                    continue;
+                }
+
+                if (target.Length > depth)
+                {
+                    depth = target.Length;
+                    forbidden.Clear();
+                }
+
+                var candidateRegion = DescribeMountBackingRegion(mount, target, candidate);
+
+                foreach (var (other, otherTarget) in mounts)
+                {
+                    var otherRegion = DescribeMountBackingRegion(other, otherTarget, otherTarget);
+
+                    if (TryGetRegionSubpath(candidateRegion, otherRegion, out _))
+                    {
+                        // Everything the other mount supplies is inside the candidate's region.
+                        AddForbiddenDataPath(forbidden, candidate, otherTarget, withDescendants: true);
+                        continue;
+                    }
+
+                    if (!TryGetRegionSubpath(otherRegion, candidateRegion, out var delta))
+                    {
+                        continue;
+                    }
+
+                    // The candidate's region is one directory below the other mount's. That exact
+                    // container path is the alias, and so is anything under it - and so is every
+                    // directory between the mount point and it, which would contain it.
+                    var path = otherTarget;
+                    foreach (var segment in delta.Split('/', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        AddForbiddenDataPath(forbidden, candidate, path, withDescendants: false);
+                        path += "/" + segment;
+                    }
+
+                    AddForbiddenDataPath(forbidden, candidate, path, withDescendants: true);
+                }
+            }
+
+            patterns.AddRange(forbidden);
+        }
+
+        return [.. patterns];
+    }
+
+    /// <summary>
+    /// Records a data directory the candidate root cannot be used with, unless the script's own
+    /// container-path test already refuses that pair.
+    /// </summary>
+    /// <remarks>
+    /// A data directory at or below the candidate root — and, with
+    /// <paramref name="withDescendants"/>, everything below it — is already excluded at runtime by
+    /// <c>case "$d" in "$x"|"$x"/*</c>, whatever storage backs either of them. Emitting it again
+    /// would only make the wrapper report an aliasing problem where the plain container-path rule
+    /// is the reason.
+    /// </remarks>
+    private static void AddForbiddenDataPath(
+        SortedSet<string> forbidden,
+        string candidate,
+        string dataPath,
+        bool withDescendants)
+    {
+        if (BacksContainerPath(candidate, dataPath))
+        {
+            return;
+        }
+
+        forbidden.Add(QuoteScratchAliasPattern(candidate, dataPath));
+
+        if (withDescendants)
+        {
+            forbidden.Add(QuoteScratchAliasPattern(candidate, dataPath) + "/*");
+        }
+    }
+
+    /// <summary>
+    /// The region <paramref name="path"/> occupies, given that <paramref name="mount"/> lands on
+    /// <paramref name="mountTarget"/> and supplies it.
+    /// </summary>
+    private static MountBackingRegion DescribeMountBackingRegion(
+        ContainerMountAnnotation mount,
+        string mountTarget,
+        string path)
+    {
+        var subpath = path.Length == mountTarget.Length ? string.Empty : path[(mountTarget.Length + 1)..];
+
+        return mount.Type == ContainerMountType.BindMount
+            ? new(ContainerMountType.BindMount, CanonicalizeHostDataDirectory(mount.Source!, subpath), string.Empty)
+            : new(ContainerMountType.Volume, mount.Source!, subpath);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="inner"/> is inside — or is — <paramref name="outer"/>, and if so
+    /// how far below it, as a <c>/</c>-separated relative path.
+    /// </summary>
+    private static bool TryGetRegionSubpath(MountBackingRegion outer, MountBackingRegion inner, out string subpath)
+    {
+        subpath = string.Empty;
+
+        if (outer.Type != inner.Type)
+        {
+            return false;
+        }
+
+        if (outer.Type == ContainerMountType.BindMount)
+        {
+            if (string.Equals(outer.Source, inner.Source, HostPathComparison))
+            {
+                return true;
+            }
+
+            if (inner.Source.Length <= outer.Source.Length ||
+                !IsHostPathSeparator(inner.Source[outer.Source.Length]) ||
+                !inner.Source.StartsWith(outer.Source, HostPathComparison))
+            {
+                return false;
+            }
+
+            subpath = inner.Source[(outer.Source.Length + 1)..]
+                .Replace(Path.DirectorySeparatorChar, '/')
+                .Replace(Path.AltDirectorySeparatorChar, '/');
+            return true;
+        }
+
+        if (!string.Equals(outer.Source, inner.Source, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (outer.Subpath.Length == 0)
+        {
+            subpath = inner.Subpath;
+            return true;
+        }
+
+        if (string.Equals(outer.Subpath, inner.Subpath, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (inner.Subpath.Length <= outer.Subpath.Length ||
+            inner.Subpath[outer.Subpath.Length] != '/' ||
+            !inner.Subpath.StartsWith(outer.Subpath, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        subpath = inner.Subpath[(outer.Subpath.Length + 1)..];
+        return true;
+    }
+
+    private static bool IsHostPathSeparator(char value) =>
+        value == Path.DirectorySeparatorChar || value == Path.AltDirectorySeparatorChar;
+
+    /// <summary>
+    /// One <c>case</c> pattern matching the literal candidate root and data directory pair, as a
+    /// quoted shell word so that a path containing a glob character matches only itself.
+    /// </summary>
+    private static string QuoteScratchAliasPattern(string candidate, string dataPath) =>
+        "\"" + EscapeShellDoubleQuoted(candidate) + "|" + EscapeShellDoubleQuoted(dataPath) + "\"";
+
+    private static string EscapeShellDoubleQuoted(string value)
+    {
+        var escaped = new System.Text.StringBuilder(value.Length);
+
+        foreach (var character in value)
+        {
+            if (character is '\\' or '"' or '$' or '`')
+            {
+                escaped.Append('\\');
+            }
+
+            escaped.Append(character);
+        }
+
+        return escaped.ToString();
+    }
 
     /// <summary>
     /// Builds the <c>jq</c> filter that removes exactly the <c>SetupConfiguration.json</c> keys
@@ -1495,7 +1901,7 @@ public static class DocumentDBBuilderExtensions
                     $"entrypoint.");
             }
 
-            var script = BuildOpenTelemetryGatewayConfigurationScript(configuration);
+            var script = BuildOpenTelemetryGatewayConfigurationScript(builder.Resource, configuration);
 
             state.Args.Insert(0, GatewayConfigurationShellArgumentZero);
             state.Args.Insert(0, script);
@@ -1932,7 +2338,7 @@ public static class DocumentDBBuilderExtensions
         var configuration = resource.Annotations
             .OfType<OpenTelemetryGatewayConfigurationAnnotation>()
             .Single();
-        var expectedScript = BuildOpenTelemetryGatewayConfigurationScript(configuration);
+        var expectedScript = BuildOpenTelemetryGatewayConfigurationScript(resource, configuration);
 
         if (command.WrapperScript is null ||
             !string.Equals(command.ShellOption, GatewayConfigurationShellCommandOption, StringComparison.Ordinal) ||

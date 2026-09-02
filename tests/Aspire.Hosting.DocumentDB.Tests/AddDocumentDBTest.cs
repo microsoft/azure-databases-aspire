@@ -878,12 +878,189 @@ public class AddDocumentDBTests
         Assert.Contains("--username) q=\"v\"", script, StringComparison.Ordinal);
         Assert.Contains("realpath -m -- \"$d\"", script, StringComparison.Ordinal);
         Assert.Contains("if [ \"$d\" = \"/\" ]", script, StringComparison.Ordinal);
-        Assert.Contains("for x in /tmp /var/tmp /dev/shm", script, StringComparison.Ordinal);
-        Assert.Contains("realpath -m -- \"$x\"", script, StringComparison.Ordinal);
+        Assert.Contains("for y in /tmp /var/tmp /dev/shm", script, StringComparison.Ordinal);
+        Assert.Contains("realpath -m -- \"$y\"", script, StringComparison.Ordinal);
         Assert.Contains("case \"$x\" in \"$d\"|\"$d\"/*) continue;; esac", script, StringComparison.Ordinal);
         Assert.Contains("case \"$d\" in \"$x\"|\"$x\"/*) continue;; esac", script, StringComparison.Ordinal);
         Assert.Contains("mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\"", script, StringComparison.Ordinal);
         Assert.DoesNotContain("o=\"$(mktemp -d)\"", script, StringComparison.Ordinal);
+
+        // Nothing here can alias the data directory, so nothing about the backing storage is
+        // emitted: this is the script every resource without mounts gets.
+        Assert.DoesNotContain("$y|$d", script, StringComparison.Ordinal);
+        Assert.Contains(
+            "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi",
+            script,
+            StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // The scratch root and the storage that backs it
+    //
+    // Two container paths that do not contain one another can still be one
+    // directory: a bind mount of the same host directory at /tmp and at /data,
+    // or one named volume mounted twice. A scratch directory created through
+    // the second window appears inside DATA_PATH, and DocumentDB 0.116.0
+    // refuses to initialise a data directory that is not empty.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ATemporaryRootBoundToTheSameHostDirectoryAsDataPathIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/documentdb", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("case \"$y|$d\" in ", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+
+        // The other two candidates are in the container's own filesystem, so they are left alone
+        // and one of them is what the wrapper falls back to.
+        Assert.DoesNotContain("\"/var/tmp|", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"/dev/shm|", script, StringComparison.Ordinal);
+        Assert.Contains("every temporary directory is on the same host directory or volume as DATA_PATH", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ATemporaryRootOnTheSameNamedVolumeAsDataPathIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataVolume(name: "documentdb-data")
+            .WithVolume("documentdb-data", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A mount target that is an ancestor of the data directory's host directory backs it just as
+    /// surely as one that is exactly it.
+    /// </summary>
+    [Fact]
+    public async Task ATemporaryRootBoundToAnAncestorOfTheDataDirectoryIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other direction: the scratch root is a subdirectory of the data directory's host tree,
+    /// so it aliases the data directory itself and every directory above it inside that tree — but
+    /// not a sibling.
+    /// </summary>
+    [Fact]
+    public async Task ATemporaryRootBoundBelowTheDataDirectoryAliasesOnlyTheDirectoriesThatContainIt()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithBindMount("/srv/documentdb/scratch", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // '/data' contains the scratch region, and '/data/scratch' is it.
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data/scratch\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data/scratch\"/*", script, StringComparison.Ordinal);
+
+        // A sibling data directory is a different host directory and stays usable.
+        Assert.DoesNotContain("\"/tmp|/data/cluster\"", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ATemporaryRootBackedByDifferentStorageIsLeftAlone()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/scratch", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.DoesNotContain("$y|$d", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// With every candidate on the data directory's storage there is nowhere safe left, and the
+    /// wrapper says so rather than writing into the data directory.
+    /// </summary>
+    [Fact]
+    public async Task EveryTemporaryRootAliasingTheDataDirectoryIsReportedByTheWrapper()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/documentdb", "/tmp")
+            .WithBindMount("/srv/documentdb", "/var/tmp")
+            .WithBindMount("/srv/documentdb", "/dev/shm")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/var/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/dev/shm|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains(
+            "if [ -n \"$w\" ]; then echo \"aspire-documentdb -- every temporary directory is on the same host directory or volume as DATA_PATH ($d), so the telemetry configuration cannot be kept out of it\" >&2; ",
+            script,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The wrapper is part of the container command, so the aliasing decision has to survive the
+    /// manifest exactly as it survives a run.
+    /// </summary>
+    [Fact]
+    public async Task TheScratchRootAliasingDecisionIsPublishedInTheManifest()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithDataBindMount("/srv/documentdb")
+                .WithBindMount("/srv/documentdb", "/tmp")
+                .WithOpenTelemetryMetrics());
+
+        var script = manifest["resources"]?["DocumentDB"]?["args"]?[1]?.ToString();
+
+        Assert.NotNull(script);
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -415,6 +415,20 @@ If one is missing, the configuration file cannot be read, or no safe temporary d
 available, the container fails to start with a diagnostic rather than starting silently without
 the override.
 
+The sanitized copy is written to a scratch directory that has to be outside `DATA_PATH` *and*
+outside the storage that backs it. Two container paths that do not contain one another can still be
+one directory — one host directory bind-mounted at both `/tmp` and `/data`, or one named volume
+mounted twice — and a scratch directory created through the second window appears inside the data
+directory, which DocumentDB `0.116.0` refuses to initialise. The container-path test stays in the
+container, because `DATA_PATH` can be moved again at runtime with `--data-path`; the backing-storage
+test is decided while the model is built, where the mount table is known, and travels with the
+command as the exact set of data directories each candidate root cannot be used with. Mount targets
+that are ancestors of the data directory or of a candidate root, and the relative subpaths below
+them, are taken into account, so `/srv` mounted at `/tmp` and `/srv/documentdb` mounted at `/data`
+are recognised as one region. Candidates are tried in the order `/tmp`, `/var/tmp`, `/dev/shm`, and
+if every one of them is on the data directory's storage the container fails to start with a
+diagnostic that says so.
+
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
 larger granularities.
