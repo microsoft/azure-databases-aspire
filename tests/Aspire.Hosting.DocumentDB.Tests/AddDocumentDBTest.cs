@@ -2710,6 +2710,11 @@ public class AddDocumentDBTests
         { ["--pod=runtime-secret"], "--pod" },
         { ["--pod-id-file", "/runtime-secret/pod-id"], "--pod-id-file" },
         { ["--pod-id-file=/runtime-secret/pod-id"], "--pod-id-file" },
+        { ["--read-only"], "--read-only" },
+        { ["--read-only=true"], "--read-only" },
+        { ["--read-only=false"], "--read-only" },
+        { ["--storage-opt", "overlay2.size=runtime-secret"], "--storage-opt" },
+        { ["--storage-opt=overlay2.size=runtime-secret"], "--storage-opt" },
     };
 
     [Theory]

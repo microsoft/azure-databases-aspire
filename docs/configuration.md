@@ -368,7 +368,7 @@ instead of guessing:
   validation and replaces the wrapper arguments with one joined `-c` string, producing a nested
   shell command that does not start DocumentDB. Leave it `null` or set it to `false`.
 - Passing raw `--entrypoint`, `--rootfs`, `--mount`, `--volume`/`-v`, `--volume-driver`,
-  `--tmpfs`, `--volumes-from`, or `--use-api-socket` options through
+  `--tmpfs`, `--volumes-from`, `--read-only`, `--storage-opt`, or `--use-api-socket` options through
   `WithContainerRuntimeArgs(...)`. Podman-specific storage changes are covered too, including
   `--secret`, `--image-volume`, `--chrootdirs`, `--ipc`, `--read-only-tmpfs`, and `--systemd`.
   Joining a pod through `--pod` or `--pod-id-file` is rejected because it can replace the
