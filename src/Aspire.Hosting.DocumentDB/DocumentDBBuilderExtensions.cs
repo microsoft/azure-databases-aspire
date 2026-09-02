@@ -254,11 +254,11 @@ public static class DocumentDBBuilderExtensions
     /// so only the effective tag at start time can be judged.
     /// </para>
     /// <para>
-    /// Same carve-outs as <see cref="SubscribeMinimumPostgresImageGuard"/>: custom images and
-    /// tags outside the strict <c>pg{NN}-X.Y.Z</c> grammar are exempt, and the guard is run-mode
-    /// only, so manifest generation is unaffected. Unlike that guard this one is always
-    /// subscribed, so the exempt paths stay silent rather than warning on every app that pins a
-    /// custom image.
+    /// Same carve-outs as <see cref="SubscribeMinimumPostgresImageGuard"/>: custom images, tags
+    /// outside the strict <c>pg{NN}-X.Y.Z</c> grammar and caller-owned Dockerfile builds are
+    /// exempt, and the guard is run-mode only, so manifest generation is unaffected. Unlike that
+    /// guard this one is always subscribed, so the exempt paths stay silent rather than warning on
+    /// every app that pins a custom image.
     /// </para>
     /// </remarks>
     private static IResourceBuilder<DocumentDBServerResource> SubscribeMinimumPgVariantImageGuard(
@@ -268,25 +268,16 @@ public static class DocumentDBBuilderExtensions
             builder.Resource,
             (evt, ct) =>
             {
-                var imageAnnotation = evt.Resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
-                if (imageAnnotation is null)
-                {
-                    // Defensive: AddDocumentDB sets ContainerImageAnnotation eagerly via WithImage.
-                    return Task.CompletedTask;
-                }
-
-                // A fork publishing its own images decides its own variant matrix.
-                if (!string.Equals(imageAnnotation.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
+                // Only a curated image is pulled by tag from the upstream registry. A fork
+                // publishing its own images decides its own variant matrix, and a resource built
+                // from the caller's own Dockerfile never resolves that tag at all.
+                var image = ResolveEffectiveImage(evt.Resource);
+                if (image is not { Origin: DocumentDBImageOrigin.Curated, KnownVersion: { } docVersion })
                 {
                     return Task.CompletedTask;
                 }
 
-                if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(imageAnnotation.Tag, out var pg, out var docVersion))
-                {
-                    return Task.CompletedTask;
-                }
-
-                if (!DocumentDBContainerImageTags.MinimumVersionByPgVariant.TryGetValue(pg, out var minimum) ||
+                if (!DocumentDBContainerImageTags.MinimumVersionByPgVariant.TryGetValue(image.PostgresVariant, out var minimum) ||
                     docVersion >= minimum)
                 {
                     return Task.CompletedTask;
@@ -294,16 +285,122 @@ public static class DocumentDBBuilderExtensions
 
                 throw new InvalidOperationException(
                     $"DocumentDB resource '{evt.Resource.Name}' resolves to image tag " +
-                    $"'{imageAnnotation.Tag}', but upstream only publishes pg{pg} images from " +
-                    $"DocumentDB v{minimum} onwards. That tag does not exist on " +
+                    $"'{image.Tag}', but upstream only publishes pg{image.PostgresVariant} images " +
+                    $"from DocumentDB v{minimum} onwards. That tag does not exist on " +
                     $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}, " +
                     $"so starting the resource would fail with an opaque manifest-not-found error. " +
-                    $"Recovery: pair '.WithPostgresVersion(DocumentDBPostgresVersion.Pg{pg})' with " +
-                    $"DocumentDB v{minimum} or newer, or choose a PostgreSQL variant that exists " +
-                    $"for v{docVersion}.");
+                    $"Recovery: pair " +
+                    $"'.WithPostgresVersion(DocumentDBPostgresVersion.Pg{image.PostgresVariant})' " +
+                    $"with DocumentDB v{minimum} or newer, or choose a PostgreSQL variant that " +
+                    $"exists for v{docVersion}.");
             });
 
         return builder;
+    }
+
+    /// <summary>
+    /// How much this package can know about the container image a DocumentDB resource will
+    /// actually run.
+    /// </summary>
+    private enum DocumentDBImageOrigin
+    {
+        /// <summary>The resource carries no <see cref="ContainerImageAnnotation"/> at all.</summary>
+        None,
+
+        /// <summary>
+        /// The image is the output of a container build the caller owns, so nothing this package
+        /// documents about a published DocumentDB release has been established for it.
+        /// </summary>
+        DockerfileBuild,
+
+        /// <summary>A repository other than the curated <c>documentdb-local</c> one.</summary>
+        CustomRepository,
+
+        /// <summary>
+        /// The curated repository, with a tag outside the strict <c>pg{NN}-X.Y.Z</c> grammar.
+        /// </summary>
+        UnrecognizedTag,
+
+        /// <summary>
+        /// The curated repository with a tag this build recognises — the only origin that carries
+        /// a DocumentDB version.
+        /// </summary>
+        Curated,
+    }
+
+    /// <summary>
+    /// What this package knows about the container image a DocumentDB resource will run.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="KnownVersion"/> and <see cref="PostgresVariant"/> are populated only when
+    /// <see cref="Origin"/> is <see cref="DocumentDBImageOrigin.Curated"/>. Every
+    /// version-dependent decision in this package is therefore gated on
+    /// <c>KnownVersion is { } version</c>: one place decides what is known, and no caller can
+    /// conclude a version from an image whose version is not known.
+    /// </remarks>
+    private readonly record struct DocumentDBEffectiveImage(
+        DocumentDBImageOrigin Origin,
+        string? Image,
+        string? Tag,
+        string? Digest,
+        int PostgresVariant,
+        Version? KnownVersion);
+
+    /// <summary>
+    /// Resolves what this package knows about the container image <paramref name="resource"/>
+    /// will actually run.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A container build the caller owns is decided first and unconditionally, because for such a
+    /// resource the image annotation does not describe what runs. Aspire keeps the
+    /// <see cref="ContainerImageAnnotation"/> that <c>AddDocumentDB</c> installs when
+    /// <c>WithDockerfile(...)</c> is chained onto the resource, and a caller may also point that
+    /// annotation at the official repository and tag afterwards, so a Dockerfile-built resource
+    /// can be annotated indistinguishably from an official release while running an image built
+    /// from an arbitrary <c>Dockerfile</c> — one that merely inherits the official image as its
+    /// base, or does not use it at all. What runs is the build output: the manifest emits
+    /// <c>build</c> instead of <c>image</c>, and in run mode the orchestrator builds the context
+    /// before starting the container. None of the release properties this package acts on — the
+    /// <c>/data</c> volume declaration, the data-directory <c>flock</c>, the PostgreSQL credential
+    /// pass-through, the gateway configuration layout and entrypoint — has been proven for such an
+    /// image, so it is classified as unknown rather than granted them on the strength of a label.
+    /// </para>
+    /// <para>
+    /// <see cref="DockerfileBuildAnnotation"/> is the single authoritative signal, and one check
+    /// covers every entry point: <c>WithDockerfile</c>, <c>WithDockerfileFactory</c> and
+    /// <c>WithDockerfileBuilder</c> all add it — the last adds a
+    /// <c>DockerfileBuilderCallbackAnnotation</c> beside it, not instead of it.
+    /// <c>DockerfileBaseImageAnnotation</c> on its own is not a build: it selects base images for
+    /// a <em>generated</em> Dockerfile, and with no build to generate one it changes neither the
+    /// image a container resource pulls nor the manifest it publishes.
+    /// </para>
+    /// </remarks>
+    private static DocumentDBEffectiveImage ResolveEffectiveImage(IResource resource)
+    {
+        var image = resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
+
+        if (resource.Annotations.OfType<DockerfileBuildAnnotation>().Any())
+        {
+            return new(DocumentDBImageOrigin.DockerfileBuild, image?.Image, image?.Tag, image?.SHA256, 0, null);
+        }
+
+        if (image is null)
+        {
+            return new(DocumentDBImageOrigin.None, null, null, null, 0, null);
+        }
+
+        if (!string.Equals(image.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
+        {
+            return new(DocumentDBImageOrigin.CustomRepository, image.Image, image.Tag, image.SHA256, 0, null);
+        }
+
+        if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(image.Tag, out var pg, out var version))
+        {
+            return new(DocumentDBImageOrigin.UnrecognizedTag, image.Image, image.Tag, image.SHA256, 0, null);
+        }
+
+        return new(DocumentDBImageOrigin.Curated, image.Image, image.Tag, image.SHA256, pg, version);
     }
 
     /// <summary>
@@ -472,7 +569,10 @@ public static class DocumentDBBuilderExtensions
     /// single warning. Tags that do not match the strict <c>pg{NN}-X.Y.Z</c> pattern
     /// (e.g., <c>nightly</c>, <c>pg17-0.112.0-rc.1</c>) are also exempt with a single
     /// warning, so callers pinning custom builds or pre-releases are not surprised by an
-    /// unactionable hard failure.
+    /// unactionable hard failure. A resource built from the caller's own Dockerfile is exempt
+    /// on the same terms even when its image annotation names the curated image and a
+    /// recognised tag, because the tag describes the build's starting point at best and the
+    /// floor is a property of the published release.
     /// </para>
     /// </remarks>
     private static IResourceBuilder<DocumentDBServerResource> SubscribeMinimumPostgresImageGuard(
@@ -489,8 +589,8 @@ public static class DocumentDBBuilderExtensions
             builder.Resource,
             (evt, ct) =>
             {
-                var imageAnnotation = evt.Resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
-                if (imageAnnotation is null)
+                var image = ResolveEffectiveImage(evt.Resource);
+                if (image.Origin == DocumentDBImageOrigin.None)
                 {
                     // Defensive: AddDocumentDB sets ContainerImageAnnotation eagerly via WithImage.
                     return Task.CompletedTask;
@@ -498,10 +598,30 @@ public static class DocumentDBBuilderExtensions
 
                 var logger = TryGetResourceLogger(evt, PostgresEndpointLoggerCategory);
 
+                // Caller-built carve-out, judged before the repository because a Dockerfile build
+                // may carry the curated repository and tag verbatim: what starts is the output of
+                // that build, so the tag says nothing about whether the credential fix is in it.
+                if (image.Origin == DocumentDBImageOrigin.DockerfileBuild)
+                {
+                    if (Interlocked.CompareExchange(ref warningLogged, 1, 0) == 0)
+                    {
+                        logger?.LogWarning(
+                            "DocumentDB resource '{ResourceName}' builds its container image from a Dockerfile, " +
+                            "so what it runs is not a published DocumentDB release however its image annotation " +
+                            "'{Image}:{Tag}' reads. The v{MinVersion} minimum required by WithPostgresEndpoint() " +
+                            "for credential parity is NOT enforced on Dockerfile builds.",
+                            evt.Resource.Name,
+                            image.Image,
+                            image.Tag,
+                            DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
+                    }
+                    return Task.CompletedTask;
+                }
+
                 // Custom-image carve-out: only enforce the floor on the curated
                 // documentdb-local image. A fork using a different image name
                 // (regardless of registry) is assumed to know what it is doing.
-                if (!string.Equals(imageAnnotation.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
+                if (image.Origin == DocumentDBImageOrigin.CustomRepository)
                 {
                     if (Interlocked.CompareExchange(ref warningLogged, 1, 0) == 0)
                     {
@@ -510,14 +630,14 @@ public static class DocumentDBBuilderExtensions
                             "The v{MinVersion} minimum required by WithPostgresEndpoint() for credential parity " +
                             "is NOT enforced on custom images.",
                             evt.Resource.Name,
-                            imageAnnotation.Image,
-                            imageAnnotation.Tag,
+                            image.Image,
+                            image.Tag,
                             DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
                     }
                     return Task.CompletedTask;
                 }
 
-                if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(imageAnnotation.Tag, out _, out var docVersion))
+                if (image.KnownVersion is not { } docVersion)
                 {
                     if (Interlocked.CompareExchange(ref warningLogged, 1, 0) == 0)
                     {
@@ -526,7 +646,7 @@ public static class DocumentDBBuilderExtensions
                             "the curated 'pg{{NN}}-X.Y.Z' pattern. The v{MinVersion} minimum required by " +
                             "WithPostgresEndpoint() for credential parity is NOT enforced on unrecognised tags.",
                             evt.Resource.Name,
-                            imageAnnotation.Tag,
+                            image.Tag,
                             DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
                     }
                     return Task.CompletedTask;
@@ -536,7 +656,7 @@ public static class DocumentDBBuilderExtensions
                 {
                     throw new InvalidOperationException(
                         $"DocumentDB resource '{evt.Resource.Name}' is configured with image tag " +
-                        $"'{imageAnnotation.Tag}', but WithPostgresEndpoint() requires DocumentDB " +
+                        $"'{image.Tag}', but WithPostgresEndpoint() requires DocumentDB " +
                         $"v{DocumentDBContainerImageTags.MinimumPostgresEndpointVersion} or later. " +
                         $"Earlier images hard-code the PostgreSQL admin credentials to " +
                         $"'docdb_admin'/'Admin100', so the Aspire-generated postgresql:// connection " +
@@ -1005,17 +1125,19 @@ public static class DocumentDBBuilderExtensions
     /// claims the directory with an exclusive <c>flock</c>, so the container that starts second
     /// refuses to start; when one of the two resources is started by hand
     /// (<see cref="ResourceBuilderExtensions.WithExplicitStart{T}"/>) the pair may never overlap
-    /// and the combination is reported as a warning. Older, unrecognised, and custom images have
-    /// no such interlock — simultaneous access is not refused, it silently corrupts — so there the
-    /// combination stays a hard failure regardless of explicit start.
+    /// and the combination is reported as a warning. Older, unrecognised, and custom images — and
+    /// images built from the caller's own Dockerfile, whatever their annotations say — are not
+    /// known to hold that lock: simultaneous access is not refused, it silently corrupts, so there
+    /// the combination stays a hard failure regardless of explicit start.
     /// </para>
     /// <para>
     /// It also warns once when the data mount does not cover <c>/data</c> on an image known to
     /// declare that path as a container <c>VOLUME</c>: neither Docker nor Aspire can un-declare an
     /// image volume, so the only way to suppress the anonymous volume the runtime would otherwise
     /// create is to mount the caller's storage on that exact path. Images that declare no volume
-    /// (at or below <c>0.114.0</c>), unrecognised tags, and custom images produce no such warning,
-    /// because for them an unmounted <c>/data</c> is just a directory in the container layer.
+    /// (at or below <c>0.114.0</c>), unrecognised tags, custom images and caller-owned Dockerfile
+    /// builds produce no such warning, because for them an unmounted <c>/data</c> is just a
+    /// directory in the container layer.
     /// </para>
     /// <para>
     /// The guard runs <em>inside</em> the resource's real configuration pipeline rather than
@@ -1758,8 +1880,9 @@ public static class DocumentDBBuilderExtensions
               "the data directory'."
             : "At least one of the two runs an image with no data-directory interlock (DocumentDB " +
               "before v" + DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion +
-              ", an unrecognised tag, or a custom image), so nothing refuses the second start: two " +
-              "PostgreSQL instances would open the same data directory and corrupt it silently.";
+              ", an unrecognised tag, a custom image, or a Dockerfile build), so nothing refuses " +
+              "the second start: two PostgreSQL instances would open the same data directory and " +
+              "corrupt it silently.";
 
         var explicitStart = explicitStartNote
             ? " One of the two is started manually (WithExplicitStart()), so this is reported as a " +
@@ -1784,19 +1907,13 @@ public static class DocumentDBBuilderExtensions
     /// <summary>
     /// Whether the resource resolves to a curated <c>documentdb-local</c> image new enough to
     /// declare <c>/data</c> as a container volume and to claim the data directory with an
-    /// exclusive lock. Custom images and unrecognised tags resolve to <see langword="false"/>:
-    /// the package cannot know what they do, so it neither promises the interlock nor warns
-    /// about an image volume that may not exist.
+    /// exclusive lock. Custom images, unrecognised tags and images built from the caller's own
+    /// Dockerfile resolve to <see langword="false"/>: the package cannot know what they do, so it
+    /// neither promises the interlock nor warns about an image volume that may not exist.
     /// </summary>
-    private static bool ResolvesToDataVolumeAwareImage(IResource resource)
-    {
-        var image = resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
-
-        return image is not null &&
-            string.Equals(image.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal) &&
-            DocumentDBContainerImageTags.TryParseDocumentDBTag(image.Tag, out _, out var version) &&
-            version >= DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion;
-    }
+    private static bool ResolvesToDataVolumeAwareImage(IResource resource) =>
+        ResolveEffectiveImage(resource).KnownVersion is { } version &&
+        version >= DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion;
 
     /// <summary>
     /// Which DocumentDB resources hold which piece of host storage as their data directory, for
@@ -2097,9 +2214,11 @@ public static class DocumentDBBuilderExtensions
     /// <para>
     /// The wrapper is expressed purely as the container <c>entrypoint</c> and <c>args</c>, both of
     /// which round-trip through the Aspire manifest, so publish mode, <c>azd</c> and direct run
-    /// mode all execute the same thing. Custom images and tags outside the <c>pg{NN}-X.Y.Z</c>
-    /// grammar are left completely untouched; private mirrors of the official image are not,
-    /// because only the registry differs. Pinning the official image by digest throws, because the
+    /// mode all execute the same thing. Custom images, tags outside the <c>pg{NN}-X.Y.Z</c>
+    /// grammar and resources built from your own Dockerfile are left completely untouched — the
+    /// last of those even when the resource's image annotation names the official image and a
+    /// recognised tag, because what runs is the build output; private mirrors of the official
+    /// image are not, because only the registry differs. Pinning the official image by digest throws, because the
     /// digest makes the version opaque and both applying and skipping the wrapper on a guess are
     /// silently wrong. Supplying your own container entrypoint on the same resource also throws,
     /// because the two cannot both own the container command. The wrapper needs <c>bash</c> and
@@ -2397,8 +2516,9 @@ public static class DocumentDBBuilderExtensions
     /// precedence arrived in that release, it is the newest published DocumentDB version, and
     /// nothing upstream retracts it. Tags outside the strict <c>pg{NN}-X.Y.Z</c> grammar and
     /// images other than the official one are exempt, so forks and custom images keep the stock
-    /// behaviour. Private mirrors of the official image are not exempt, because only the registry
-    /// differs.
+    /// behaviour. So is any resource built from the caller's own Dockerfile, whose image
+    /// annotation describes the build at best and may name the official image exactly. Private
+    /// mirrors of the official image are not exempt, because only the registry differs.
     /// </para>
     /// <para>
     /// A digest pin on the official image makes the version opaque - the runtime resolves the
@@ -2422,18 +2542,23 @@ public static class DocumentDBBuilderExtensions
             return GatewayConfigurationRequirement.NotConfigured;
         }
 
-        var image = resource.Annotations.OfType<ContainerImageAnnotation>().LastOrDefault();
-        if (image is null ||
-            !string.Equals(image.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
+        var image = ResolveEffectiveImage(resource);
+
+        // A caller-owned Dockerfile build lands here with the custom images: it is not the
+        // official image however its annotations read, and every part of the wrapper - the
+        // entrypoint script path, the packaged configuration layout, bash and jq - is a property
+        // of the official image that this package has not established for a build it did not
+        // produce.
+        if (image.Origin is not (DocumentDBImageOrigin.Curated or DocumentDBImageOrigin.UnrecognizedTag))
         {
-            return NotRequired(configuration, resource, image?.Tag);
+            return NotRequired(configuration, resource, image);
         }
 
-        if (!string.IsNullOrEmpty(image.SHA256))
+        if (!string.IsNullOrEmpty(image.Digest))
         {
             throw new InvalidOperationException(
                 $"DocumentDB resource '{resource.Name}' pins " +
-                $"{DocumentDBContainerImageTags.Image} by digest '{image.SHA256}', so its " +
+                $"{DocumentDBContainerImageTags.Image} by digest '{image.Digest}', so its " +
                 $"DocumentDB version cannot be determined and the tag " +
                 $"'{image.Tag ?? "<none>"}' is not what the runtime resolves. " +
                 $"WithOpenTelemetryMetrics() needs the version because DocumentDB " +
@@ -2445,29 +2570,33 @@ public static class DocumentDBBuilderExtensions
                 $"names.");
         }
 
-        if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(image.Tag, out _, out var version))
+        if (image.KnownVersion is not { } version)
         {
-            return NotRequired(configuration, resource, image.Tag);
+            return NotRequired(configuration, resource, image);
         }
 
         return version >= FirstGatewayTelemetryConfigurationVersion
             ? GatewayConfigurationRequirement.Required
-            : NotRequired(configuration, resource, image.Tag);
+            : NotRequired(configuration, resource, image);
 
         // The wrapper cannot be uninstalled once the entrypoint carries it: an image swapped in
         // after installation would leave /bin/bash with no arguments, which starts nothing.
         static GatewayConfigurationRequirement NotRequired(
             OpenTelemetryGatewayConfigurationAnnotation configuration,
             DocumentDBServerResource resource,
-            string? tag)
+            DocumentDBEffectiveImage image)
         {
             if (configuration.EntrypointOwned)
             {
+                var description = image.Origin == DocumentDBImageOrigin.DockerfileBuild
+                    ? $"a Dockerfile build (annotated '{image.Tag ?? "<none>"}')"
+                    : $"an image ('{image.Tag ?? "<none>"}')";
+
                 throw new InvalidOperationException(
-                    $"DocumentDB resource '{resource.Name}' changed to an image " +
-                    $"('{tag ?? "<none>"}') that does not need the WithOpenTelemetryMetrics() " +
-                    $"compatibility wrapper after that wrapper had already taken over the " +
-                    $"container entrypoint. Select the image before configuring metrics.");
+                    $"DocumentDB resource '{resource.Name}' changed to {description} that does " +
+                    $"not need the WithOpenTelemetryMetrics() compatibility wrapper after that " +
+                    $"wrapper had already taken over the container entrypoint. Select the image " +
+                    $"before configuring metrics.");
             }
 
             return GatewayConfigurationRequirement.NotApplicable;
