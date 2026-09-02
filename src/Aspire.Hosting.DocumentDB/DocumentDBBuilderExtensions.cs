@@ -1,6 +1,8 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+#pragma warning disable ASPIRECONTAINERSHELLEXECUTION001 // Guard Aspire's experimental shell argument rewrite.
+
 using System.Globalization;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.DocumentDB;
@@ -48,9 +50,9 @@ public static class DocumentDBBuilderExtensions
         public CommandLineArgsCallbackAnnotation CommandLineCallback { get; set; } = null!;
 
         /// <summary>
-        /// The container-runtime-arguments callback. It contributes nothing and exists only to be
-        /// a checkpoint: Aspire never caches these, so it is the one piece of this package's code
-        /// that is guaranteed to run on every container creation.
+        /// The terminal container-runtime-arguments callback. Aspire never caches these, so it is
+        /// guaranteed to run on every container creation: it verifies the command seal, then
+        /// resolves and validates the completed runtime-argument list.
         /// </summary>
         public ContainerRuntimeArgsCallbackAnnotation RuntimeCheckpoint { get; set; } = null!;
 
@@ -115,6 +117,7 @@ public static class DocumentDBBuilderExtensions
         System.Collections.Immutable.ImmutableArray<EnvironmentCallbackAnnotation> EnvironmentCallbacks,
         System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
         string? Entrypoint,
+        bool ShellExecutionEnabled,
         DocumentDBEffectiveImage Image,
         TerminalCommandSeal Command);
 
@@ -201,6 +204,385 @@ public static class DocumentDBBuilderExtensions
         "--init-data|--init-data-path|--key-file|--log-level|--owner|--password|--pg-port|--start-pg|" +
         "--tlsMode|--toast-compression|--username";
 
+    private enum ContainerRuntimeOptionValueArity
+    {
+        None,
+        Required,
+    }
+
+    private enum ContainerRuntimeOptionEffect
+    {
+        None,
+        Storage,
+        Entrypoint,
+        Environment,
+        EnvironmentFile,
+    }
+
+    private readonly record struct ContainerRuntimeOption(
+        string LongName,
+        char? ShortName,
+        ContainerRuntimeOptionValueArity ValueArity,
+        ContainerRuntimeOptionEffect Effect = ContainerRuntimeOptionEffect.None);
+
+    /// <summary>
+    /// Docker <c>run</c> options that consume a following value, plus the short boolean options
+    /// needed to parse a compact token such as <c>-it</c>. Keeping the grammar in one typed table
+    /// is what prevents a value such as <c>--mount</c>, supplied to an unrelated option, from being
+    /// mistaken for another option.
+    /// </summary>
+    private static readonly ContainerRuntimeOption[] s_containerRuntimeOptions =
+    [
+        new("add-host", null, ContainerRuntimeOptionValueArity.Required),
+        new("annotation", null, ContainerRuntimeOptionValueArity.Required),
+        new("attach", 'a', ContainerRuntimeOptionValueArity.Required),
+        new("blkio-weight", null, ContainerRuntimeOptionValueArity.Required),
+        new("blkio-weight-device", null, ContainerRuntimeOptionValueArity.Required),
+        new("cap-add", null, ContainerRuntimeOptionValueArity.Required),
+        new("cap-drop", null, ContainerRuntimeOptionValueArity.Required),
+        new("cgroup-parent", null, ContainerRuntimeOptionValueArity.Required),
+        new("cgroupns", null, ContainerRuntimeOptionValueArity.Required),
+        new("cidfile", null, ContainerRuntimeOptionValueArity.Required),
+        new("cpu-period", null, ContainerRuntimeOptionValueArity.Required),
+        new("cpu-quota", null, ContainerRuntimeOptionValueArity.Required),
+        new("cpu-rt-period", null, ContainerRuntimeOptionValueArity.Required),
+        new("cpu-rt-runtime", null, ContainerRuntimeOptionValueArity.Required),
+        new("cpu-shares", 'c', ContainerRuntimeOptionValueArity.Required),
+        new("cpus", null, ContainerRuntimeOptionValueArity.Required),
+        new("cpuset-cpus", null, ContainerRuntimeOptionValueArity.Required),
+        new("cpuset-mems", null, ContainerRuntimeOptionValueArity.Required),
+        new("detach", 'd', ContainerRuntimeOptionValueArity.None),
+        new("detach-keys", null, ContainerRuntimeOptionValueArity.Required),
+        new("device", null, ContainerRuntimeOptionValueArity.Required),
+        new("device-cgroup-rule", null, ContainerRuntimeOptionValueArity.Required),
+        new("device-read-bps", null, ContainerRuntimeOptionValueArity.Required),
+        new("device-read-iops", null, ContainerRuntimeOptionValueArity.Required),
+        new("device-write-bps", null, ContainerRuntimeOptionValueArity.Required),
+        new("device-write-iops", null, ContainerRuntimeOptionValueArity.Required),
+        new("dns", null, ContainerRuntimeOptionValueArity.Required),
+        new("dns-option", null, ContainerRuntimeOptionValueArity.Required),
+        new("dns-search", null, ContainerRuntimeOptionValueArity.Required),
+        new("domainname", null, ContainerRuntimeOptionValueArity.Required),
+        new("entrypoint", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Entrypoint),
+        new("env", 'e', ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Environment),
+        new("env-file", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.EnvironmentFile),
+        new("expose", null, ContainerRuntimeOptionValueArity.Required),
+        new("gpus", null, ContainerRuntimeOptionValueArity.Required),
+        new("group-add", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-cmd", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-interval", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-retries", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-start-interval", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-start-period", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-timeout", null, ContainerRuntimeOptionValueArity.Required),
+        new("hostname", 'h', ContainerRuntimeOptionValueArity.Required),
+        new("interactive", 'i', ContainerRuntimeOptionValueArity.None),
+        new("ip", null, ContainerRuntimeOptionValueArity.Required),
+        new("ip6", null, ContainerRuntimeOptionValueArity.Required),
+        new("ipc", null, ContainerRuntimeOptionValueArity.Required),
+        new("isolation", null, ContainerRuntimeOptionValueArity.Required),
+        new("label", 'l', ContainerRuntimeOptionValueArity.Required),
+        new("label-file", null, ContainerRuntimeOptionValueArity.Required),
+        new("link", null, ContainerRuntimeOptionValueArity.Required),
+        new("link-local-ip", null, ContainerRuntimeOptionValueArity.Required),
+        new("log-driver", null, ContainerRuntimeOptionValueArity.Required),
+        new("log-opt", null, ContainerRuntimeOptionValueArity.Required),
+        new("mac-address", null, ContainerRuntimeOptionValueArity.Required),
+        new("memory", 'm', ContainerRuntimeOptionValueArity.Required),
+        new("memory-reservation", null, ContainerRuntimeOptionValueArity.Required),
+        new("memory-swap", null, ContainerRuntimeOptionValueArity.Required),
+        new("memory-swappiness", null, ContainerRuntimeOptionValueArity.Required),
+        new("mount", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("name", null, ContainerRuntimeOptionValueArity.Required),
+        new("network", null, ContainerRuntimeOptionValueArity.Required),
+        new("network-alias", null, ContainerRuntimeOptionValueArity.Required),
+        new("oom-score-adj", null, ContainerRuntimeOptionValueArity.Required),
+        new("pid", null, ContainerRuntimeOptionValueArity.Required),
+        new("pids-limit", null, ContainerRuntimeOptionValueArity.Required),
+        new("platform", null, ContainerRuntimeOptionValueArity.Required),
+        new("publish", 'p', ContainerRuntimeOptionValueArity.Required),
+        new("publish-all", 'P', ContainerRuntimeOptionValueArity.None),
+        new("pull", null, ContainerRuntimeOptionValueArity.Required),
+        new("quiet", 'q', ContainerRuntimeOptionValueArity.None),
+        new("restart", null, ContainerRuntimeOptionValueArity.Required),
+        new("runtime", null, ContainerRuntimeOptionValueArity.Required),
+        new("security-opt", null, ContainerRuntimeOptionValueArity.Required),
+        new("shm-size", null, ContainerRuntimeOptionValueArity.Required),
+        new("stop-signal", null, ContainerRuntimeOptionValueArity.Required),
+        new("stop-timeout", null, ContainerRuntimeOptionValueArity.Required),
+        new("storage-opt", null, ContainerRuntimeOptionValueArity.Required),
+        new("sysctl", null, ContainerRuntimeOptionValueArity.Required),
+        new("tmpfs", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("tty", 't', ContainerRuntimeOptionValueArity.None),
+        new("ulimit", null, ContainerRuntimeOptionValueArity.Required),
+        new("use-api-socket", null, ContainerRuntimeOptionValueArity.None, ContainerRuntimeOptionEffect.Storage),
+        new("user", 'u', ContainerRuntimeOptionValueArity.Required),
+        new("userns", null, ContainerRuntimeOptionValueArity.Required),
+        new("uts", null, ContainerRuntimeOptionValueArity.Required),
+        new("volume", 'v', ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("volume-driver", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("volumes-from", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("workdir", 'w', ContainerRuntimeOptionValueArity.Required),
+    ];
+
+    private static readonly IReadOnlyDictionary<string, ContainerRuntimeOption> s_longContainerRuntimeOptions =
+        s_containerRuntimeOptions.ToDictionary(option => option.LongName, StringComparer.Ordinal);
+
+    private static readonly IReadOnlyDictionary<char, ContainerRuntimeOption> s_shortContainerRuntimeOptions =
+        s_containerRuntimeOptions
+            .Where(option => option.ShortName is not null)
+            .ToDictionary(option => option.ShortName!.Value);
+
+    private static readonly HashSet<string> s_openTelemetryRuntimeProtectedEnvironmentVariables =
+        new(StringComparer.Ordinal)
+        {
+            "CONFIG_DIR",
+            "GATEWAY_HOME",
+            DataPathEnvVarName,
+            EnableTelemetryEnvVarName,
+            OtelMetricsEnabledEnvVarName,
+            OtelExporterOtlpMetricsEndpointEnvVarName,
+            OtelExporterOtlpMetricsTimeoutEnvVarName,
+            OtelMetricExportIntervalEnvVarName,
+            OtelServiceNameEnvVarName,
+            OtelServiceVersionEnvVarName,
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TIMEOUT",
+            "OTEL_RESOURCE_ATTRIBUTES",
+        };
+
+    private sealed class ContainerRuntimeArgumentParser(DocumentDBServerResource resource)
+    {
+        private ContainerRuntimeOption? _pendingOption;
+        private bool _endOfOptions;
+
+        public void Parse(string argument)
+        {
+            if (_pendingOption is { } pending)
+            {
+                _pendingOption = null;
+                ValidateValue(pending, argument);
+                return;
+            }
+
+            if (_endOfOptions)
+            {
+                return;
+            }
+
+            if (string.Equals(argument, "--", StringComparison.Ordinal))
+            {
+                _endOfOptions = true;
+                return;
+            }
+
+            if (argument.StartsWith("--", StringComparison.Ordinal) && argument.Length > 2)
+            {
+                ParseLongOption(argument);
+                return;
+            }
+
+            if (argument.Length > 1 && argument[0] == '-' && argument[1] != '-')
+            {
+                ParseShortOptions(argument);
+            }
+        }
+
+        public void Complete()
+        {
+            if (_pendingOption is { Effect: ContainerRuntimeOptionEffect.Environment })
+            {
+                throw UnsafeContainerRuntimeEnvironment(resource, "the option has no value");
+            }
+        }
+
+        private void ParseLongOption(string argument)
+        {
+            var equals = argument.IndexOf('=', 2);
+            var name = equals < 0 ? argument[2..] : argument[2..equals];
+
+            if (!s_longContainerRuntimeOptions.TryGetValue(name, out var option))
+            {
+                return;
+            }
+
+            var hasAttachedValue = equals >= 0;
+            var attachedValue = hasAttachedValue ? argument[(equals + 1)..] : null;
+            Apply(option, hasAttachedValue, attachedValue);
+        }
+
+        private void ParseShortOptions(string argument)
+        {
+            for (var index = 1; index < argument.Length; index++)
+            {
+                if (!s_shortContainerRuntimeOptions.TryGetValue(argument[index], out var option))
+                {
+                    return;
+                }
+
+                if (option.Effect is ContainerRuntimeOptionEffect.Storage or
+                    ContainerRuntimeOptionEffect.Entrypoint)
+                {
+                    Reject(option);
+                }
+
+                if (option.ValueArity == ContainerRuntimeOptionValueArity.None)
+                {
+                    continue;
+                }
+
+                var attachedValue = argument[(index + 1)..];
+                var hasAttachedValue = attachedValue.Length > 0;
+                if (attachedValue.StartsWith('='))
+                {
+                    attachedValue = attachedValue[1..];
+                    hasAttachedValue = true;
+                }
+
+                Apply(option, hasAttachedValue, attachedValue);
+                return;
+            }
+        }
+
+        private void Apply(ContainerRuntimeOption option, bool hasAttachedValue, string? attachedValue)
+        {
+            if (option.Effect is ContainerRuntimeOptionEffect.Storage or
+                ContainerRuntimeOptionEffect.Entrypoint or
+                ContainerRuntimeOptionEffect.EnvironmentFile)
+            {
+                Reject(option);
+            }
+
+            if (option.ValueArity == ContainerRuntimeOptionValueArity.None)
+            {
+                return;
+            }
+
+            if (hasAttachedValue)
+            {
+                ValidateValue(option, attachedValue!);
+            }
+            else
+            {
+                _pendingOption = option;
+            }
+        }
+
+        private void ValidateValue(ContainerRuntimeOption option, string value)
+        {
+            if (option.Effect != ContainerRuntimeOptionEffect.Environment)
+            {
+                return;
+            }
+
+            var equals = value.IndexOf('=');
+            var name = equals < 0 ? value : value[..equals];
+
+            if (s_openTelemetryRuntimeProtectedEnvironmentVariables.Contains(name))
+            {
+                throw UnsafeContainerRuntimeEnvironment(resource, "it overrides protected container configuration");
+            }
+        }
+
+        private void Reject(ContainerRuntimeOption option)
+        {
+            var displayName = "--" + option.LongName;
+
+            throw option.Effect switch
+            {
+                ContainerRuntimeOptionEffect.Storage => UnsafeContainerRuntimeStorage(resource, displayName),
+                ContainerRuntimeOptionEffect.Entrypoint => UnsafeContainerRuntimeEntrypoint(resource),
+                ContainerRuntimeOptionEffect.EnvironmentFile =>
+                    UnsafeContainerRuntimeEnvironment(resource, "an environment file cannot be inspected"),
+                _ => throw new InvalidOperationException(),
+            };
+        }
+    }
+
+    private static InvalidOperationException UnsafeContainerRuntimeStorage(
+        DocumentDBServerResource resource,
+        string option) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds the storage-changing container runtime " +
+            $"option '{option}' while the WithOpenTelemetryMetrics() compatibility wrapper is " +
+            $"required. Raw runtime mounts are applied outside the resource's mount model, so the " +
+            $"wrapper cannot prove that its temporary configuration stays off DATA_PATH storage. " +
+            $"Use WithBindMount(...) or WithVolume(...) so the mount can be validated, or remove " +
+            $"the raw runtime option.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeEntrypoint(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds the container runtime option " +
+            $"'--entrypoint' while the WithOpenTelemetryMetrics() compatibility wrapper is " +
+            $"required. That raw option can replace the verified '/bin/bash' entrypoint after the " +
+            $"resource model has been sealed. Configure no custom entrypoint, or drop " +
+            $"WithOpenTelemetryMetrics() and configure telemetry from your own entrypoint.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeEnvironment(
+        DocumentDBServerResource resource,
+        string reason) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds a raw container runtime environment " +
+            $"override while the WithOpenTelemetryMetrics() compatibility wrapper is required, " +
+            $"but {reason}. The override could invalidate the telemetry command or its DATA_PATH " +
+            $"isolation after the resource model has been sealed. Use WithEnvironment(...) so " +
+            $"the value is part of the validated model.");
+
+    /// <summary>
+    /// Resolves the completed runtime-argument list once, validates the exact strings Docker will
+    /// receive, and replaces deferred values with those strings so Aspire does not resolve them a
+    /// second time.
+    /// </summary>
+    private static async Task ValidateOpenTelemetryContainerRuntimeArgumentsAsync(
+        DocumentDBServerResource resource,
+        ContainerRuntimeArgsCallbackContext context,
+        DistributedApplicationExecutionContext executionContext)
+    {
+        if (ResolveOpenTelemetryGatewayConfigurationRequirement(resource) !=
+            GatewayConfigurationRequirement.Required)
+        {
+            return;
+        }
+
+        var parser = new ContainerRuntimeArgumentParser(resource);
+        var resolvedArguments = new List<object>(context.Args.Count);
+        var valueProviderContext = new ValueProviderContext
+        {
+            Caller = resource,
+            ExecutionContext = executionContext,
+        };
+
+        foreach (var argument in context.Args.ToArray())
+        {
+            var resolved = argument switch
+            {
+                string value => value,
+                IValueProvider provider => await provider
+                    .GetValueAsync(valueProviderContext, context.CancellationToken)
+                    .ConfigureAwait(false),
+                null => null,
+                _ => argument.ToString(),
+            };
+
+            if (resolved is null)
+            {
+                continue;
+            }
+
+            parser.Parse(resolved);
+            resolvedArguments.Add(resolved);
+        }
+
+        parser.Complete();
+
+        context.Args.Clear();
+        foreach (var argument in resolvedArguments)
+        {
+            context.Args.Add(argument);
+        }
+    }
+
     /// <summary>
     /// Builds the wrapper script that makes the OpenTelemetry environment variables this package
     /// writes authoritative over the gateway's <c>SetupConfiguration.json</c>.
@@ -222,7 +604,11 @@ public static class DocumentDBBuilderExtensions
     /// DocumentDB <c>0.116.0</c> refuses to initialise. The container path test stays in the
     /// script, because <c>DATA_PATH</c> can still be moved at runtime with <c>--data-path</c>; the
     /// backing test is decided here, where the mount table is known, and emitted as the exact set
-    /// of data directories each candidate root cannot be used with. See
+    /// of data directories each candidate root cannot be used with. Named volumes can be compared
+    /// exactly. Bind sources are resolved by the Docker daemon and may traverse unavailable
+    /// symbolic links, so a bind-backed candidate is conservatively skipped for every bind-backed
+    /// data path without consulting the local filesystem. Raw runtime mounts are rejected before
+    /// container creation because they are absent from this table. See
     /// <see cref="BuildOpenTelemetryScratchRootAliases"/>.
     /// </para>
     /// <para>
@@ -281,7 +667,7 @@ public static class DocumentDBBuilderExtensions
             ? "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi; "
             : "if [ -z \"$r\" ]; then " +
                 "if [ -n \"$w\" ]; then " +
-                    "echo \"aspire-documentdb -- every temporary directory is on the same host directory or volume as DATA_PATH ($d), so the telemetry configuration cannot be kept out of it\" >&2; " +
+                    "echo \"aspire-documentdb -- every temporary directory aliases DATA_PATH storage or cannot be proven independent of it, so the telemetry configuration cannot be kept out of it\" >&2; " +
                 "else " +
                     "echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; " +
                 "fi; " +
@@ -358,74 +744,6 @@ public static class DocumentDBBuilderExtensions
          canonicalPath[canonicalTarget.Length] == '/' &&
          canonicalPath.StartsWith(canonicalTarget, StringComparison.Ordinal));
 
-    // Host paths are compared case-sensitively only where the platform's filesystem is,
-    // so a bind mount reused as "C:\Data" and "c:\data" is still recognised as shared.
-    private static readonly StringComparison HostPathComparison =
-        OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
-
-    /// <summary>
-    /// Canonicalizes a bind mount's host path with host semantics, so aliases of one directory
-    /// compare equal: <c>/srv/documentdb</c>, <c>/srv/documentdb/</c>, <c>/srv/documentdb/.</c> and
-    /// <c>/srv/documentdb/../documentdb</c> are the same host directory.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// Symbolic links are deliberately not resolved, and that is a bounded limitation rather than
-    /// an oversight. Resolving one needs the whole path to exist on the machine building the model
-    /// — <see cref="Directory.ResolveLinkTarget(string, bool)"/> throws for a path that does not,
-    /// and resolves no intermediate link component of a longer path — and a bind source routinely
-    /// does not exist there: the daemon may be in a VM or on another machine entirely, and a
-    /// publish has no daemon at all. Resolving what does exist locally would also make the emitted
-    /// container command, and therefore the manifest, depend on the publishing machine's
-    /// filesystem, which is the one property this package's manifest handling is built to avoid.
-    /// Two bind sources that name one directory only through a link are therefore compared as
-    /// written and treated as different storage. The container's own <c>realpath</c> still resolves
-    /// links inside the image at runtime, Docker resolves the bind source on the daemon side, and
-    /// the <c>0.116.0</c> data-directory interlock still refuses two clusters on one directory, so
-    /// what is lost is the early diagnosis and not the protection.
-    /// </para>
-    /// </remarks>
-    private static string CanonicalizeHostPath(string source)
-    {
-        try
-        {
-            var trimmed = source.TrimEnd('/', '\\');
-            // Trimming a rooted path down to nothing ("/" or "C:\") leaves no path to resolve.
-            return Path.GetFullPath(trimmed.Length == 0 ? source : trimmed);
-        }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
-        {
-            // An unresolvable spelling is compared as written rather than crashing the wrapper.
-            return source;
-        }
-    }
-
-    /// <summary>
-    /// The host directory a bind-mounted container path really occupies: the mount source with the
-    /// part of the path that falls below the mount target appended, canonicalized with host
-    /// semantics.
-    /// </summary>
-    private static string CanonicalizeHostDataDirectory(string source, string containerSubpath)
-    {
-        if (containerSubpath.Length == 0)
-        {
-            return CanonicalizeHostPath(source);
-        }
-
-        // The subpath is a container path; its separators become the host's on the way through.
-        var hostSubpath = containerSubpath.Replace('/', Path.DirectorySeparatorChar);
-
-        try
-        {
-            return CanonicalizeHostPath(Path.Combine(CanonicalizeHostPath(source), hostSubpath));
-        }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
-        {
-            // Same fallback as CanonicalizeHostPath: compare what was written rather than crash.
-            return source + Path.DirectorySeparatorChar + hostSubpath;
-        }
-    }
-
     /// <summary>
     /// The scratch roots the wrapper will try, in order. Each has to exist, be writable, be
     /// outside <c>DATA_PATH</c> as a container path, and be backed by storage that is not the
@@ -434,16 +752,16 @@ public static class DocumentDBBuilderExtensions
     private static readonly string[] s_openTelemetryScratchRoots = ["/tmp", "/var/tmp", "/dev/shm"];
 
     /// <summary>
-    /// Where a container path really lives: the host directory a bind mount opens onto, or a named
-    /// volume plus the part of the path that falls below its mount point.
+    /// Where a volume-backed container path lives: a named volume plus the part of the path below
+    /// its mount point. Bind mounts retain only their type because their physical source cannot be
+    /// proven from a host path string.
     /// </summary>
     /// <remarks>
-    /// A bind mount is a window onto the host filesystem, so its region is a single host path —
-    /// the mount source with the container subpath appended — and two windows onto the same
-    /// directory, or onto a directory and one of its ancestors, are the same storage however
-    /// differently their container paths are spelled. A volume name is not a path and cannot be
-    /// combined with one, so a volume's region stays its name plus the subdirectory, compared
-    /// exactly: the container reads that subdirectory on its own case-sensitive filesystem.
+    /// A bind source is resolved by the Docker daemon, which may be remote and may traverse
+    /// symbolic links that do not exist on the model-building or publishing machine. Therefore two
+    /// bind-backed paths are conservatively treated as potentially aliased regardless of how their
+    /// source strings differ. Named-volume identity is daemon-independent and can still be compared
+    /// exactly.
     /// </remarks>
     private readonly record struct MountBackingRegion(ContainerMountType Type, string Source, string Subpath);
 
@@ -462,12 +780,11 @@ public static class DocumentDBBuilderExtensions
     /// The data directory is only known at runtime — <c>DATA_PATH</c> can be a deferred value and
     /// <c>--data-path</c> can move it again — but the mount table is known here, so the answer is
     /// expressed as the set of data directories each candidate is incompatible with rather than as
-    /// a decision. Two shapes produce that set: a mount whose whole region falls inside the
-    /// candidate's region, which makes every path under that mount an alias; and a mount whose
-    /// region contains the candidate's, which makes the one path that lands on the candidate's
-    /// region an alias, together with everything under it and each of its ancestors down to the
-    /// mount point — a data directory above the scratch region contains it just as surely as one
-    /// inside it.
+    /// a decision. Named volumes can be compared exactly. Bind paths cannot: when both the
+    /// candidate and a possible data path are bind-backed, that candidate is skipped because the
+    /// Docker daemon may resolve lexically different sources through a symbolic link to the same
+    /// directory. This is deliberately independent of the local filesystem so run and publish
+    /// produce the same command for a remote daemon.
     /// </para>
     /// <para>
     /// Anonymous volumes are left out: nothing else can be mounted from one, so a candidate and a
@@ -515,12 +832,31 @@ public static class DocumentDBBuilderExtensions
 
                 foreach (var (other, otherTarget) in mounts)
                 {
+                    if (candidateRegion.Type == ContainerMountType.BindMount &&
+                        other.Type == ContainerMountType.BindMount)
+                    {
+                        // There is no daemon-independent proof that two bind source spellings are
+                        // physically disjoint. The remote daemon may resolve either through an
+                        // ancestor or a symbolic link that is absent on this machine.
+                        AddForbiddenDataPathAndAncestors(
+                            forbidden,
+                            candidate,
+                            otherTarget,
+                            withDescendants: true);
+                        continue;
+                    }
+
                     var otherRegion = DescribeMountBackingRegion(other, otherTarget, otherTarget);
 
                     if (TryGetRegionSubpath(candidateRegion, otherRegion, out _))
                     {
-                        // Everything the other mount supplies is inside the candidate's region.
-                        AddForbiddenDataPath(forbidden, candidate, otherTarget, withDescendants: true);
+                        // Everything the other mount supplies is inside the candidate's region,
+                        // and a DATA_PATH above the mount point contains that alias too.
+                        AddForbiddenDataPathAndAncestors(
+                            forbidden,
+                            candidate,
+                            otherTarget,
+                            withDescendants: true);
                         continue;
                     }
 
@@ -532,6 +868,12 @@ public static class DocumentDBBuilderExtensions
                     // The candidate's region is one directory below the other mount's. That exact
                     // container path is the alias, and so is anything under it - and so is every
                     // directory between the mount point and it, which would contain it.
+                    AddForbiddenDataPathAndAncestors(
+                        forbidden,
+                        candidate,
+                        otherTarget,
+                        withDescendants: false);
+
                     var path = otherTarget;
                     foreach (var segment in delta.Split('/', StringSplitOptions.RemoveEmptyEntries))
                     {
@@ -547,6 +889,32 @@ public static class DocumentDBBuilderExtensions
         }
 
         return [.. patterns];
+    }
+
+    /// <summary>
+    /// Records a mounted alias and every container directory above it, because DATA_PATH contains
+    /// the alias when it names any such ancestor.
+    /// </summary>
+    private static void AddForbiddenDataPathAndAncestors(
+        SortedSet<string> forbidden,
+        string candidate,
+        string dataPath,
+        bool withDescendants)
+    {
+        AddForbiddenDataPath(forbidden, candidate, dataPath, withDescendants);
+
+        var ancestor = dataPath;
+        while (true)
+        {
+            var separator = ancestor.LastIndexOf('/');
+            if (separator <= 0)
+            {
+                break;
+            }
+
+            ancestor = ancestor[..separator];
+            AddForbiddenDataPath(forbidden, candidate, ancestor, withDescendants: false);
+        }
     }
 
     /// <summary>
@@ -591,7 +959,7 @@ public static class DocumentDBBuilderExtensions
         var subpath = path.Length == mountTarget.Length ? string.Empty : path[(mountTarget.Length + 1)..];
 
         return mount.Type == ContainerMountType.BindMount
-            ? new(ContainerMountType.BindMount, CanonicalizeHostDataDirectory(mount.Source!, subpath), string.Empty)
+            ? new(ContainerMountType.BindMount, string.Empty, string.Empty)
             : new(ContainerMountType.Volume, mount.Source!, subpath);
     }
 
@@ -603,29 +971,10 @@ public static class DocumentDBBuilderExtensions
     {
         subpath = string.Empty;
 
-        if (outer.Type != inner.Type)
+        if (outer.Type != ContainerMountType.Volume ||
+            inner.Type != ContainerMountType.Volume)
         {
             return false;
-        }
-
-        if (outer.Type == ContainerMountType.BindMount)
-        {
-            if (string.Equals(outer.Source, inner.Source, HostPathComparison))
-            {
-                return true;
-            }
-
-            if (inner.Source.Length <= outer.Source.Length ||
-                !IsHostPathSeparator(inner.Source[outer.Source.Length]) ||
-                !inner.Source.StartsWith(outer.Source, HostPathComparison))
-            {
-                return false;
-            }
-
-            subpath = inner.Source[(outer.Source.Length + 1)..]
-                .Replace(Path.DirectorySeparatorChar, '/')
-                .Replace(Path.AltDirectorySeparatorChar, '/');
-            return true;
         }
 
         if (!string.Equals(outer.Source, inner.Source, StringComparison.Ordinal))
@@ -654,9 +1003,6 @@ public static class DocumentDBBuilderExtensions
         subpath = inner.Subpath[(outer.Subpath.Length + 1)..];
         return true;
     }
-
-    private static bool IsHostPathSeparator(char value) =>
-        value == Path.DirectorySeparatorChar || value == Path.AltDirectorySeparatorChar;
 
     /// <summary>
     /// One <c>case</c> pattern matching the literal candidate root and data directory pair, as a
@@ -1626,12 +1972,15 @@ public static class DocumentDBBuilderExtensions
     /// grammar and resources built from your own Dockerfile are left completely untouched — the
     /// last of those even when the resource's image annotation names the official image and a
     /// recognised tag, because what runs is the build output; private mirrors of the official
-    /// image are not, because only the registry differs. Pinning the official image by digest throws, because the
-    /// digest makes the version opaque and both applying and skipping the wrapper on a guess are
-    /// silently wrong. Supplying your own container entrypoint on the same resource also throws,
-    /// because the two cannot both own the container command. The wrapper needs <c>bash</c> and
-    /// <c>jq</c>, which the official image provides; it fails the container start with a
-    /// diagnostic rather than starting without the override if either is missing.
+    /// image are not, because only the registry differs. Pinning the official image by digest
+    /// throws, because the digest makes the version opaque and both applying and skipping the
+    /// wrapper on a guess are silently wrong. Supplying your own container entrypoint or enabling
+    /// <see cref="ContainerResource.ShellExecution"/> on the same resource also throws, because
+    /// either can replace the verified command. Raw runtime mounts, entrypoint overrides and
+    /// protected environment overrides are rejected for the same reason; express them through the
+    /// resource model instead. The wrapper needs <c>bash</c> and <c>jq</c>, which the official
+    /// image provides; it fails the container start with a diagnostic rather than starting without
+    /// the override if either is missing.
     /// </para>
     /// <para>
     /// Merge semantics across multiple calls on the same builder:
@@ -1698,6 +2047,11 @@ public static class DocumentDBBuilderExtensions
     /// </exception>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="exportInterval"/> or <paramref name="timeout"/> is negative.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The affected official image cannot be classified safely, or a custom entrypoint,
+    /// <see cref="ContainerResource.ShellExecution"/>, raw runtime mount, or protected runtime
+    /// environment override would replace part of the compatibility command.
     /// </exception>
     /// <example>
     /// <code>
@@ -1956,13 +2310,16 @@ public static class DocumentDBBuilderExtensions
     /// <see cref="Lifecycle.IDistributedApplicationLifecycleHook"/>, say — and only then changes
     /// the model gets a validated answer recorded before the change and reused after it. That is
     /// what the seal is for: the command-line callback records what the resource looked like when
-    /// it produced its result, and the two checkpoints Aspire never caches compare it.
+    /// it produced its result, including whether Aspire would shell-rewrite that result, and the
+    /// two checkpoints Aspire never caches compare it.
     /// </para>
     /// <list type="bullet">
     /// <item><description>Run: the container-runtime-arguments callback. Aspire re-invokes those on
     /// every container creation without caching, and it does so after the last opportunity a
     /// caller has to change anything — a caller's own runtime-arguments callback — and before the
-    /// container's command, arguments and environment are read.</description></item>
+    /// container's command, arguments and environment are read. It also resolves the completed
+    /// Docker runtime argument list once and rejects raw command, environment and mount overrides
+    /// that bypass the resource model.</description></item>
     /// <item><description>Publish: the manifest callback itself. A publishing-pipeline prerequisite
     /// re-establishes it after every <see cref="Publishing.BeforePublishEvent"/> subscriber has
     /// completed, so a normal model event cannot replace or shadow the checkpoint; the callback
@@ -1994,11 +2351,14 @@ public static class DocumentDBBuilderExtensions
             return Task.CompletedTask;
         });
 
-        guard.RuntimeCheckpoint = new ContainerRuntimeArgsCallbackAnnotation(_ =>
+        guard.RuntimeCheckpoint = new ContainerRuntimeArgsCallbackAnnotation(async context =>
         {
             EnsureTerminalCallbackRunsLast(resource, guard.RuntimeCheckpoint, "container-runtime-arguments");
             VerifyTerminalConfigurationSeal(resource, guard);
-            return Task.CompletedTask;
+            await ValidateOpenTelemetryContainerRuntimeArgumentsAsync(
+                resource,
+                context,
+                builder.ApplicationBuilder.ExecutionContext).ConfigureAwait(false);
         });
 
         guard.ManifestCheckpoint = new ManifestPublishingCallbackAnnotation(async context =>
@@ -2218,6 +2578,7 @@ public static class DocumentDBBuilderExtensions
             [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
             [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
             resource.Entrypoint,
+            resource.ShellExecution is true,
             ResolveEffectiveImage(resource),
             CaptureTerminalCommandSeal(resource, state));
 
@@ -2254,7 +2615,8 @@ public static class DocumentDBBuilderExtensions
     /// container-runtime-arguments callback in a run and the manifest publishing callback while a
     /// publish serializes the resource. Together they cover every supported way to change the model
     /// after the command line has been decided: appending or inserting a callback in either
-    /// pipeline, re-pointing the entrypoint, and swapping the image, tag, digest or Dockerfile.
+    /// pipeline, re-pointing the entrypoint, enabling Aspire's shell rewrite, and swapping the
+    /// image, tag, digest or Dockerfile.
     /// </para>
     /// <para>
     /// Nothing is repaired. Re-running the wrapper is not an option — Aspire would keep the cached
@@ -2275,6 +2637,7 @@ public static class DocumentDBBuilderExtensions
 
         if (guard.Seal is not { } seal)
         {
+            ValidateOpenTelemetryShellExecution(resource);
             return;
         }
 
@@ -2304,11 +2667,21 @@ public static class DocumentDBBuilderExtensions
             throw StaleConfiguration(resource, "its container entrypoint changed");
         }
 
+        if (seal.Command.GatewayRequirement == GatewayConfigurationRequirement.Required &&
+            (resource.ShellExecution is true) != seal.ShellExecutionEnabled)
+        {
+            ValidateOpenTelemetryShellExecution(resource);
+            throw StaleConfiguration(
+                resource,
+                "whether Aspire shell-rewrites its container arguments changed");
+        }
+
         if (!ResolveEffectiveImage(resource).Equals(seal.Image))
         {
             throw StaleConfiguration(resource, "the image it will run changed");
         }
 
+        ValidateOpenTelemetryShellExecution(resource);
         VerifyTerminalCommandSeal(resource, seal.Command);
     }
 
@@ -2454,6 +2827,28 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Refuses Aspire's post-validation shell rewrite when the compatibility wrapper owns the
+    /// command. DCP applies this switch after it gathers the verified arguments.
+    /// </summary>
+    private static void ValidateOpenTelemetryShellExecution(DocumentDBServerResource resource)
+    {
+        if (resource.ShellExecution is not true ||
+            ResolveOpenTelemetryGatewayConfigurationRequirement(resource) !=
+                GatewayConfigurationRequirement.Required)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' enables ContainerResource.ShellExecution " +
+            $"while the WithOpenTelemetryMetrics() compatibility wrapper is required. Aspire " +
+            $"rewrites the already verified wrapper arguments into one joined '-c' command after " +
+            $"the terminal check, so '/bin/bash' receives a nested shell command and DocumentDB " +
+            $"does not start. Set ShellExecution to false or null, or drop " +
+            $"WithOpenTelemetryMetrics() and configure telemetry from your own shell command.");
+    }
+
+    /// <summary>
     /// Verifies that the finished command line is exactly the one the gateway configuration
     /// wrapper needs, whenever the wrapper is required at all.
     /// </summary>
@@ -2482,6 +2877,8 @@ public static class DocumentDBBuilderExtensions
         DocumentDBServerResource resource,
         TerminalCommandLineState state)
     {
+        ValidateOpenTelemetryShellExecution(resource);
+
         var required = ResolveOpenTelemetryGatewayConfigurationRequirement(resource) ==
             GatewayConfigurationRequirement.Required;
 

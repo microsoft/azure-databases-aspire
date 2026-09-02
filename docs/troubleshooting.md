@@ -131,6 +131,24 @@ that is caught when the wrapper's arguments are resolved, and `aspire publish` r
 `publish-manifest` step as failed. Drop the custom entrypoint, or drop
 `WithOpenTelemetryMetrics(...)` and configure telemetry from your own entrypoint.
 
+### `WithOpenTelemetryMetrics()` throws about `ShellExecution`
+
+Leave `ContainerResource.ShellExecution` as `null` or set it to `false`. With `true`, DCP joins the
+already validated wrapper arguments into a second `-c` command after the package's terminal check,
+so `/bin/bash` no longer receives `-c <wrapper> --` and DocumentDB does not start. The effective
+setting is sealed with the command and checked again before both container creation and manifest
+serialization, so enabling it after an early configuration read also fails clearly.
+
+### `WithOpenTelemetryMetrics()` rejects a container runtime option
+
+`WithContainerRuntimeArgs(...)` is applied outside the resource model. Raw mounts
+(`--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`, and `--volumes-from`) can put DATA_PATH
+storage back under a scratch root after the wrapper has selected it, and raw `--entrypoint` can replace `/bin/bash`.
+They are rejected when the compatibility wrapper is required. Protected `--env`/`-e` overrides
+are rejected too, as is `--env-file`, whose contents cannot be validated. Use `WithBindMount(...)`,
+`WithVolume(...)`, and `WithEnvironment(...)`; harmless runtime options continue to work. Error
+messages name the option class but never repeat its value.
+
 ### `WithOpenTelemetryMetrics()` throws about a later command-line callback
 
 The wrapper's `-c <script> --` prefix has to be the first thing on the container command line, so
@@ -156,8 +174,8 @@ recorded wrapper from the command line without re-running anything that would no
 The wrapper records what its answer depended on and compares it at the last point the app host runs
 unconditionally: a container-runtime-arguments callback in a run, `BeforePublishEvent` in a publish.
 A mismatch fails the resource before the container is created or the manifest is written, and names
-what kind of thing changed — callbacks, entrypoint, or image — without repeating a value, because
-whatever changed the model may be carrying a secret.
+what kind of thing changed — callbacks, entrypoint, `ShellExecution`, or image — without repeating
+a value, because whatever changed the model may be carrying a secret.
 
 Finish configuring the resource before anything reads its configuration. If a lifecycle hook has to
 contribute arguments, let it add them without reading first: they are ordered behind the wrapper

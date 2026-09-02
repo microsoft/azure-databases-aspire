@@ -346,7 +346,7 @@ for a build neither is what runs. A private registry mirror is wrapped when it i
 repository directly beneath a registry host — only the host differs — however the reference spells
 the boundary between the two annotation fields; a mirror that adds a namespace path, such as
 `contoso.azurecr.io/mirrors/documentdb/documentdb-local`, is a different repository and is left
-alone. See [How the image is recognised](#how-the-image-is-recognised). Four situations throw
+alone. See [How the image is recognised](#how-the-image-is-recognised). These situations throw
 instead of guessing:
 
 - Pinning the official image by digest (`WithImageSHA256`). The digest supersedes the tag — Aspire
@@ -364,6 +364,18 @@ instead of guessing:
   entrypoint — including by adding a Dockerfile build at that point. The wrapper cannot be
   uninstalled, and dropping its arguments would leave `/bin/bash` with nothing to run. Select the
   image before configuring metrics.
+- Setting `ContainerResource.ShellExecution` to `true`. DCP applies that switch after argument
+  validation and replaces the wrapper arguments with one joined `-c` string, producing a nested
+  shell command that does not start DocumentDB. Leave it `null` or set it to `false`.
+- Passing raw `--entrypoint`, `--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`,
+  `--volumes-from`, or `--use-api-socket` options through `WithContainerRuntimeArgs(...)`. Those
+  options bypass the resource model after the wrapper has been generated. Use `WithBindMount(...)` or
+  `WithVolume(...)` for storage.
+- Passing a raw runtime environment override for `DATA_PATH`, `CONFIG_DIR`, `GATEWAY_HOME`, or a
+  telemetry value the wrapper protects. `--env-file` is also rejected because its contents cannot
+  be inspected. Use `WithEnvironment(...)`, which is part of both the validated model and the
+  published manifest. Other Docker runtime options, including unrelated `--env` values, remain
+  available.
 
 **Argument ordering is fixed, and enforced.** `/bin/bash` reads its command from the first
 arguments, so the wrapper's `-c <script> --` prefix has to stay in front of everything else: one
@@ -387,6 +399,8 @@ position at every phase the app host offers — `BeforeStartEvent`,
 - The finished command line is checked before it is used: the entrypoint must still be `/bin/bash`,
   the arguments must begin with exactly `-c`, this run's script, `--`, and the script must not
   appear twice.
+- `ShellExecution` must remain `null` or `false`; its effective value is sealed with the command
+  and checked again in both run and publish mode.
 
 **Reading the configuration early freezes it.** The app host records each callback's result the
 first time it runs and reuses it for the rest of the run, and it takes the *last* callback's
@@ -396,12 +410,12 @@ early — `ExecutionConfigurationBuilder` or `GetArgumentValuesAsync`, typically
 the command line: the recorded wrapper is dropped from it entirely, and nothing re-validates.
 
 The wrapper closes that by recording what the container's command depended on when it produced its
-answer — the callbacks in every pipeline, the entrypoint, and the image the resource will run — and
-comparing it at the two points the app host never caches:
+answer — the callbacks in every pipeline, the entrypoint, `ShellExecution`, and the image the
+resource will run — and comparing it at the two points the app host never caches:
 
 | Mode | Checkpoint | Runs |
 | --- | --- | --- |
-| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read |
+| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read; it also resolves the final Docker runtime arguments once and rejects command, environment, or storage overrides that bypass the model |
 | Publish | `BeforePublishEvent` | after every lifecycle hook and before the pipeline serializes anything |
 
 If anything changed, the resource is failed — a publish before the manifest is written, a run
@@ -422,12 +436,15 @@ mounted twice — and a scratch directory created through the second window appe
 directory, which DocumentDB `0.116.0` refuses to initialise. The container-path test stays in the
 container, because `DATA_PATH` can be moved again at runtime with `--data-path`; the backing-storage
 test is decided while the model is built, where the mount table is known, and travels with the
-command as the exact set of data directories each candidate root cannot be used with. Mount targets
-that are ancestors of the data directory or of a candidate root, and the relative subpaths below
-them, are taken into account, so `/srv` mounted at `/tmp` and `/srv/documentdb` mounted at `/data`
-are recognised as one region. Candidates are tried in the order `/tmp`, `/var/tmp`, `/dev/shm`, and
-if every one of them is on the data directory's storage the container fails to start with a
-diagnostic that says so.
+command as the exact set of data directories each candidate root cannot be used with. Named volumes
+are compared by name and subpath. Bind sources are different: Docker resolves them on the daemon,
+which may be remote and may traverse symbolic links that do not exist on the publishing machine.
+Whenever both `DATA_PATH` and a candidate are bind-backed, that candidate is therefore skipped even
+if the two source strings look unrelated. This conservative rule is machine-independent and covers
+exact, ancestor/subpath, and symbolic-link aliases. Different storage types remain independent.
+Candidates are tried in the order `/tmp`, `/var/tmp`, `/dev/shm`; if every candidate aliases
+`DATA_PATH` or cannot be proven independent, the container fails clearly. Raw runtime mounts are
+rejected because they never enter this model.
 
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or

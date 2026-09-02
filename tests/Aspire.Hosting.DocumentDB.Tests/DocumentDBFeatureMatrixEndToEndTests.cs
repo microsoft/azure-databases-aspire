@@ -702,6 +702,282 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
+    /// <summary>
+    /// Exact reproduction of the physical-alias hole: the two bind source strings differ, but the
+    /// second is a symbolic link to the first. Docker resolves that link on the publish host or
+    /// daemon, so both container mount points expose one directory.
+    /// </summary>
+    [Fact]
+    public async Task TelemetryWrapperAvoidsASymlinkAliasOfTheDataDirectory()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var root = Path.Combine(
+            AppContext.BaseDirectory,
+            "telemetry-symlink-alias",
+            Guid.NewGuid().ToString("N"));
+        var dataPath = Path.Combine(root, "data");
+        var scratchAlias = Path.Combine(root, "scratch-alias");
+        Directory.CreateDirectory(dataPath);
+        Directory.CreateSymbolicLink(scratchAlias, dataPath);
+
+        var resolvedAlias = Directory.ResolveLinkTarget(scratchAlias, returnFinalTarget: true);
+        Assert.NotNull(resolvedAlias);
+        Assert.Equal(Path.GetFullPath(dataPath), resolvedAlias!.FullName);
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetrySymlinkAliasedTemporaryRootScenario),
+            (AppHost.BindMountPathEnvironmentVariable, dataPath),
+            (AppHost.ScratchBindMountPathEnvironmentVariable, scratchAlias),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            await using var app = await appHost.BuildAsync(cts.Token);
+
+            await app.StartAsync(cts.Token);
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+            var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+            await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+            var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+            await AssertRoundTripAsync(connectionString!, "appdb", "symlink-alias", "safe", cts.Token);
+
+            var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+            var command = await GetContainerConfigListAsync(containerId, "Cmd");
+            Assert.Contains("\"/tmp|/data\"", command[1], StringComparison.Ordinal);
+
+            var (exitCode, output) = await RunDockerAsync(
+                "exec", containerId, "/bin/bash", "-c",
+                "find /data -maxdepth 1 -type d -name 'aspire-documentdb-otel.*' -print");
+            Assert.True(exitCode == 0, $"Could not inspect DATA_PATH: {output}");
+            Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
+
+            await app.StopAsync(cts.Token);
+        }
+        finally
+        {
+            await TryRelaxBindMountPermissionsAsync(dataPath);
+
+            if (Directory.Exists(scratchAlias))
+            {
+                Directory.Delete(scratchAlias);
+            }
+
+            TryDeleteDirectory(root);
+        }
+    }
+
+    /// <summary>
+    /// A raw runtime mount bypasses ContainerMountAnnotation entirely. The guard must reject it
+    /// before DCP creates a container, rather than letting the named DATA_PATH volume reappear at
+    /// <c>/tmp</c>.
+    /// </summary>
+    [Fact]
+    public async Task TelemetryWrapperRejectsARawRuntimeMountOfTheDataVolume()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var volumeName = $"aspire-documentdb-runtime-secret-{Guid.NewGuid():N}";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryRawRuntimeVolumeScenario),
+            (AppHost.VolumeNameEnvironmentVariable, volumeName),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            var hostLog = new LogSink();
+            appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+            await using var app = await appHost.BuildAsync(cts.Token);
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+            try
+            {
+                await app.StartAsync(cts.Token);
+            }
+            catch (Exception ex)
+            {
+                hostLog.Append(ex.ToString());
+            }
+
+            await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+            var diagnostics = hostLog.ToString();
+            Assert.Contains("storage-changing container runtime option '--mount'", diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(volumeName, diagnostics, StringComparison.Ordinal);
+
+            var (exitCode, containers) = await RunDockerAsync(
+                "ps", "--all", "--quiet", "--filter", $"volume={volumeName}");
+            Assert.Equal(0, exitCode);
+            Assert.True(string.IsNullOrWhiteSpace(containers), "The rejected runtime mount still created a container.");
+        }
+        finally
+        {
+            await RemoveVolumeAsync(volumeName);
+        }
+    }
+
+    [Fact]
+    public async Task TelemetryWrapperFailsClearlyWhenEveryBindCandidateIsUnprovable()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var root = Path.Combine(
+            AppContext.BaseDirectory,
+            "telemetry-unprovable-roots",
+            Guid.NewGuid().ToString("N"));
+        var dataPath = Path.Combine(root, "data");
+        var scratchRoot = Path.Combine(root, "scratch");
+        Directory.CreateDirectory(dataPath);
+        Directory.CreateDirectory(Path.Combine(scratchRoot, "tmp"));
+        Directory.CreateDirectory(Path.Combine(scratchRoot, "var-tmp"));
+        Directory.CreateDirectory(Path.Combine(scratchRoot, "dev-shm"));
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryUnprovableTemporaryRootsScenario),
+            (AppHost.BindMountPathEnvironmentVariable, dataPath),
+            (AppHost.ScratchBindMountPathEnvironmentVariable, scratchRoot),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            await using var app = await appHost.BuildAsync(cts.Token);
+
+            await app.StartAsync(cts.Token);
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+            var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+            var logs = await WaitForContainerLogAsync(
+                containerId,
+                "every temporary directory aliases DATA_PATH storage or cannot be proven independent",
+                cts.Token);
+
+            Assert.Contains(
+                "telemetry configuration cannot be kept out of it",
+                logs,
+                StringComparison.Ordinal);
+            await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+        }
+        finally
+        {
+            await TryRelaxBindMountPermissionsAsync(dataPath);
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("false")]
+    public async Task TelemetryWrapperRunsWithNullOrFalseShellExecution(string shellExecution)
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryShellExecutionScenario),
+            (AppHost.ShellExecutionEnvironmentVariable, shellExecution),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        Assert.Equal(["/bin/bash"], await GetContainerConfigListAsync(containerId, "Entrypoint"));
+
+        var command = await GetContainerConfigListAsync(containerId, "Cmd");
+        Assert.Equal("-c", command[0]);
+        Assert.Equal("--", command[2]);
+    }
+
+    [Fact]
+    public async Task TelemetryWrapperRejectsShellExecutionBeforeContainerCreation()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryShellExecutionScenario),
+            (AppHost.ShellExecutionEnvironmentVariable, "true"),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("ShellExecution", diagnostics, StringComparison.Ordinal);
+        Assert.Contains("Set ShellExecution to false or null", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("-c set -e", diagnostics, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TelemetryWrapperRejectsShellExecutionEnabledAfterCommandCaching()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryShellExecutionMutationScenario),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("ShellExecution", diagnostics, StringComparison.Ordinal);
+        Assert.Contains("rewrites the already verified wrapper arguments", diagnostics, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task TelemetryWrapperUsesDataPathArgumentWhenChoosingTemporaryDirectory()
     {
