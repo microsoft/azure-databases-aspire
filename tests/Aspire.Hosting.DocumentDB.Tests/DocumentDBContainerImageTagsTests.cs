@@ -222,6 +222,9 @@ public class DocumentDBContainerImageTagsTests
     // A digest brings its own ':' and is stored the way ContainerImageAnnotation.SHA256 is.
     [InlineData("ghcr.io/documentdb", "documentdb/documentdb-local@sha256:abc123", null, "abc123")]
     [InlineData(null, "ghcr.io/documentdb/documentdb/documentdb-local@sha256:abc123", null, "abc123")]
+    // Both at once. The parser reports both; deciding that the digest wins is the resolver's job.
+    [InlineData("ghcr.io/documentdb", "documentdb/documentdb-local:pg17-0.116.0@sha256:abc123", "pg17-0.116.0", "abc123")]
+    [InlineData(null, "ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0@sha256:abc123", "pg17-0.116.0", "abc123")]
     [InlineData("ghcr.io/documentdb", "documentdb/documentdb-local", null, null)]
     public void NamesCuratedRepositoryReportsAnInlineTagOrDigest(
         string? registry,

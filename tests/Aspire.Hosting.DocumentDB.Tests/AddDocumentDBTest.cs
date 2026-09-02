@@ -1323,6 +1323,48 @@ public class AddDocumentDBTests
         Assert.Contains(Digest, exception.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The digest rejection has to survive a tag standing next to the digest: the repository is
+    /// still the curated one, so this is the case the message exists for.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task WithOpenTelemetryMetricsRejectsADigestBehindACuratedTag(
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithOpenTelemetryMetrics();
+        SetImageAnnotation(documentDB, image, tag, sha256);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(OlderReleaseDigest, exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A digest on a repository this package does not publish stays untouched, tag or no tag:
+    /// there is nothing to reject, because the wrapper was never going to be applied.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsADigestBehindACuratedTagOnACustomRepository()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage($"contoso/documentdb-local:{InterlockedTag}")
+            .WithImageSHA256(OlderReleaseDigest)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
     [Fact]
     public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenDisabled()
     {
@@ -2734,6 +2776,108 @@ public class AddDocumentDBTests
         Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
 
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task WithPostgresEndpointGuardSkippedForADigestBehindACuratedTag(
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+        SetImageAnnotation(documentDB, image, tag, sha256);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("digest", warnings[0].Message, StringComparison.Ordinal);
+        Assert.Contains(OlderReleaseDigest, warnings[0].Message, StringComparison.Ordinal);
+        Assert.Contains("NOT enforced", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The tag is not trusted in the other direction either: one that reads below the floor is
+    /// not grounds for failing a resource whose digest may name a release above it.
+    /// </summary>
+    [Fact]
+    public async Task WithPostgresEndpointGuardDoesNotFailOnATagSupersededByADigest()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:pg17-0.110.0",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.Contains("digest", Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning)).Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorIsNotEnforcedForADigestBehindACuratedTag()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:pg18-0.113.0",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A Dockerfile build is decided before the reference is read at all, so a digest behind a
+    /// curated tag changes nothing about it.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildWithADigestBehindACuratedTagStaysABuild()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithPostgresEndpoint();
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.Contains("Dockerfile", Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning)).Message, StringComparison.Ordinal);
+    }
+
     private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)
     {
         var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
@@ -3020,6 +3164,68 @@ public class AddDocumentDBTests
         var args = await BuildContainerArgsAsync(resource);
         Assert.Equal(3, args.Count);
         return Assert.IsType<string>(args[1]);
+    }
+
+    // A real digest of the published pg17-0.114.0 image, embedded as a literal so nothing here
+    // depends on the registry or on a tag upstream can move. That release predates the /data
+    // VOLUME declaration and the data-directory flock, which is what makes it the right thing to
+    // find behind a "pg17-0.116.0" tag.
+    private const string OlderReleaseDigest =
+        "8c8a716e27f398b03c397424c4ddd901bddbc22b9f910b17096b0b246c7c9011";
+
+    /// <summary>
+    /// The three shapes in which one reference carries both a parseable curated tag and a digest,
+    /// written as the (image, tag, sha256) they land on the annotation as.
+    /// </summary>
+    /// <remarks>
+    /// All three publish a reference the runtime resolves by digest, so none of them runs the
+    /// release the tag names.
+    /// </remarks>
+    public static TheoryData<string, string?, string?> DigestBehindACuratedTag => new()
+    {
+        { $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}@sha256:{OlderReleaseDigest}", null, null },
+        { $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}", null, OlderReleaseDigest },
+        { $"{DocumentDBContainerImageTags.Image}@sha256:{OlderReleaseDigest}", InterlockedTag, null },
+    };
+
+    /// <summary>
+    /// Writes an image annotation spelled exactly as given, replacing the one AddDocumentDB
+    /// installed.
+    /// </summary>
+    /// <remarks>
+    /// Aspire's <c>WithImage</c> / <c>WithImageTag</c> / <c>WithImageSHA256</c> keep the
+    /// annotation's tag and digest mutually exclusive and drop an inline tag when the same string
+    /// also carries a digest, so a reference holding both is written on directly. It is still
+    /// exactly what the manifest emits.
+    /// </remarks>
+    private static void SetImageAnnotation(
+        IResourceBuilder<DocumentDBServerResource> builder,
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        foreach (var existing in builder.Resource.Annotations.OfType<ContainerImageAnnotation>().ToList())
+        {
+            builder.Resource.Annotations.Remove(existing);
+        }
+
+        var annotation = new ContainerImageAnnotation
+        {
+            Registry = DocumentDBContainerImageTags.Registry,
+            Image = image,
+        };
+
+        if (tag is not null)
+        {
+            annotation.Tag = tag;
+        }
+
+        if (sha256 is not null)
+        {
+            annotation.SHA256 = sha256;
+        }
+
+        builder.Resource.Annotations.Add(annotation);
     }
 
     /// <summary>
