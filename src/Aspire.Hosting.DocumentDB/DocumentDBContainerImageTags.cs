@@ -122,41 +122,47 @@ internal static partial class DocumentDBContainerImageTags
     /// <param name="registry">The annotation's <see cref="ContainerImageAnnotation.Registry"/>.</param>
     /// <param name="image">The annotation's <see cref="ContainerImageAnnotation.Image"/>.</param>
     /// <param name="inlineTag">
-    /// The tag written into <paramref name="image"/> itself (<c>repo:tag</c>), or
-    /// <see langword="null"/>. Aspire's <c>WithImage</c> splits such a tag out into
-    /// <see cref="ContainerImageAnnotation.Tag"/>, so this only carries a value for an annotation
-    /// that was built by hand.
+    /// The tag the reference carries itself (<c>repo:tag</c>), or <see langword="null"/>. Aspire's
+    /// <c>WithImage</c> splits such a tag out into <see cref="ContainerImageAnnotation.Tag"/> and
+    /// refuses a tag given twice, so this only carries a value for an annotation built by hand.
     /// </param>
     /// <param name="inlineDigest">
-    /// The digest written into <paramref name="image"/> itself (<c>repo@sha256:...</c>) with its
-    /// algorithm prefix removed, matching how <see cref="ContainerImageAnnotation.SHA256"/> is
-    /// stored, or <see langword="null"/>.
+    /// The digest the reference carries itself (<c>repo@sha256:...</c>) with its algorithm prefix
+    /// removed, matching how <see cref="ContainerImageAnnotation.SHA256"/> is stored, or
+    /// <see langword="null"/>.
     /// </param>
     /// <remarks>
     /// <para>
     /// The annotation models a reference as a registry prefix plus a repository, but Aspire only
-    /// ever joins the two with a single separator — it never re-splits them — so where a caller
-    /// puts the boundary is up to the caller.
-    /// <c>WithImage("ghcr.io/documentdb/documentdb/documentdb-local").WithImageRegistry(null)</c>
-    /// resolves to exactly the same image as the default spelling, and comparing
-    /// <see cref="ContainerImageAnnotation.Image"/> on its own would call one of them official and
-    /// the other custom.
+    /// ever joins the two with a single separator — it never re-splits them, and it never
+    /// validates either half. Where a caller puts the boundary is therefore not evidence about
+    /// anything: <c>Registry</c> may hold a namespace, or nothing, or the whole reference may sit
+    /// in <c>Image</c>. So the two fields are composed first and the composed reference is judged,
+    /// which is also what guarantees that two spellings resolving to one reference classify alike.
     /// </para>
     /// <para>
-    /// So the composed reference is what is judged, and the repository identity within it stays
-    /// exact — <see cref="Image"/>, segment for segment. Only the prefix in front of it may vary,
-    /// and only in the ways a reference can legitimately carry one: the annotation's own
-    /// <paramref name="registry"/>, the curated <see cref="Registry"/> written inline, a registry
-    /// host (Docker's rule — a first segment containing <c>.</c> or <c>:</c>, or exactly
-    /// <c>localhost</c>), or nothing at all. Any other leading path is part of the repository and
-    /// therefore a different repository: <c>evil/documentdb/documentdb-local</c> has no registry
-    /// in front of it, and <c>ghcr.io/evil/documentdb/documentdb-local</c> has a path segment that
-    /// is not part of the curated registry. Neither is accepted, and neither is a reference with
-    /// an empty segment, because the runtime cannot resolve one.
+    /// Exactly one prefix is then removed, and only one of two kinds may be removed:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>the curated registry <see cref="Registry"/> — the one namespace path
+    /// this package publishes under, compared case-insensitively because registry hosts and GitHub
+    /// owners are;</description></item>
+    /// <item><description>a single registry host segment — a DNS name, an IPv4 or bracketed IPv6
+    /// literal, or <c>localhost</c>, each with an optional port — and nothing after it.</description></item>
+    /// </list>
+    /// <para>
+    /// What remains must equal <see cref="Image"/> exactly. A namespace, project or mirror path in
+    /// front of the repository is therefore part of the repository and names a different one:
+    /// <c>ghcr.io/evil/documentdb/documentdb-local</c>,
+    /// <c>contoso.azurecr.io/mirrors/documentdb/documentdb-local</c> and
+    /// <c>harbor.corp.local/library/documentdb/documentdb-local</c> are all custom, whether the
+    /// caller wrote the prefix into <c>Registry</c> or inline. A true private mirror is a registry
+    /// host and the exact repository beneath it — <c>contoso.azurecr.io/documentdb/documentdb-local</c>
+    /// — which is what "only the registry differs" has always meant.
     /// </para>
     /// <para>
-    /// The curated registry is compared case-insensitively and the repository case-sensitively:
-    /// registry hosts are case-insensitive, repository paths are not.
+    /// A reference with an empty path segment — a leading or trailing separator, or a doubled one —
+    /// is rejected before any of this, because no runtime can resolve one.
     /// </para>
     /// </remarks>
     internal static bool NamesCuratedRepository(
@@ -165,30 +171,38 @@ internal static partial class DocumentDBContainerImageTags
         out string? inlineTag,
         out string? inlineDigest)
     {
-        var repository = SplitTagAndDigest(image ?? string.Empty, out inlineTag, out inlineDigest);
+        // Exactly what Aspire composes and the manifest carries. Registry is not trusted to be a
+        // registry, and Image is not trusted to be a repository; only the whole is judged.
+        var composed = string.IsNullOrEmpty(registry)
+            ? image ?? string.Empty
+            : registry + "/" + (image ?? string.Empty);
 
-        // Exactly what Aspire composes and the manifest carries.
-        var reference = string.IsNullOrEmpty(registry)
-            ? repository
-            : registry + "/" + repository;
+        var path = SplitTagAndDigest(composed, out inlineTag, out inlineDigest);
 
-        // The annotation's own split: whatever Registry holds is a prefix by construction, so the
-        // repository is Image verbatim however that text reads.
-        if (IsCuratedRepositoryPath(repository))
+        if (path.Length == 0 ||
+            path[0] == '/' ||
+            path[^1] == '/' ||
+            path.Contains("//", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // No prefix at all.
+        if (IsCuratedRepositoryPath(path))
         {
             return true;
         }
 
-        // The curated registry spelled inline. Tried before the host rule because the curated
-        // registry carries a namespace ("ghcr.io/documentdb") that the host rule alone would
-        // leave attached to the repository.
-        if (TryRemoveLeadingPath(reference, Registry, out var withoutCuratedRegistry) &&
+        // The curated registry, which carries a namespace the host rule alone would leave
+        // attached to the repository.
+        if (TryRemoveCuratedRegistry(path, out var withoutCuratedRegistry) &&
             IsCuratedRepositoryPath(withoutCuratedRegistry))
         {
             return true;
         }
 
-        return TryRemoveRegistryHost(reference, out var withoutHost) &&
+        // One registry host, and nothing between it and the repository.
+        return TryRemoveRegistryHost(path, out var withoutHost) &&
             IsCuratedRepositoryPath(withoutHost);
     }
 
@@ -201,7 +215,7 @@ internal static partial class DocumentDBContainerImageTags
     /// <remarks>
     /// A digest is always last and brings its own <c>:</c>, and a <c>:</c> introduces a tag only
     /// in the final path segment — anywhere earlier it is a registry port, as in
-    /// <c>localhost:5000/repo</c>.
+    /// <c>localhost:5000/repo</c> or <c>[::1]:5000/repo</c>.
     /// </remarks>
     private static string SplitTagAndDigest(string reference, out string? tag, out string? digest)
     {
@@ -230,48 +244,49 @@ internal static partial class DocumentDBContainerImageTags
     }
 
     /// <summary>
-    /// Removes <paramref name="prefix"/> from <paramref name="reference"/> when it is a whole
-    /// leading path, so that <c>ghcr.io/documentdbX/...</c> is not treated as living under
-    /// <c>ghcr.io/documentdb</c>.
+    /// Removes <see cref="Registry"/> when the reference begins with it as a whole path, so that
+    /// <c>ghcr.io/documentdbX/...</c> is not treated as living under <c>ghcr.io/documentdb</c>.
     /// </summary>
-    private static bool TryRemoveLeadingPath(string reference, string prefix, out string remainder)
+    private static bool TryRemoveCuratedRegistry(string path, out string remainder)
     {
-        remainder = reference;
+        remainder = path;
 
-        if (reference.Length <= prefix.Length + 1 ||
-            reference[prefix.Length] != '/' ||
-            !reference.AsSpan(0, prefix.Length).Equals(prefix, StringComparison.OrdinalIgnoreCase))
+        if (path.Length <= Registry.Length + 1 ||
+            path[Registry.Length] != '/' ||
+            !path.AsSpan(0, Registry.Length).Equals(Registry, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        remainder = reference[(prefix.Length + 1)..];
+        remainder = path[(Registry.Length + 1)..];
         return true;
     }
 
+    // A registry host and nothing else: localhost, a bracketed IPv6 literal, or a dotted DNS or
+    // IPv4 name, each with an optional port -- plus the one shape that needs no dot, a bare name
+    // with a port ("myregistry:5000"). This is the grammar Aspire's own (internal) container
+    // reference parser applies, which is what decides whether the runtime reads a first segment
+    // as a host or as the first component of the repository path.
+    [GeneratedRegex(
+        @"^((localhost|\[[a-fA-F0-9:]+\]|[\w-]+(\.[\w-]+)+)(:[0-9]+)?|[\w-]+:[0-9]+)\z",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex RegistryHostRegex();
+
     /// <summary>
-    /// Removes a leading registry host, following Docker's rule that the first segment is a host
-    /// only when it contains a <c>.</c> or a <c>:</c>, or is exactly <c>localhost</c>.
+    /// Removes a leading registry host, and only a host: any further path segment before the
+    /// repository belongs to the repository.
     /// </summary>
-    private static bool TryRemoveRegistryHost(string reference, out string remainder)
+    private static bool TryRemoveRegistryHost(string path, out string remainder)
     {
-        remainder = reference;
+        remainder = path;
 
-        var separator = reference.IndexOf('/', StringComparison.Ordinal);
-        if (separator <= 0)
+        var separator = path.IndexOf('/', StringComparison.Ordinal);
+        if (separator <= 0 || !RegistryHostRegex().IsMatch(path.AsSpan(0, separator)))
         {
             return false;
         }
 
-        var host = reference.AsSpan(0, separator);
-        if (host.IndexOf('.') < 0 &&
-            host.IndexOf(':') < 0 &&
-            !host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        remainder = reference[(separator + 1)..];
+        remainder = path[(separator + 1)..];
         return true;
     }
 }

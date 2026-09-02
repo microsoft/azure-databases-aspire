@@ -1237,10 +1237,14 @@ public class AddDocumentDBTests
     }
 
     [Theory]
-    // Only the registry differs, in every spelling of the boundary.
+    // A registry host and the exact repository beneath it, in every spelling of the boundary.
     [InlineData("contoso.azurecr.io/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "contoso.azurecr.io")]
     [InlineData("localhost:5000/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "localhost:5000")]
+    [InlineData("[::1]:5000/documentdb/documentdb-local", null)]
     [InlineData("documentdb/documentdb/documentdb-local", "ghcr.io")]
+    [InlineData("documentdb-local", "ghcr.io/documentdb/documentdb")]
     public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForQualifiedPrivateMirrors(
         string image,
         string? registry)
@@ -1257,9 +1261,17 @@ public class AddDocumentDBTests
     }
 
     [Theory]
-    // A leading path that is not a registry is part of the repository.
+    // A namespace, project or mirror path in front of the repository is part of the repository,
+    // whether the caller writes it inline or into the registry field.
     [InlineData("evil/documentdb/documentdb-local", null)]
     [InlineData("ghcr.io/evil/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "ghcr.io/evil")]
+    [InlineData("contoso.azurecr.io/mirrors/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "contoso.azurecr.io/mirrors")]
+    [InlineData("harbor.corp.local/library/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "harbor.corp.local/library")]
+    // A bare name is a host only when it carries a port.
+    [InlineData("documentdb/documentdb-local", "myregistry")]
     // Leaving the registry annotation in place composes a doubled, unresolvable reference.
     [InlineData("ghcr.io/documentdb/documentdb/documentdb-local", "ghcr.io/documentdb")]
     public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForLookalikeReferences(
@@ -2100,6 +2112,34 @@ public class AddDocumentDBTests
         Assert.Equal($"{QualifiedOfficialImage}:{InterlockedTag}", resource!["image"]?.GetValue<string>());
         Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
         Assert.Equal(3, resource["args"]?.AsArray().Count);
+    }
+
+    /// <summary>
+    /// Through the real publishing pipeline, for a reference whose prefix carries a namespace:
+    /// the manifest ships the reference the caller composed, unwrapped, because that repository is
+    /// not one this package publishes.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local", "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    public async Task WithOpenTelemetryMetricsPublishesAnUnwrappedManifestForAnExtraPathSegment(
+        string? registry,
+        string image,
+        string expected)
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage(image, InterlockedTag)
+                .WithImageRegistry(registry!)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Equal($"{expected}:{InterlockedTag}", resource!["image"]?.GetValue<string>());
+        Assert.Null(resource["entrypoint"]);
+        Assert.Null(resource["args"]);
     }
 
     [Fact]
