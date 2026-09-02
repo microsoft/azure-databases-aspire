@@ -106,7 +106,21 @@ public static class DocumentDBBuilderExtensions
         "s=\"$c/SetupConfiguration.json\"; " +
         "if [ ! -r \"$s\" ]; then echo \"aspire-documentdb -- gateway configuration $s is missing or unreadable\" >&2; exit 1; fi; " +
         "if ! command -v jq >/dev/null 2>&1; then echo \"aspire-documentdb -- jq is required to make the OpenTelemetry environment variables authoritative\" >&2; exit 1; fi; " +
-        "o=\"$(mktemp -d)\"; " +
+        "if ! command -v realpath >/dev/null 2>&1; then echo \"aspire-documentdb -- realpath is required to keep the telemetry configuration outside DATA_PATH\" >&2; exit 1; fi; " +
+        "d=\"$DATA_PATH\"; " +
+        $"if [ -z \"$d\" ]; then d=\"{DefaultMountedDataPath}\"; fi; " +
+        "if ! d=\"$(realpath -m -- \"$d\" 2>/dev/null)\"; then echo \"aspire-documentdb -- DATA_PATH could not be canonicalized for the telemetry configuration\" >&2; exit 1; fi; " +
+        "if [ \"$d\" = \"/\" ]; then echo \"aspire-documentdb -- no temporary directory can be safely separated from a root DATA_PATH\" >&2; exit 1; fi; " +
+        "r=\"\"; " +
+        "for x in /tmp /var/tmp /dev/shm; do " +
+            "if ! x=\"$(realpath -m -- \"$x\" 2>/dev/null)\"; then continue; fi; " +
+            "if [ ! -d \"$x\" ] || [ ! -w \"$x\" ]; then continue; fi; " +
+            "case \"$x\" in \"$d\"|\"$d\"/*) continue;; esac; " +
+            "case \"$d\" in \"$x\"|\"$x\"/*) continue;; esac; " +
+            "r=\"$x\"; break; " +
+        "done; " +
+        "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi; " +
+        "if ! o=\"$(mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\")\"; then echo \"aspire-documentdb -- could not create the temporary gateway configuration\" >&2; exit 1; fi; " +
         $"jq '{BuildOpenTelemetryGatewayConfigurationFilter(configuration)}' \"$s\" >\"$o/SetupConfiguration.json\"; " +
         "export CONFIG_DIR=\"$o\"; " +
         $"exec {GatewayEntrypointScriptPath} \"$@\"";

@@ -3425,6 +3425,30 @@ public class AddDocumentDBTests
     }
 
     [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsItsTemporaryConfigurationOutsideDataPath()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("DATA_PATH", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("d=\"$DATA_PATH\"", script, StringComparison.Ordinal);
+        Assert.Contains("realpath -m -- \"$d\"", script, StringComparison.Ordinal);
+        Assert.Contains("if [ \"$d\" = \"/\" ]", script, StringComparison.Ordinal);
+        Assert.Contains("for x in /tmp /var/tmp /dev/shm", script, StringComparison.Ordinal);
+        Assert.Contains("realpath -m -- \"$x\"", script, StringComparison.Ordinal);
+        Assert.Contains("case \"$x\" in \"$d\"|\"$d\"/*) continue;; esac", script, StringComparison.Ordinal);
+        Assert.Contains("case \"$d\" in \"$x\"|\"$x\"/*) continue;; esac", script, StringComparison.Ordinal);
+        Assert.Contains("mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\"", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("o=\"$(mktemp -d)\"", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task WithOpenTelemetryMetricsRemovesTheWholeMetricsBlockButKeepsTheSharedIdentity()
     {
         var appBuilder = CreateLifecycleTestBuilder();
