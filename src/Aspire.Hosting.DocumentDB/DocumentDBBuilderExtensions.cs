@@ -423,9 +423,15 @@ public static class DocumentDBBuilderExtensions
     /// <para>
     /// Same carve-outs as <see cref="SubscribeMinimumPostgresImageGuard"/>: custom images, tags
     /// outside the strict <c>pg{NN}-X.Y.Z</c> grammar and caller-owned Dockerfile builds are
-    /// exempt, and the guard is run-mode only, so manifest generation is unaffected. Unlike that
-    /// guard this one is always subscribed, so the exempt paths stay silent rather than warning on
-    /// every app that pins a custom image.
+    /// exempt. Unlike that guard this one is always subscribed, so the exempt paths stay silent
+    /// rather than warning on every app that pins a custom image.
+    /// </para>
+    /// <para>
+    /// The subscription reports the failure while the resource is being started, which is where a
+    /// caller sees it; it is not what makes the floor hold. A subscriber registered after this
+    /// package runs afterwards and can replace the image it cleared, so the same rule — stated
+    /// once in <see cref="DescribeUnpublishedPostgresVariant"/> — is applied again at the
+    /// checkpoints Aspire never caches. See <see cref="DescribeIncompatibleImage"/>.
     /// </para>
     /// </remarks>
     private static IResourceBuilder<DocumentDBServerResource> SubscribeMinimumPgVariantImageGuard(
@@ -435,35 +441,124 @@ public static class DocumentDBBuilderExtensions
             builder.Resource,
             (evt, ct) =>
             {
-                // Only a curated image is pulled by tag from the upstream registry. A fork
-                // publishing its own images decides its own variant matrix, and a resource built
-                // from the caller's own Dockerfile never resolves that tag at all.
-                var image = ResolveEffectiveImage(evt.Resource);
-                if (image is not { Origin: DocumentDBImageOrigin.Curated, KnownVersion: { } docVersion })
+                if (DescribeUnpublishedPostgresVariant(evt.Resource, ResolveEffectiveImage(evt.Resource)) is { } incompatible)
                 {
-                    return Task.CompletedTask;
+                    throw incompatible;
                 }
 
-                if (!DocumentDBContainerImageTags.MinimumVersionByPgVariant.TryGetValue(image.PostgresVariant, out var minimum) ||
-                    docVersion >= minimum)
-                {
-                    return Task.CompletedTask;
-                }
-
-                throw new InvalidOperationException(
-                    $"DocumentDB resource '{evt.Resource.Name}' resolves to image tag " +
-                    $"'{image.Tag}', but upstream only publishes pg{image.PostgresVariant} images " +
-                    $"from DocumentDB v{minimum} onwards. That tag does not exist on " +
-                    $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}, " +
-                    $"so starting the resource would fail with an opaque manifest-not-found error. " +
-                    $"Recovery: pair " +
-                    $"'.WithPostgresVersion(DocumentDBPostgresVersion.Pg{image.PostgresVariant})' " +
-                    $"with DocumentDB v{minimum} or newer, or choose a PostgreSQL variant that " +
-                    $"exists for v{docVersion}.");
+                return Task.CompletedTask;
             });
 
         return builder;
     }
+
+    /// <summary>
+    /// The unpublished-variant floor, stated once and evaluated against one effective image.
+    /// </summary>
+    /// <remarks>
+    /// Only a curated image is pulled by tag from the upstream registry. A fork publishing its own
+    /// images decides its own variant matrix, a resource built from the caller's own Dockerfile
+    /// never resolves that tag at all, and a digest pin resolves something the tag does not name —
+    /// so the floor applies to exactly the origin that carries a known version.
+    /// </remarks>
+    /// <returns>
+    /// The failure to raise, or <see langword="null"/> when the image satisfies the floor or its
+    /// version is not known.
+    /// </returns>
+    private static InvalidOperationException? DescribeUnpublishedPostgresVariant(
+        IResource resource,
+        DocumentDBEffectiveImage image)
+    {
+        if (image is not { Origin: DocumentDBImageOrigin.Curated, KnownVersion: { } docVersion })
+        {
+            return null;
+        }
+
+        if (!DocumentDBContainerImageTags.MinimumVersionByPgVariant.TryGetValue(image.PostgresVariant, out var minimum) ||
+            docVersion >= minimum)
+        {
+            return null;
+        }
+
+        return new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' resolves to image tag " +
+            $"'{image.Tag}', but upstream only publishes pg{image.PostgresVariant} images " +
+            $"from DocumentDB v{minimum} onwards. That tag does not exist on " +
+            $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}, " +
+            $"so starting the resource would fail with an opaque manifest-not-found error. " +
+            $"Recovery: pair " +
+            $"'.WithPostgresVersion(DocumentDBPostgresVersion.Pg{image.PostgresVariant})' " +
+            $"with DocumentDB v{minimum} or newer, or choose a PostgreSQL variant that " +
+            $"exists for v{docVersion}.");
+    }
+
+    /// <summary>
+    /// The <see cref="WithPostgresEndpoint"/> credential floor, stated once and evaluated against
+    /// one effective image.
+    /// </summary>
+    /// <remarks>
+    /// Whether the floor applies is read from the model rather than remembered at
+    /// <see cref="WithPostgresEndpoint"/> time, so a checkpoint that judges the final image judges
+    /// the final endpoint set with it. The carve-outs are the same ones
+    /// <see cref="DescribeUnpublishedPostgresVariant"/> gets from the origin; the early guard warns
+    /// about them, and this states only the failure.
+    /// </remarks>
+    private static InvalidOperationException? DescribePostgresEndpointFloor(
+        IResource resource,
+        DocumentDBEffectiveImage image)
+    {
+        if (image is not { Origin: DocumentDBImageOrigin.Curated, KnownVersion: { } docVersion } ||
+            docVersion >= DocumentDBContainerImageTags.MinimumPostgresEndpointVersion ||
+            !PublishesPostgresEndpoint(resource))
+        {
+            return null;
+        }
+
+        return new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' is configured with image tag " +
+            $"'{image.Tag}', but WithPostgresEndpoint() requires DocumentDB " +
+            $"v{DocumentDBContainerImageTags.MinimumPostgresEndpointVersion} or later. " +
+            $"Earlier images hard-code the PostgreSQL admin credentials to " +
+            $"'docdb_admin'/'Admin100', so the Aspire-generated postgresql:// connection " +
+            $"string would silently fail to authenticate. Recovery: chain " +
+            $"'.WithImageTag(\"pg{{NN}}-{DocumentDBContainerImageTags.MinimumPostgresEndpointVersion}\")' " +
+            $"(or newer) after AddDocumentDB(...). See " +
+            $"https://github.com/microsoft/azure-databases-aspire/issues/71.");
+    }
+
+    /// <summary>
+    /// Every hard image-compatibility floor this package enforces, evaluated together against the
+    /// image the resource will actually run as the model now stands.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The floors are also subscribed as <see cref="BeforeResourceStartedEvent"/> handlers, which
+    /// is what reports them while the resource is still being started rather than at the moment
+    /// the container is created. That is not on its own sufficient: a subscriber registered after
+    /// this package runs after those handlers, so an image they cleared can still be replaced
+    /// before anything reads it. This is therefore called from the checkpoints Aspire never
+    /// caches, where the image being judged is the last word on the subject.
+    /// </para>
+    /// <para>
+    /// The variant floor is judged first, matching the order the two subscriptions are registered
+    /// in, so a tag that breaks both rules reports the same failure it always has.
+    /// </para>
+    /// </remarks>
+    private static InvalidOperationException? DescribeIncompatibleImage(IResource resource)
+    {
+        var image = ResolveEffectiveImage(resource);
+
+        return DescribeUnpublishedPostgresVariant(resource, image)
+            ?? DescribePostgresEndpointFloor(resource, image);
+    }
+
+    /// <summary>
+    /// Whether the resource publishes the PostgreSQL coordinator endpoint, which is what makes the
+    /// credential floor apply to it.
+    /// </summary>
+    private static bool PublishesPostgresEndpoint(IResource resource) =>
+        resource.Annotations.OfType<EndpointAnnotation>()
+            .Any(endpoint => endpoint.Name == DocumentDBServerResource.PostgresEndpointName);
 
     /// <summary>
     /// How much this package can know about the container image a DocumentDB resource will
@@ -781,9 +876,12 @@ public static class DocumentDBBuilderExtensions
     /// <see cref="WithPostgresEndpoint"/> still affects the tag the guard sees.
     /// </para>
     /// <para>
-    /// The guard is run-mode only. <see cref="BeforeResourceStartedEvent"/> is not published
-    /// during manifest generation, so <c>azd publish</c> / <c>--publisher manifest</c> flows
-    /// are unaffected — that is intentional, because no container is started in those modes.
+    /// The subscription is what warns about the exempt cases and what reports the failure while
+    /// the resource is being started. It is not what makes the floor hold: a subscriber registered
+    /// after this package runs afterwards, so the rule — stated once in
+    /// <see cref="DescribePostgresEndpointFloor"/> — is applied again at the checkpoints Aspire
+    /// never caches, in a run and while a publish serializes the resource alike. See
+    /// <see cref="DescribeIncompatibleImage"/>.
     /// </para>
     /// <para>
     /// Custom images (anything whose <see cref="ContainerImageAnnotation.Image"/> is not
@@ -879,7 +977,7 @@ public static class DocumentDBBuilderExtensions
                     return Task.CompletedTask;
                 }
 
-                if (image.KnownVersion is not { } docVersion)
+                if (image.KnownVersion is null)
                 {
                     if (Interlocked.CompareExchange(ref warningLogged, 1, 0) == 0)
                     {
@@ -894,18 +992,9 @@ public static class DocumentDBBuilderExtensions
                     return Task.CompletedTask;
                 }
 
-                if (docVersion < DocumentDBContainerImageTags.MinimumPostgresEndpointVersion)
+                if (DescribePostgresEndpointFloor(evt.Resource, image) is { } incompatible)
                 {
-                    throw new InvalidOperationException(
-                        $"DocumentDB resource '{evt.Resource.Name}' is configured with image tag " +
-                        $"'{image.Tag}', but WithPostgresEndpoint() requires DocumentDB " +
-                        $"v{DocumentDBContainerImageTags.MinimumPostgresEndpointVersion} or later. " +
-                        $"Earlier images hard-code the PostgreSQL admin credentials to " +
-                        $"'docdb_admin'/'Admin100', so the Aspire-generated postgresql:// connection " +
-                        $"string would silently fail to authenticate. Recovery: chain " +
-                        $"'.WithImageTag(\"pg{{NN}}-{DocumentDBContainerImageTags.MinimumPostgresEndpointVersion}\")' " +
-                        $"(or newer) after AddDocumentDB(...). See " +
-                        $"https://github.com/microsoft/azure-databases-aspire/issues/71.");
+                    throw incompatible;
                 }
 
                 return Task.CompletedTask;
@@ -3023,13 +3112,13 @@ public static class DocumentDBBuilderExtensions
         guard.RuntimeCheckpoint = new ContainerRuntimeArgsCallbackAnnotation(_ =>
         {
             EnsureTerminalCallbackRunsLast(resource, guard.RuntimeCheckpoint, "container-runtime-arguments");
-            VerifyTerminalConfigurationSeal(resource, guard);
+            VerifyTerminalCheckpoint(resource, guard);
             return Task.CompletedTask;
         });
 
         guard.ManifestCheckpoint = new ManifestPublishingCallbackAnnotation(async context =>
         {
-            VerifyTerminalConfigurationSeal(resource, guard);
+            VerifyTerminalCheckpoint(resource, guard);
 
             // Whatever would have written this resource had the checkpoint not been installed
             // still writes it, so the manifest is byte-for-byte the one Aspire would have
@@ -3282,16 +3371,49 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Everything the two uncached checkpoints judge, in the order they judge it: the hard image
+    /// floors first, then the configuration seal.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The floors are re-applied here because the events that report them are ordinary
+    /// subscriptions: one registered after this package runs after them, and an image they cleared
+    /// can be replaced before anything reads it. They are judged before the seal so an image that
+    /// cannot work is reported with the recovery that applies to it rather than only as a change.
+    /// </para>
+    /// <para>
+    /// This is what the container-runtime-arguments callback and the manifest publishing callback
+    /// run, and nothing else does: those two are the moments a container is about to be created
+    /// and a resource is actually being serialized.
+    /// <see cref="ResourceBuilderExtensions.ExcludeFromManifest{T}"/> takes the second one out of
+    /// the model, which is what keeps it the deliberate boundary — a resource that publishes
+    /// nothing has no published image to judge.
+    /// </para>
+    /// </remarks>
+    private static void VerifyTerminalCheckpoint(
+        DocumentDBServerResource resource,
+        TerminalGuardAnnotation guard)
+    {
+        if (DescribeIncompatibleImage(resource) is { } incompatible)
+        {
+            throw incompatible;
+        }
+
+        VerifyTerminalConfigurationSeal(resource, guard);
+    }
+
+    /// <summary>
     /// Fails the resource when anything the container's command depends on changed after the
     /// command-line callback produced the answer Aspire cached.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Called from the two uncached checkpoints the integration owns: the
-    /// container-runtime-arguments callback in a run and the manifest publishing callback while a
-    /// publish serializes the resource. Together they cover every supported way to change the model
-    /// after the command line has been decided: appending or inserting a callback in either
-    /// pipeline, re-pointing the entrypoint, and swapping the image, tag, digest or Dockerfile.
+    /// Called from the two uncached checkpoints the integration owns — see
+    /// <see cref="VerifyTerminalCheckpoint"/> — and from
+    /// <see cref="Publishing.BeforePublishEvent"/>, which reports a stale configuration before the
+    /// pipeline starts writing. Together they cover every supported way to change the model after
+    /// the command line has been decided: appending or inserting a callback in either pipeline,
+    /// re-pointing the entrypoint, and swapping the image, tag, digest or Dockerfile.
     /// </para>
     /// <para>
     /// Nothing is repaired. Re-running the wrapper is not an option — Aspire would keep the cached

@@ -802,7 +802,7 @@ var server = builder.AddDocumentDB("documentdb")
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`, `Pg18`. `Pg18` images are available upstream from DocumentDB `0.114.0` onwards; pairing `Pg18` with an older `DocumentDBVersion` throws at startup rather than failing the container pull with an opaque manifest error. |
+| `pgVersion` | `DocumentDBPostgresVersion` | `Pg17` (when not called) | One of `Pg15`, `Pg16`, `Pg17`, `Pg18`. `Pg18` images are available upstream from DocumentDB `0.114.0` onwards; pairing `Pg18` with an older `DocumentDBVersion` throws before the container starts, and again before it is created or published, rather than failing the container pull with an opaque manifest error. |
 
 ## WithPostgresEndpoint
 
@@ -831,7 +831,7 @@ builder.AddProject<Projects.Worker>("worker")
 > `postgresql://admin:<password>@host:port/postgres` connection string Aspire
 > generates would silently fail authentication. To prevent the silent failure,
 > the integration validates the resource's effective `ContainerImageAnnotation`
-> tag at startup and throws an `InvalidOperationException` if it is older than
+> tag and throws an `InvalidOperationException` if it is older than
 > `pg{NN}-0.112.0`. The exception message looks like:
 >
 > ```
@@ -858,9 +858,14 @@ builder.AddProject<Projects.Worker>("worker")
 > `.WithImageTag(...)` shown above.
 >
 > **Scope of the guard:**
-> - **Run mode only.** Manifest generation (`azd publish`, `--publisher
->   manifest`) does not start the container, so the guard does not fire and
->   the manifest is produced regardless of tag.
+> - **Judged on the image that will actually run.** The floor is reported by a
+>   `BeforeResourceStartedEvent` subscriber, and applied again from the
+>   package's uncached checkpoints — immediately before each container is
+>   created, and while `azd publish` / `--publisher manifest` serializes the
+>   resource — so a subscriber or lifecycle hook that swaps the image after the
+>   event cannot slip a pre-`0.112.0` image past it. Publishing a manifest for
+>   such a resource is refused with the same message; `ExcludeFromManifest()`
+>   remains the way to keep a resource out of the manifest entirely.
 > - **Curated image only.** A custom image (any reference that is not the
 >   curated repository under a registry host, e.g. a fork via
 >   `.WithImage("myorg/build", "pg17-0.110.0")` or a mirror path such as
@@ -909,7 +914,7 @@ You can enumerate the full list at runtime via `DocumentDBVersions.All`, and rea
 | Symbol | Notes |
 |---|---|
 | `enum DocumentDBVersion` | Curated members like `V0_109_0`, `V0_110_0`, `V0_111_0`. Stable forever once shipped. |
-| `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`, `Pg18`. Default `Pg17`. `Pg18` requires DocumentDB `0.114.0` or newer — enforced at startup, so an unpublished combination fails with an actionable message. |
+| `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`, `Pg18`. Default `Pg17`. `Pg18` requires DocumentDB `0.114.0` or newer — enforced against the image that will actually run, at startup and again at container creation and manifest serialization, so an unpublished combination fails with an actionable message. |
 | `DocumentDBVersions.All` | All known version strings, ascending semver. |
 | `DocumentDBVersions.Latest` | The newest version known to *this build* of the package. |
 
