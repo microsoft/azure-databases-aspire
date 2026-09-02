@@ -220,6 +220,17 @@ where the database is written, since a database publishes nothing but the string
 The expression is kept only as a digest and never appears in a failure: it carries the resource's
 credentials.
 
+Both checkpoints — the server's and each database's — have to be the last manifest callback on their
+resource to run at all, because the publisher reads the last one and no other. Events alone cannot
+guarantee that: the app host publishes `BeforePublishEvent` to every subscriber and only then runs
+the publishing pipeline, so a subscriber registered after `AddDocumentDB` — including one a lifecycle
+hook registers — can call `WithManifestPublishingCallback(...)` after this package has taken the last
+position back, and the checkpoint would simply never run. Every checkpoint is therefore recorded on
+its resource and put back from a single publishing-pipeline configuration callback, which the app
+host runs when it resolves the pipeline's steps: after the last subscriber, and before the step that
+writes the manifest. A caller's own writer still writes the entry it would have written, and
+`ExcludeFromManifest()` still excludes the resource.
+
 The image is settled before any of this, and before the app host prepares a single container. The
 app host snapshots a container's image into the orchestrator's container spec while it prepares
 resources, which is before endpoints are allocated and before the resource-start event, and nothing
@@ -236,21 +247,63 @@ nothing, because it prepares no container and writes the manifest from the model
 
 Container-runtime arguments are read too. `WithContainerRuntimeArgs(...)` passes its arguments
 straight to the container runtime ahead of the image, so nothing added there is visible to any rule
-written against the model: `--mount`, `-v`, `--volume`, `--volume-driver`, `--volumes-from`,
-`--tmpfs` and `--use-api-socket` mount storage with no annotation to read, `--read-only` makes the
-data directory unwritable without one either,
+written against the model: `--mount`, `-v`, `--volume`, `--volumes-from` and `--tmpfs` mount
+storage with no annotation to read, `--read-only` makes the data directory unwritable without one
+either,
 `--env DATA_PATH=...` moves the data directory past the one checked path above, `--env`/`-e` can
 replace `USERNAME` or `PASSWORD` out from under the generated connection string, `--entrypoint`
 replaces the entry point, and a bare operand would be read as the image. All of those fail the
 resource, in every spelling the runtime accepts — `--option value`, `--option=value`, the attached
 short form `-eDATA_PATH=...`, short-option clusters, `--env-file`, and values contributed by
 another callback — as does a token whose value is only known later sitting where the runtime reads
-an option name. One parser and one terminal container-runtime callback serve the whole package, so
-the storage rules and the `WithOpenTelemetryMetrics(...)` wrapper judge the same finished line. The arguments
-are parsed with the runtime's own grammar rather than searched, so `--label -v` passes a label,
-`--memory 512m` is not a mount, and `--cap-add`, `--network`, `--pull`, `--platform`, `--dns`,
-`--ulimit`, `--sysctl`, `-it` and the rest reach the runtime untouched. No operand appears in the
-failure, which names the option and, for an environment option, the variable.
+an option name.
+
+The grammar is the union of the two runtimes the app host drives, because which one is behind the
+arguments is not this package's to know. Podman accepts everything Docker does and adds options with
+no Docker equivalent that reach the same places: `--secret` mounts a file (or, with `type=env`, sets
+a variable), `--image-volume` decides what becomes of the image's own `VOLUME` declarations, and
+`--init-path` bind-mounts a host binary, so all three are refused as storage; `--env-host` imports
+the entire host environment and `--unsetenv-all` clears every variable the image declares, including
+the canonical `DATA_PATH` written above, so both are refused outright, while `--env-merge` and
+`--unsetenv` name the one variable they touch and are refused only when that variable is one this
+package owns; and `--rootfs` replaces the image with a directory, so it is refused as displacing the
+sealed image. An explicit `--option=false` on a value-less option is the caller declining it, and is
+passed through.
+
+Storage is not only what a `--mount` spells, so an option that creates, selects or alters mounts or
+the root filesystem without naming one is refused as storage too: `--storage-opt` (the storage
+driver's options for this container, which is the size and backing of the root filesystem the data
+directory sits on when nothing is mounted over it), `--volume-driver` (which driver supplies every
+`-v` volume), `--chrootdirs` (further directories the runtime bind-mounts its managed files into),
+`--ipc` (whose `/dev/shm` the container gets — `host` mounts the host's, `container:`*id* another
+container's), `--pod` and `--pod-id-file` (the pod whose infra container brings namespaces and the
+pod's own volumes, and which `--pod new:`*name* also creates), `--read-only-tmpfs` (the read-write
+tmpfs the runtime mounts over `/dev`, `/dev/shm`, `/run`, `/tmp` and `/var/tmp` under `--read-only`),
+`--systemd` (systemd mode, which mounts tmpfs on `/run`, `/run/lock`, `/tmp` and `/var/log/journal`
+and mounts the cgroup filesystem) and `--use-api-socket` (which bind-mounts the runtime's API socket
+and a synthesized credential file). `--read-only-tmpfs=false` and `--use-api-socket=false` are the
+caller declining them and pass through; so does `--systemd=false`, which is the one off spelling
+Podman reads for a three-valued option — `--systemd=0` is not.
+
+The arguments are parsed with the runtimes' own grammar rather than searched, so `--label -v` passes
+a label, `--memory 512m` is not a mount, and `--cap-add`, `--network`, `--pull`, `--platform`,
+`--dns`, `--ulimit`, `--sysctl`, `-it` — and Podman's `--tz`, `--umask`, `--sdnotify`, `--uidmap`,
+`--authfile`, `--seccomp-policy` and the rest — reach the runtime untouched. A value-less option
+takes its value only after an `=`, so a bare `--systemd`, `--read-only-tmpfs` or `--use-api-socket`
+does not consume the token behind it and cannot hide a `--mount=type=bind,...` as its operand.
+
+No value the caller wrote appears in the failure. What is named is the option spelling this
+package's own table holds and, for an environment option, the package-owned variable name this
+package itself chose; an operand is never named, and neither is a bare positional token. An operand
+is where a mount source, a variable's value or a password lives, and a positional token is where a
+caller who resolved a connection string themselves would have put it — including as a parameter or a
+reference expression, which are read by position only and never resolved.
+
+One parser and one terminal container-runtime callback serve the whole package. The storage rules
+and the `WithOpenTelemetryMetrics(...)` wrapper read the same finished line, each with its own set
+of variables it owns; while the wrapper owns the command the reading is stricter in one respect
+only, in that an option neither runtime documents, and a required value that is missing, are
+refused rather than passed through.
 
 A container built from a Dockerfile is recorded twice over, because every such build resolves to the
 same effective image and the `build` object is the first thing the writer emits. The annotation's
@@ -721,15 +774,28 @@ instead of guessing:
 - Setting `ContainerResource.ShellExecution` to `true`. DCP applies that switch after argument
   validation and replaces the wrapper arguments with one joined `-c` string, producing a nested
   shell command that does not start DocumentDB. Leave it `null` or set it to `false`.
-- Passing raw `--entrypoint`, `--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`,
-  `--volumes-from`, or `--use-api-socket` options through `WithContainerRuntimeArgs(...)`. Those
-  options bypass the resource model after the wrapper has been generated. Use `WithBindMount(...)` or
-  `WithVolume(...)` for storage.
+- Passing raw `--entrypoint`, `--rootfs`, `--mount`, `--volume`/`-v`, `--volume-driver`,
+  `--tmpfs`, `--volumes-from`, `--read-only`, `--storage-opt`, or `--use-api-socket` options through
+  `WithContainerRuntimeArgs(...)`. Podman-specific storage changes are covered too, including
+  `--secret`, `--image-volume`, `--init-path`, `--chrootdirs`, `--ipc`, `--read-only-tmpfs`, and `--systemd`.
+  Joining a pod through `--pod` or `--pod-id-file` is rejected because it can replace the
+  `/dev/shm` backing through a shared IPC namespace. Those options bypass the resource model after
+  the wrapper has been generated. Use
+  `WithBindMount(...)` or `WithVolume(...)` for storage.
 - Passing a raw runtime environment override for `DATA_PATH`, `CONFIG_DIR`, `GATEWAY_HOME`, or a
-  telemetry value the wrapper protects. `--env-file` is also rejected because its contents cannot
-  be inspected. Use `WithEnvironment(...)`, which is part of both the validated model and the
-  published manifest. Other Docker runtime options, including unrelated `--env` values, remain
-  available.
+  telemetry value the wrapper protects. `--env-file`, Podman's `--env-host`, and `--unsetenv-all`
+  are rejected because their complete effects cannot be inspected; protected `--env-merge` and
+  `--unsetenv` values are rejected by name. Use `WithEnvironment(...)`, which is part of both the
+  validated model and the published manifest.
+- Passing a bare positional runtime operand, including one after `--`. Docker and Podman interpret
+  that operand as the image or root filesystem before the model-selected image, so it is rejected
+  without reporting its value. Unknown runtime options fail generically as well. The parser covers
+  the documented Docker/Podman `run` option union, including exact required-value arity; unrelated
+  known options remain available.
+
+Runtime diagnostics report only known option names and package-owned environment variable names.
+They never include positional operands, image or rootfs values, mount specifications, environment
+values, URIs, credentials, deferred values, or the original exception from a failed resolution.
 
 **Argument ordering is fixed, and enforced.** `/bin/bash` reads its command from the first
 arguments, so the wrapper's `-c <script> --` prefix has to stay in front of everything else: one
@@ -769,7 +835,7 @@ resource will run — and comparing it at the two points the app host never cach
 
 | Mode | Checkpoint | Runs |
 | --- | --- | --- |
-| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read; it also resolves the final Docker runtime arguments once and rejects command, environment, or storage overrides that bypass the model |
+| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read; it also resolves the final Docker/Podman runtime arguments once and rejects image operands, command, environment, or storage overrides that bypass the model |
 | Publish | the manifest publishing callback the package adds | while the resource is serialized, after every lifecycle hook and every model event, including ones raised by subscribers registered after `AddDocumentDB` |
 
 If anything changed, the resource is failed — a publish before the manifest is written, a run

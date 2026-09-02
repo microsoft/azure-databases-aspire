@@ -6182,16 +6182,40 @@ public class AddDocumentDBTests
         { ["--mount=type=volume,source=runtime-secret,target=/tmp"], "--mount" },
         { ["--volume", "runtime-secret:/tmp"], "--volume" },
         { ["--volume=runtime-secret:/tmp"], "--volume" },
-        { ["-v", "runtime-secret:/tmp"], "--volume" },
-        { ["-vruntime-secret:/tmp"], "--volume" },
-        { ["-v=runtime-secret:/tmp"], "--volume" },
-        { ["-itvruntime-secret:/tmp"], "--volume" },
+        { ["-v", "runtime-secret:/tmp"], "-v" },
+        { ["-vruntime-secret:/tmp"], "-v" },
+        { ["-v=runtime-secret:/tmp"], "-v" },
+        { ["-itvruntime-secret:/tmp"], "-v" },
         { ["-l=", "--mount", "type=volume,source=runtime-secret,target=/tmp"], "--mount" },
         { ["--tmpfs", "/tmp:size=64m"], "--tmpfs" },
         { ["--tmpfs=/tmp:size=64m"], "--tmpfs" },
         { ["--volume-driver", "runtime-secret"], "--volume-driver" },
         { ["--volumes-from", "runtime-secret"], "--volumes-from" },
         { ["--use-api-socket"], "--use-api-socket" },
+        { ["--secret", "runtime-secret,type=mount,target=/tmp"], "--secret" },
+        { ["--secret=runtime-secret,type=mount,target=/tmp"], "--secret" },
+        { ["--image-volume", "tmpfs"], "--image-volume" },
+        { ["--image-volume=tmpfs"], "--image-volume" },
+        { ["--ipc", "host"], "--ipc" },
+        { ["--ipc=host"], "--ipc" },
+        { ["--chrootdirs", "/runtime-secret"], "--chrootdirs" },
+        { ["--chrootdirs=/runtime-secret"], "--chrootdirs" },
+        { ["--read-only-tmpfs"], "--read-only-tmpfs" },
+        { ["--read-only-tmpfs=true"], "--read-only-tmpfs" },
+        { ["--systemd"], "--systemd" },
+        { ["--systemd=always"], "--systemd" },
+        { ["--pod", "runtime-secret"], "--pod" },
+        { ["--pod=runtime-secret"], "--pod" },
+        { ["--pod-id-file", "/runtime-secret/pod-id"], "--pod-id-file" },
+        { ["--pod-id-file=/runtime-secret/pod-id"], "--pod-id-file" },
+        { ["--read-only"], "--read-only" },
+        { ["--read-only=true"], "--read-only" },
+        { ["--storage-opt", "overlay2.size=runtime-secret"], "--storage-opt" },
+        { ["--storage-opt=overlay2.size=runtime-secret"], "--storage-opt" },
+        { ["--init-path", "/runtime-secret/podman-init"], "--init-path" },
+        { ["--init-path=/runtime-secret/podman-init"], "--init-path" },
+        { ["--http-proxy", "--secret=runtime-secret,type=mount,target=/tmp"], "--secret" },
+        { ["--http-proxy=false", "--image-volume=runtime-secret"], "--image-volume" },
     };
 
     [Theory]
@@ -6247,6 +6271,13 @@ public class AddDocumentDBTests
         { ["-e=OTEL_EXPORTER_OTLP_ENDPOINT=http://runtime-secret"] },
         { ["--env-file", "/runtime-secret/environment"] },
         { ["--env-file=/runtime-secret/environment"] },
+        { ["--env-host"] },
+        { ["--env-host=true"] },
+        { ["--env-merge", "DATA_PATH=/runtime-secret"] },
+        { ["--env-merge=CONFIG_DIR=/runtime-secret"] },
+        { ["--unsetenv", "OTEL_METRICS_ENABLED"] },
+        { ["--unsetenv=OTEL_EXPORTER_OTLP_ENDPOINT"] },
+        { ["--unsetenv-all"] },
     };
 
     [Theory]
@@ -6268,6 +6299,133 @@ public class AddDocumentDBTests
 
         Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--rootfs", "/runtime-secret/rootfs")]
+    [InlineData("--rootfs=/runtime-secret/rootfs")]
+    public async Task WithOpenTelemetryMetricsRejectsPodmanRootfsOverrides(params string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("'--rootfs'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("registry.example/runtime-secret:latest")]
+    [InlineData("--", "registry.example/runtime-secret:latest")]
+    public async Task RuntimeArgumentParserRejectsPositionalOperandsWithoutRepeatingThem(
+        params string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("positional container runtime operand", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("registry.example", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--authfile")]
+    [InlineData("--env-merge")]
+    [InlineData("--sdnotify")]
+    public async Task RuntimeArgumentParserEnforcesRequiredPodmanOptionArity(string runtimeArgument)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArgument);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("does not provide the required value", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(runtimeArgument, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--future-runtime-option=runtime-secret")]
+    [InlineData("-Zruntime-secret")]
+    public async Task RuntimeArgumentParserRejectsUnknownOptionsWithoutRepeatingTheirTokens(
+        string runtimeArgument)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArgument);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("outside the Docker and Podman run grammar", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("future-runtime-option", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("-Z", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserLeavesHarmlessPodmanOptionsAlone()
+    {
+        string[] runtimeArguments =
+        [
+            "--arch", "arm64",
+            "--authfile=/work/auth.json",
+            "--cgroups", "disabled",
+            "--gidmap=0:1000:1",
+            "--health-log-destination", "local",
+            "--http-proxy=false",
+            "--init",
+            "--net=bridge",
+            "--os", "linux",
+            "--retry", "3",
+            "--sdnotify=ignore",
+            "--tz", "UTC",
+            "--variant", "v8",
+            "--env-merge", "UNRELATED=prefix",
+            "--unsetenv=UNRELATED",
+            "--",
+        ];
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            runtimeArguments,
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
     }
 
     [Fact]
@@ -6375,6 +6533,157 @@ public class AddDocumentDBTests
         Assert.Equal(1, environment.Evaluations);
         Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredPodmanSecretOption()
+    {
+        var option = new CountingValueProvider("--secret");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(option);
+                context.Args.Add("runtime-secret,type=mount,target=/tmp");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, option.Evaluations);
+        Assert.Contains("'--secret'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredPodmanEnvironmentMerge()
+    {
+        var environment = new CountingValueProvider("DATA_PATH=/runtime-secret");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--env-merge");
+                context.Args.Add(environment);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, environment.Evaluations);
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserResolvesADeferredHarmlessPodmanValueOnce()
+    {
+        var value = new CountingValueProvider("ignore");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--sdnotify");
+                context.Args.Add(value);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            ["--sdnotify", "ignore"],
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+        Assert.Equal(1, value.Evaluations);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotExposeASecretParameterOperandInPublishMode()
+    {
+        const string secret = "operand-secret-fragment";
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:operand"] = secret;
+        var operand = appBuilder.AddParameter("operand", secret: true);
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context => context.Args.Add(operand.Resource));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("positional container runtime operand", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("operand-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotExposeACredentialReferenceOperandInPublishMode()
+    {
+        const string passwordValue = "ReferenceCredentialSecret987";
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:reference-password"] = passwordValue;
+        var password = appBuilder.AddParameter("reference-password", secret: true);
+        var credential = ReferenceExpression.Create(
+            $"mongodb://runtime-user:{password.Resource}@runtime-host:10260/admin");
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context => context.Args.Add(credential));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("positional container runtime operand", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(passwordValue, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("mongodb://", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("runtime-user", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotExposeADeferredResolutionFailure()
+    {
+        var value = new ThrowingValueProvider("resolution-secret-fragment");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context => context.Args.Add(value));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("could not be resolved", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("resolution-secret", exception.ToString(), StringComparison.Ordinal);
+        Assert.Null(exception.InnerException);
     }
 
     [Fact]
@@ -6522,6 +6831,75 @@ public class AddDocumentDBTests
 
         Assert.Contains("ShellExecution", log, StringComparison.Ordinal);
         Assert.Contains("false or null", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ManifestDiagnosticsDoNotExposeASecretParameterArgument()
+    {
+        const string secret = "manifest-parameter-secret-fragment";
+
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.Configuration["Parameters:operand"] = secret;
+            var operand = appBuilder.AddParameter("operand", secret: true);
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics()
+                // The deferred value sits where the container entrypoint reads an operand, which
+                // is the one position the storage guard's command-line rule leaves alone; the
+                // point of this test is what a diagnostic says, not which rule raises it.
+                .WithArgs(context =>
+                {
+                    context.Args.Add("--log-level");
+                    context.Args.Add(operand.Resource);
+                })
+                .WithContainerRuntimeArgs(context => context.Args.Add(operand.Resource));
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, cancellationToken) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, cancellationToken);
+                documentDB.Resource.ShellExecution = true;
+            });
+        });
+
+        Assert.Contains("ShellExecution", log, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, log, StringComparison.Ordinal);
+        Assert.DoesNotContain("manifest-parameter-secret", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ManifestDiagnosticsDoNotExposeACredentialReferenceExpression()
+    {
+        const string passwordValue = "ManifestCredentialSecret987";
+
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.Configuration["Parameters:manifest-password"] = passwordValue;
+            var password = appBuilder.AddParameter("manifest-password", secret: true);
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB", password: password)
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            documentDB
+                .WithArgs(context =>
+                {
+                    context.Args.Add("--log-level");
+                    context.Args.Add(documentDB.Resource.ConnectionStringExpression);
+                })
+                .WithContainerRuntimeArgs(context =>
+                    context.Args.Add(documentDB.Resource.ConnectionStringExpression));
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, cancellationToken) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, cancellationToken);
+                documentDB.Resource.ShellExecution = true;
+            });
+        });
+
+        Assert.Contains("ShellExecution", log, StringComparison.Ordinal);
+        Assert.DoesNotContain(passwordValue, log, StringComparison.Ordinal);
+        Assert.DoesNotContain("mongodb://", log, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("manifest-password", log, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -6963,6 +7341,12 @@ public class AddDocumentDBTests
             Evaluations++;
             return ValueTask.FromResult<string?>(value);
         }
+    }
+
+    private sealed class ThrowingValueProvider(string message) : IValueProvider
+    {
+        public ValueTask<string?> GetValueAsync(CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<string?>(new InvalidOperationException(message));
     }
 
     private static async Task<string[]> RunContainerRuntimeArgsAsync(DocumentDBServerResource resource)

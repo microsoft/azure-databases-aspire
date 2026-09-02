@@ -180,16 +180,28 @@ serialization, so enabling it after an early configuration read also fails clear
 
 ### `WithOpenTelemetryMetrics()` rejects a container runtime option
 
-`WithContainerRuntimeArgs(...)` is applied outside the resource model. Raw mounts
-(`--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`, `--volumes-from`, `--use-api-socket` and
-`--read-only`) can put DATA_PATH storage back under a scratch root after the wrapper has selected
-it, and raw `--entrypoint` can replace `/bin/bash`.
-They are rejected on every DocumentDB resource — see
+`WithContainerRuntimeArgs(...)` is applied outside the resource model. Raw Docker/Podman mounts
+can put DATA_PATH storage back under a scratch root after the wrapper has selected it, raw
+`--entrypoint` can replace `/bin/bash`, and Podman `--rootfs` or a bare positional operand can
+replace the model-selected image. `--read-only` and `--storage-opt` also change root filesystem
+behavior outside the model. Podman-specific `--secret`, `--image-volume`, `--chrootdirs`,
+`--init-path`, `--ipc`, `--read-only-tmpfs`, and `--systemd` are therefore covered alongside
+Docker's mount grammar. `--pod` and `--pod-id-file` are rejected too because joining a pod can
+replace the `/dev/shm` backing through its shared IPC namespace.
+
+Protected `--env`/`-e`, `--env-merge`, and `--unsetenv` values are rejected too. So are
+`--env-file`, `--env-host`, and `--unsetenv-all`, whose complete environment effects cannot be
+validated. Use `WithBindMount(...)`, `WithVolume(...)`, and `WithEnvironment(...)`; harmless known
+runtime options continue to work.
+
+Diagnostics may name a known option or package-owned environment variable, but never repeat an
+operand or value. Image names, rootfs paths, mount specs, environment values, URIs, credentials,
+deferred resolutions, and failed-resolution exception text are deliberately omitted.
+
+All of these are rejected on every DocumentDB resource — see
 [A container-runtime argument is rejected](#a-container-runtime-argument-is-rejected) — and this
-message is the wrapper's own wording for them. Protected `--env`/`-e` overrides
-are rejected too, as is `--env-file`, whose contents cannot be validated. Use `WithBindMount(...)`,
-`WithVolume(...)`, and `WithEnvironment(...)`; harmless runtime options continue to work. Error
-messages name the option class but never repeat its value.
+message is the wrapper's own wording for them, with two additions it owns: an option neither
+runtime documents, and a required value that is missing, are rejected rather than passed through.
 
 ### `WithOpenTelemetryMetrics()` throws about a later command-line callback
 
@@ -449,13 +461,33 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 **Solution:** call `UseTls(...)` and `AllowInsecureTls(...)` while the application model is being built. Setting a flag to the value it already has is not a change, and an environment callback that only sets environment variables is unaffected.
 
+The same failure is reported when the writer that made the change was installed late — from a `BeforePublishEvent` subscriber registered after `AddDocumentDB`, or from one a lifecycle hook registers. Those run after this package has put its checkpoints back, and a `WithManifestPublishingCallback(...)` they install would otherwise displace the checkpoint entirely, since the publisher reads the last callback and no other. The checkpoints are put back once more from the publishing pipeline, which runs after every subscriber and before the manifest is written, so a caller's own writer still writes the entry and a change it makes while writing is still caught.
+
 ### A container-runtime argument is rejected
 
 **Symptom:** starting the resource fails with an `InvalidOperationException` saying it `passes the container-runtime argument '--mount', which changes what the container mounts` — or the same for `-v`, `--volume`, `--volume-driver`, `--volumes-from`, `--tmpfs`, `--use-api-socket`, `--read-only`, for `'--env DATA_PATH'`/`'--env-file'`, which set an environment variable this package has already decided, for `'--entrypoint'`, or for an operand the runtime would read as the image. While `WithOpenTelemetryMetrics(...)` needs its compatibility wrapper the same readings are reported in the wrapper's own words; see [`WithOpenTelemetryMetrics()` rejects a container runtime option](#withopentelemetrymetrics-rejects-a-container-runtime-option).
 
 **Cause:** `WithContainerRuntimeArgs(...)` passes its arguments straight to the container runtime ahead of the image, so they are not part of the application model and none of the storage rules can see them. A read-only mount added that way starts a container DocumentDB cannot initialise, a shared one puts two clusters on one data directory, and a replaced entry point or `DATA_PATH` silently discards everything that was checked.
 
-**Solution:** declare storage in the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithVolume(...)`, `WithBindMount(...)` — set the data directory with `WithEnvironment("DATA_PATH", ...)`, supply credentials through the `userName`/`password` parameters of `AddDocumentDB(...)`, and choose the image with `WithImageTag(...)`. Ordinary container-runtime arguments are unaffected: the line is parsed with the runtime's own grammar, so `--label -v` passes a label and `--cap-add`, `--network`, `--memory`, `--pull`, `--platform`, `--dns`, `--ulimit`, `--sysctl` and `-it` reach the runtime untouched. A token whose value is only known later is rejected where the runtime reads an option name — it could resolve to `--mount` — but is fine as the operand of one, as in `WithContainerRuntimeArgs("--network", network)`.
+**Solution:** declare storage in the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithVolume(...)`, `WithBindMount(...)` — set the data directory with `WithEnvironment("DATA_PATH", ...)`, supply credentials through the `userName`/`password` parameters of `AddDocumentDB(...)`, and choose the image with `WithImageTag(...)`. Ordinary container-runtime arguments are unaffected: the line is parsed with the runtimes' own grammar, so `--label -v` passes a label and `--cap-add`, `--network`, `--memory`, `--pull`, `--platform`, `--dns`, `--ulimit`, `--sysctl` and `-it` reach the runtime untouched. A token whose value is only known later is rejected where the runtime reads an option name — it could resolve to `--mount` — but is fine as the operand of one, as in `WithContainerRuntimeArgs("--network", network)`.
+
+The failure never repeats anything from the argument. It names the option, and for an environment option the variable, and nothing else — no mount source, no variable value, and no positional token, because that is where a credential would be.
+
+### A Podman-only container-runtime argument is rejected
+
+**Symptom:** starting the resource fails with the message above naming `--secret`, `--image-volume` or `--init-path` (storage), `--env-host`, `--env-merge`, `--unsetenv` or `--unsetenv-all` (environment), or `--rootfs` (what the runtime runs).
+
+**Cause:** the app host drives Docker or Podman, and which one is behind a container-runtime argument is not something this package can know, so the arguments are read with the union of the two grammars. Podman's extra options reach exactly the places Docker's do: `--secret` mounts a file into the container or, with `type=env`, sets a variable; `--image-volume` decides whether the image's own `VOLUME` declarations become volumes, a tmpfs or nothing; `--init-path` bind-mounts a host binary; `--env-host` imports the entire host environment and `--unsetenv-all` clears every variable the image declares, either of which can move or erase `DATA_PATH`; `--env-merge` and `--unsetenv` rewrite or remove the one variable they name; and `--rootfs` makes the operand a root filesystem directory instead of an image.
+
+**Solution:** the same as above — configure storage, the data directory, the credentials and the image through the application model. `--env-merge` and `--unsetenv` are rejected only when they name a variable this package owns (`DATA_PATH`, `USERNAME`, `PASSWORD`), so `--unsetenv TZ` and `--env-merge TZ=${TZ}-utc` pass through, and an explicitly disabled value-less option (`--env-host=false`, `--read-only=false`) passes through as well. Ordinary Podman configuration — `--tz`, `--umask`, `--sdnotify`, `--uidmap`, `--gidmap`, `--authfile`, `--cert-dir`, `--seccomp-policy`, `--requires`, `--retry` — is unaffected.
+
+### A container-runtime argument that mounts without naming a mount is rejected
+
+**Symptom:** starting the resource fails with the message above naming `--storage-opt`, `--volume-driver`, `--chrootdirs`, `--ipc`, `--pod`, `--pod-id-file`, `--read-only-tmpfs`, `--systemd` or `--use-api-socket` as changing what the container mounts.
+
+**Cause:** each of these creates, selects or alters storage without spelling a mount, and does it where no `ContainerMountAnnotation` exists for any rule to read. `--storage-opt` sets the storage driver's options for this container, which is the size and backing of the root filesystem the data directory sits on when nothing is mounted over it; `--volume-driver` chooses which driver supplies every `-v` volume; `--chrootdirs` makes the runtime bind-mount its own managed files into further directories inside the container; `--ipc` decides whose `/dev/shm` the container gets (`host` mounts the host's, `container:`*id* another container's); `--pod` and `--pod-id-file` join a pod, whose infra container brings namespaces and the pod's own volumes with it, and `--pod new:`*name* creates one; `--read-only-tmpfs` is what mounts the read-write tmpfs over `/dev`, `/dev/shm`, `/run`, `/tmp` and `/var/tmp` in a `--read-only` container; `--systemd` puts the container in systemd mode, which mounts tmpfs on `/run`, `/run/lock`, `/tmp` and `/var/log/journal` and mounts the cgroup filesystem; and `--use-api-socket` bind-mounts the runtime's own API socket and a synthesized credential file into the container.
+
+**Solution:** declare storage in the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithVolume(...)`, `WithBindMount(...)`. The value-less ones are rejected only when they are on: `--read-only-tmpfs=false` and `--use-api-socket=false` pass through, and so does `--systemd=false`, which is the one off spelling Podman reads for a three-valued option (`--systemd=0` is a value Podman rejects, so it is read as the option being set). None of the three consumes the token behind it, so a bare `--systemd` cannot hide a following `--mount=type=bind,...` as its operand; the cost is that the split `--systemd false` is rejected too, and `--systemd=false` is the spelling to use.
 
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 

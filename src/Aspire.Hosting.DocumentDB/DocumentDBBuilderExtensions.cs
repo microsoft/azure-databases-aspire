@@ -168,9 +168,6 @@ public static class DocumentDBBuilderExtensions
     /// entrypoint's own <c>--option value</c> grammar has to have run first.
     /// </summary>
     private const int TerminalCommandLineOpenTelemetryWrapperRank = 100;
-    private const string ManifestPublishingPipelineStepName = "publish-manifest";
-    private const string TerminalManifestCheckpointPipelineStepName =
-        "documentdb-terminal-manifest-checkpoint";
 
     // default internal port is 10260.
     private const int DefaultContainerPort = 10260;
@@ -1103,8 +1100,102 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Marks a resource's manifest checkpoint so that one prerequisite can put every DocumentDB
+    /// checkpoint — a server's and a database's alike — back in the position the publisher reads,
+    /// without knowing what kind of resource carries it.
+    /// </summary>
+    /// <remarks>
+    /// The checkpoints are installed while the model is built and are moved back to last at each
+    /// lifecycle event, but an event is not the last word: a <see cref="BeforeStartEvent"/> or
+    /// <see cref="Publishing.BeforePublishEvent"/> subscriber registered after this package runs
+    /// after this package's own, and one that calls <c>WithManifestPublishingCallback(...)</c>
+    /// displaces the checkpoint for good — the publisher reads the last annotation and no other,
+    /// so the checkpoint simply never runs and the entry is written unjudged. Recording the
+    /// checkpoint on the resource is what lets <see cref="RestoreManifestCheckpoints"/> find every
+    /// one of them at a phase no subscriber can be registered after.
+    /// </remarks>
+    private sealed class DocumentDBManifestCheckpointAnnotation(ManifestPublishingCallbackAnnotation checkpoint)
+        : IResourceAnnotation
+    {
+        public ManifestPublishingCallbackAnnotation Checkpoint { get; } = checkpoint;
+    }
+
+    /// <summary>
+    /// Puts every DocumentDB manifest checkpoint in the model back in the position the publisher
+    /// reads.
+    /// </summary>
+    /// <remarks>
+    /// Servers and databases together, because both publish something this package is answerable
+    /// for and both can be displaced the same way. Exclusion and a caller's own writer are
+    /// preserved: <see cref="EstablishManifestCheckpoint"/> leaves a callback-less annotation —
+    /// Aspire's <c>ExcludeFromManifest()</c> — in place and takes the checkpoint out, and the
+    /// checkpoint hands the writing on to whatever it displaced.
+    /// </remarks>
+    private static void RestoreManifestCheckpoints(DistributedApplicationModel model)
+    {
+        foreach (var resource in model.Resources)
+        {
+            // Snapshot first: establishing a checkpoint adds to and removes from the same
+            // annotation collection this is reading.
+            foreach (var marked in resource.Annotations.OfType<DocumentDBManifestCheckpointAnnotation>().ToArray())
+            {
+                EstablishManifestCheckpoint(resource, marked.Checkpoint);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Registers the one prerequisite that runs after every event subscriber and before the
+    /// publisher serializes anything: a pipeline configuration callback that puts every DocumentDB
+    /// manifest checkpoint back in the position the publisher reads.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The events are not enough on their own. Aspire publishes
+    /// <see cref="Publishing.BeforePublishEvent"/> and only then executes the publishing pipeline,
+    /// and a subscriber registered after this package's — from an app host, or from a lifecycle
+    /// hook, both of which are ordinary — runs after this package has taken the last position
+    /// back. If that subscriber calls <c>WithManifestPublishingCallback(...)</c> on a resource, its
+    /// annotation is appended behind the checkpoint, the publisher reads the last annotation and no
+    /// other, and the checkpoint never runs at all: the entry is written from a callback that can
+    /// change the parent's TLS settings halfway through, with nothing left to notice.
+    /// </para>
+    /// <para>
+    /// A pipeline configuration callback closes that window. Aspire resolves the pipeline's steps
+    /// once, inside the publishing pipeline and before the first step runs — the manifest is
+    /// written by a step — and configuration callbacks are the first thing that resolution does.
+    /// That is strictly after <see cref="Publishing.BeforePublishEvent"/> has been published to
+    /// every subscriber and strictly before anything is serialized, which is the whole of what the
+    /// checkpoints need. The callback is registered once per application, from the hook that
+    /// already runs once per application, and it is idempotent: it only moves annotations that are
+    /// already there.
+    /// </para>
+    /// <para>
+    /// The per-event retakes are kept as well. They are what keeps the checkpoints in place for the
+    /// resource-level rules that read them earlier, and this prerequisite is the last word rather
+    /// than a replacement for them.
+    /// </para>
+    /// </remarks>
+    private static void RegisterManifestCheckpointPrerequisite(IServiceProvider services, DistributedApplicationModel model)
+    {
+#pragma warning disable ASPIREPIPELINES001 // The publishing pipeline is the only phase after every event subscriber and before serialization.
+        if (services.GetService<Pipelines.IDistributedApplicationPipeline>() is not { } pipeline)
+        {
+            return;
+        }
+
+        pipeline.AddPipelineConfiguration(_ =>
+        {
+            RestoreManifestCheckpoints(model);
+            return Task.CompletedTask;
+        });
+#pragma warning restore ASPIREPIPELINES001
+    }
+
+    /// <summary>
     /// Seals the image every DocumentDB resource in the model will run, at the last phase that is
-    /// guaranteed to precede the orchestrator's own reading of it.
+    /// guaranteed to precede the orchestrator's own reading of it, and registers the prerequisite
+    /// that puts the manifest checkpoints back after the last subscriber can have displaced them.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -1144,11 +1235,15 @@ public static class DocumentDBBuilderExtensions
     /// </para>
     /// </remarks>
 #pragma warning disable CS0618 // The lifecycle-hook phase has no eventing equivalent that runs after every BeforeStartEvent subscriber.
-    private sealed class DocumentDBImageSealLifecycleHook(DistributedApplicationExecutionContext executionContext)
+    private sealed class DocumentDBImageSealLifecycleHook(
+        DistributedApplicationExecutionContext executionContext,
+        IServiceProvider services)
         : IDistributedApplicationLifecycleHook
     {
         public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
         {
+            RegisterManifestCheckpointPrerequisite(services, appModel);
+
             if (!executionContext.IsRunMode)
             {
                 return Task.CompletedTask;
@@ -1378,10 +1473,13 @@ public static class DocumentDBBuilderExtensions
         });
 
         resource.Annotations.Add(checkpoint);
+        resource.Annotations.Add(new DocumentDBManifestCheckpointAnnotation(checkpoint));
 
         // ExcludeFromManifest() and WithManifestPublishingCallback() both append after this, and
         // the publisher reads only the last annotation, so the position is taken back at the two
-        // phases a publish raises before it serializes anything.
+        // phases a publish raises before it serializes anything — and, after every subscriber those
+        // phases can reach, by the publishing-pipeline prerequisite that
+        // RegisterManifestCheckpointPrerequisite installs.
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
         {
             EstablishManifestCheckpoint(resource, checkpoint);
@@ -3451,14 +3549,19 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// <para>
     /// <see cref="ContainerResourceBuilderExtensions.WithContainerRuntimeArgs{T}(IResourceBuilder{T}, string[])"/>
-    /// hands its arguments to <c>docker run</c> ahead of the image, so they are not part of the
-    /// model: <c>--mount</c>, <c>-v</c>, <c>--volume</c>, <c>--volumes-from</c>, <c>--tmpfs</c>,
-    /// <c>--volume-driver</c> and <c>--use-api-socket</c> add storage with no
-    /// <see cref="ContainerMountAnnotation"/> to read, <c>--read-only</c> makes the data directory
-    /// unwritable without one either, <c>--env</c> sets <c>DATA_PATH</c> without an
-    /// <see cref="EnvironmentCallbackAnnotation"/>, and <c>--entrypoint</c> replaces the entry
-    /// point without touching <see cref="ContainerResource.Entrypoint"/>. Every storage rule in
-    /// this package is written against the model, so each of those reaches past all of them: a
+    /// hands its arguments to <c>docker run</c> or <c>podman run</c> ahead of the image, so they
+    /// are not part of the model: <c>--mount</c>, <c>-v</c>, <c>--volume</c>,
+    /// <c>--volumes-from</c>, <c>--tmpfs</c>, <c>--volume-driver</c>, <c>--storage-opt</c>,
+    /// <c>--chrootdirs</c>, <c>--ipc</c>, <c>--pod</c>, <c>--pod-id-file</c>,
+    /// <c>--read-only-tmpfs</c>, <c>--systemd</c>, <c>--use-api-socket</c> and Podman's
+    /// <c>--secret</c>, <c>--image-volume</c> and <c>--init-path</c> add, select or alter storage
+    /// with no <see cref="ContainerMountAnnotation"/> to read, <c>--read-only</c> makes the data
+    /// directory unwritable without one either, <c>--env</c> sets <c>DATA_PATH</c> without an
+    /// <see cref="EnvironmentCallbackAnnotation"/> — as do Podman's <c>--env-host</c>,
+    /// <c>--env-merge</c>, <c>--unsetenv</c> and <c>--unsetenv-all</c> — <c>--entrypoint</c>
+    /// replaces the entry point without touching <see cref="ContainerResource.Entrypoint"/>, and
+    /// Podman's <c>--rootfs</c> replaces the image with a directory. Every storage rule in this
+    /// package is written against the model, so each of those reaches past all of them: a
     /// read-only mount added this way starts a container DocumentDB cannot initialise, and a shared
     /// one puts two clusters on one directory, with nothing reported either time.
     /// </para>
@@ -3483,12 +3586,18 @@ public static class DocumentDBBuilderExtensions
     /// spellings; see <see cref="DocumentDBContainerRuntimeArguments"/>. A search would refuse
     /// <c>--label -v</c>, which passes a label, and accept <c>--mount=type=bind,...</c>, which
     /// mounts. Ordinary arguments — <c>--cap-add</c>, <c>--network</c>, <c>--memory</c>,
-    /// <c>--pull</c>, <c>--platform</c>, <c>--dns</c> — are passed through untouched.
+    /// <c>--pull</c>, <c>--platform</c>, <c>--dns</c>, and the Podman-only <c>--tz</c>,
+    /// <c>--sdnotify</c>, <c>--uidmap</c> — are passed through untouched. While the wrapper owns
+    /// the command the reading is stricter in one respect only: an option neither runtime
+    /// documents is refused rather than read as a flag, because an option nothing here models
+    /// could consume the token after it and that token is the wrapper's own command.
     /// </para>
     /// <para>
-    /// No value ever reaches the message: an operand is where a mount source, a variable's value or
-    /// a password would be, so only the option's name — and, for an environment option, the name of
-    /// the variable it sets — is reported.
+    /// No value the caller wrote ever reaches a message, whether it is a literal, a parameter
+    /// resolved later, or the error a resolution raised. What is reported is the option spelling
+    /// the parser's own table holds and, for an environment option, the package-owned variable name
+    /// this package itself chose; an operand is never reported at all, and neither is a positional
+    /// token — a positional is where a caller would have written a connection string.
     /// </para>
     /// </remarks>
     private static async Task ValidateContainerRuntimeArgumentsAsync(
@@ -3500,6 +3609,10 @@ public static class DocumentDBBuilderExtensions
             ResolveOpenTelemetryGatewayConfigurationRequirement(resource) ==
                 GatewayConfigurationRequirement.Required;
 
+        // Two authorities, one reading. The storage guard owns DATA_PATH and the credentials and
+        // is answerable for every resource; the OpenTelemetry wrapper additionally owns the
+        // container's whole command while it is required. They differ in which variables they
+        // claim and in how strictly they read an option neither runtime documents — nothing else.
         var resolved = wrapperRequired
             ? await ResolveContainerRuntimeArgumentsAsync(resource, context, executionContext).ConfigureAwait(false)
             : null;
@@ -3507,14 +3620,17 @@ public static class DocumentDBBuilderExtensions
         var finding = DocumentDBContainerRuntimeArguments.Read(
             resolved ?? [.. context.Args],
             wrapperRequired
-                ? static name =>
-                    s_guardOwnedEnvironmentVariables.Contains(name) ||
-                    s_openTelemetryRuntimeProtectedEnvironmentVariables.Contains(name)
-                : s_guardOwnedEnvironmentVariables.Contains);
+                ? ResolveOpenTelemetryProtectedEnvironmentVariable
+                : ResolveGuardOwnedEnvironmentVariable,
+            wrapperRequired
+                ? DocumentDBRuntimeArgumentStrictness.Strict
+                : DocumentDBRuntimeArgumentStrictness.Grammar);
 
         if (finding.Verdict != DocumentDBRuntimeArgumentVerdict.Harmless)
         {
-            throw DescribeUnsafeRuntimeArgument(resource, finding, wrapperRequired);
+            throw wrapperRequired
+                ? DescribeUnsafeOpenTelemetryRuntimeArgument(resource, finding)
+                : DescribeUnsafeRuntimeArgument(resource, finding);
         }
 
         if (resolved is null)
@@ -3532,9 +3648,35 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// This package's own spelling of a guard-owned environment variable, or <see langword="null"/>
+    /// when the name is not one of them.
+    /// </summary>
+    /// <remarks>
+    /// The name that comes back is the one held in
+    /// <see cref="s_guardOwnedEnvironmentVariables"/>, never the caller's token, which is what lets
+    /// a diagnostic name the variable without naming anything that was read.
+    /// </remarks>
+    private static string? ResolveGuardOwnedEnvironmentVariable(string name) =>
+        s_guardOwnedEnvironmentVariables.TryGetValue(name, out var owned) ? owned : null;
+
+    /// <summary>
+    /// The same for the OpenTelemetry wrapper, which owns everything the storage guard owns and,
+    /// while it is required, the variables its own command depends on as well.
+    /// </summary>
+    private static string? ResolveOpenTelemetryProtectedEnvironmentVariable(string name) =>
+        ResolveGuardOwnedEnvironmentVariable(name)
+            ?? (s_openTelemetryRuntimeProtectedEnvironmentVariables.TryGetValue(name, out var owned) ? owned : null);
+
+    /// <summary>
     /// Resolves the completed runtime-argument list exactly once, so the parser reads the strings
     /// the container runtime will really be given.
     /// </summary>
+    /// <remarks>
+    /// A provider that fails is reported by kind alone. Its exception is not chained and its
+    /// message is not repeated: a resolution failure is raised from the caller's own parameter or
+    /// reference expression, and both the partial value and the message can carry the credential
+    /// the resolution was for.
+    /// </remarks>
     private static async Task<List<object>> ResolveContainerRuntimeArgumentsAsync(
         DocumentDBServerResource resource,
         ContainerRuntimeArgsCallbackContext context,
@@ -3549,15 +3691,28 @@ public static class DocumentDBBuilderExtensions
 
         foreach (var argument in context.Args.ToArray())
         {
-            var value = argument switch
+            string? value;
+
+            try
             {
-                string text => text,
-                IValueProvider provider => await provider
-                    .GetValueAsync(valueProviderContext, context.CancellationToken)
-                    .ConfigureAwait(false),
-                null => null,
-                _ => argument.ToString(),
-            };
+                value = argument switch
+                {
+                    string text => text,
+                    IValueProvider provider => await provider
+                        .GetValueAsync(valueProviderContext, context.CancellationToken)
+                        .ConfigureAwait(false),
+                    null => null,
+                    _ => argument.ToString(),
+                };
+            }
+            catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                throw UnresolvedContainerRuntimeArgument(resource);
+            }
 
             if (value is null)
             {
@@ -3571,83 +3726,183 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
-    /// Turns one reading of the argument list into the diagnostic that belongs to it: the wrapper's
-    /// own when the wrapper owns the command, and the storage rules' otherwise.
+    /// The wrapper's own reading of a finding. Every spelling interpolated below comes from the
+    /// parser's tables or from this package's own protected-variable set, so no caller token, no
+    /// operand and no resolved value can reach the message.
     /// </summary>
+    private static InvalidOperationException DescribeUnsafeOpenTelemetryRuntimeArgument(
+        DocumentDBServerResource resource,
+        DocumentDBRuntimeArgumentFinding finding) =>
+        finding.Verdict switch
+        {
+            DocumentDBRuntimeArgumentVerdict.Storage =>
+                UnsafeContainerRuntimeStorage(resource, finding.Option!),
+
+            DocumentDBRuntimeArgumentVerdict.Entrypoint =>
+                UnsafeContainerRuntimeEntrypoint(resource),
+
+            // '--rootfs' names a root filesystem instead of an image; the terminator and a bare
+            // operand are the positional the runtime reads as the image.
+            DocumentDBRuntimeArgumentVerdict.Image when
+                finding.Option is { } option &&
+                !string.Equals(option, "--", StringComparison.Ordinal) =>
+                UnsafeContainerRuntimeImageOrRootfs(resource, option),
+
+            DocumentDBRuntimeArgumentVerdict.Image =>
+                UnsafeContainerRuntimeOperand(resource),
+
+            DocumentDBRuntimeArgumentVerdict.Environment when finding.Variable is null =>
+                UnsafeContainerRuntimeEnvironment(
+                    resource,
+                    "the option imports or clears environment values outside the model"),
+
+            DocumentDBRuntimeArgumentVerdict.Environment =>
+                UnsafeContainerRuntimeEnvironment(
+                    resource,
+                    "it overrides protected container configuration"),
+
+            DocumentDBRuntimeArgumentVerdict.UnknownOption =>
+                UnsupportedContainerRuntimeOption(resource),
+
+            DocumentDBRuntimeArgumentVerdict.MissingValue =>
+                MissingContainerRuntimeOptionValue(resource, finding.Option!),
+
+            // Every argument was resolved to a string before the reading, so nothing is deferred;
+            // this is the defensive arm and is reported as the positional it would be.
+            _ => UnsafeContainerRuntimeOperand(resource),
+        };
+
+    private static InvalidOperationException UnsafeContainerRuntimeStorage(
+        DocumentDBServerResource resource,
+        string option) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds the storage-changing container runtime " +
+            $"option '{option}' while the WithOpenTelemetryMetrics() compatibility wrapper is " +
+            $"required. That option can add or replace mounts outside the resource model, so the " +
+            $"wrapper cannot prove that its temporary configuration stays off DATA_PATH storage. " +
+            $"Use the modeled mount and environment APIs where applicable, or remove the raw " +
+            $"runtime option.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeEntrypoint(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds the container runtime option " +
+            $"'--entrypoint' while the WithOpenTelemetryMetrics() compatibility wrapper is " +
+            $"required. That raw option can replace the verified '/bin/bash' entrypoint after the " +
+            $"resource model has been sealed. Configure no custom entrypoint, or drop " +
+            $"WithOpenTelemetryMetrics() and configure telemetry from your own entrypoint.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeImageOrRootfs(
+        DocumentDBServerResource resource,
+        string option) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds the container runtime option '{option}' " +
+            $"while the WithOpenTelemetryMetrics() compatibility wrapper is required. That option " +
+            $"can replace the image or root filesystem whose entrypoint and telemetry layout the " +
+            $"wrapper validated. Select the image through the resource model instead.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeOperand(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds a positional container runtime operand " +
+            $"while the WithOpenTelemetryMetrics() compatibility wrapper is required. A positional " +
+            $"operand in runtime options can replace the model-selected image or root filesystem. " +
+            $"The value is intentionally omitted because runtime operands may contain secrets. " +
+            $"Select the image through the resource model and pass container arguments with " +
+            $"WithArgs(...).");
+
+    private static InvalidOperationException UnsupportedContainerRuntimeOption(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds a container runtime option outside the " +
+            $"Docker and Podman run grammar understood by the WithOpenTelemetryMetrics() safety " +
+            $"check. The option and its value are intentionally omitted because a deferred runtime " +
+            $"argument may contain secrets. Use a supported modeled API or remove the option.");
+
+    private static InvalidOperationException MissingContainerRuntimeOptionValue(
+        DocumentDBServerResource resource,
+        string option) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' does not provide the required value for " +
+            $"container runtime option '{option}'. The value is intentionally omitted because " +
+            $"runtime option values may contain secrets.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeEnvironment(
+        DocumentDBServerResource resource,
+        string reason) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds a raw container runtime environment " +
+            $"override while the WithOpenTelemetryMetrics() compatibility wrapper is required, " +
+            $"but {reason}. The override could invalidate the telemetry command or its DATA_PATH " +
+            $"isolation after the resource model has been sealed. Use WithEnvironment(...) so " +
+            $"the value is part of the validated model.");
+
+    private static InvalidOperationException UnresolvedContainerRuntimeArgument(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' has a deferred container runtime argument that " +
+            $"could not be resolved for the WithOpenTelemetryMetrics() safety check. The argument, " +
+            $"its partial value and the resolution error are intentionally omitted because they " +
+            $"may contain credentials or other secrets.");
+
+    /// <summary>
+    /// The storage rules' own reading of a finding.
+    /// </summary>
+    /// <remarks>
+    /// No value the caller wrote ever reaches the message, whether it is a literal or a parameter
+    /// resolved later. What is reported is the option spelling the parser's own table holds and,
+    /// for an environment option, the package-owned variable name this package itself chose; an
+    /// operand is never reported at all, and neither is a positional token. An operand is where a
+    /// mount source, a variable's value or a password lives, and a positional token is where a
+    /// caller would have written a connection string — so the rule is that a diagnostic names what
+    /// this package already knew, and nothing it read.
+    /// </remarks>
     private static InvalidOperationException DescribeUnsafeRuntimeArgument(
         DocumentDBServerResource resource,
-        DocumentDBRuntimeArgumentFinding finding,
-        bool wrapperRequired)
+        DocumentDBRuntimeArgumentFinding finding)
     {
-        if (wrapperRequired)
-        {
-            switch (finding.Verdict)
-            {
-                case DocumentDBRuntimeArgumentVerdict.Storage:
-                    return new InvalidOperationException(
-                        $"DocumentDB resource '{resource.Name}' adds the storage-changing container " +
-                        $"runtime option '{finding.CanonicalOption}' while the " +
-                        $"WithOpenTelemetryMetrics() compatibility wrapper is required. Raw runtime " +
-                        $"mounts are applied outside the resource's mount model, so the wrapper " +
-                        $"cannot prove that its temporary configuration stays off DATA_PATH " +
-                        $"storage. Use WithBindMount(...) or WithVolume(...) so the mount can be " +
-                        $"validated, or remove the raw runtime option.");
-
-                case DocumentDBRuntimeArgumentVerdict.Entrypoint:
-                    return new InvalidOperationException(
-                        $"DocumentDB resource '{resource.Name}' adds the container runtime option " +
-                        $"'--entrypoint' while the WithOpenTelemetryMetrics() compatibility wrapper " +
-                        $"is required. That raw option can replace the verified '/bin/bash' " +
-                        $"entrypoint after the resource model has been sealed. Configure no custom " +
-                        $"entrypoint, or drop WithOpenTelemetryMetrics() and configure telemetry " +
-                        $"from your own entrypoint.");
-
-                case DocumentDBRuntimeArgumentVerdict.Environment:
-                    var reason =
-                        string.Equals(finding.CanonicalOption, "--env-file", StringComparison.Ordinal)
-                            ? "an environment file cannot be inspected"
-                        : finding.Variable is null
-                            ? "the option has no value"
-                            : "it overrides protected container configuration";
-
-                    return new InvalidOperationException(
-                        $"DocumentDB resource '{resource.Name}' adds a raw container runtime " +
-                        $"environment override while the WithOpenTelemetryMetrics() compatibility " +
-                        $"wrapper is required, but {reason}. The override could invalidate the " +
-                        $"telemetry command or its DATA_PATH isolation after the resource model has " +
-                        $"been sealed. Use WithEnvironment(...) so the value is part of the " +
-                        $"validated model.");
-            }
-        }
+        // Only ever a spelling from the parser's own tables, so the interpolation below cannot
+        // carry anything the caller wrote.
+        var option = finding.Option is { } named
+            ? finding.Variable is { } variable ? $"'{named} {variable}'" : $"'{named}'"
+            : null;
 
         var (what, recovery) = finding.Verdict switch
         {
             DocumentDBRuntimeArgumentVerdict.Storage =>
-                ($"'{finding.Option}', which changes what the container mounts",
+                ($"{option}, which changes what the container mounts",
                  "declare storage in the application model instead — WithDataVolume(), " +
                  "WithDataBindMount(...), WithVolume(...) or WithBindMount(...) — so the " +
                  "read-only, duplicate-mount and shared-data-directory rules can see it"),
 
             DocumentDBRuntimeArgumentVerdict.Environment =>
-                ($"'{finding.Option}', which sets an environment variable this package has already decided",
+                ($"{option}, which sets, imports or clears an environment variable this package " +
+                 $"has already decided",
                  $"set it through the model instead — WithDataVolume(), WithDataBindMount(...) or " +
                  $"WithEnvironment(\"{DataPathEnvVarName}\", ...) for the data directory, and the " +
                  $"userName/password parameters of AddDocumentDB(...) for the credentials"),
 
             DocumentDBRuntimeArgumentVerdict.Entrypoint =>
-                ($"'{finding.Option}', which replaces the image's entry point",
+                ($"{option}, which replaces the image's entry point",
                  "leave the entry point to the image, or set it on the resource " +
                  "(ContainerResource.Entrypoint) so the model describes what runs"),
 
             DocumentDBRuntimeArgumentVerdict.Image =>
-                ($"'{finding.Option}', which the runtime reads as the image and which would " +
-                 $"displace the one this run was sealed on",
+                (option is null
+                    ? "a positional operand, which the runtime reads as the image and which would " +
+                      "displace the one this run was sealed on"
+                    : $"{option}, which decides what the runtime runs and would displace the image " +
+                      $"this run was sealed on",
                  "choose the image with WithImage(...), WithImageTag(...), WithImageRegistry(...) " +
                  "or WithDockerfile(...) while the application model is being built"),
 
             _ =>
-                ("a value that is only known later, in a position where the runtime reads an " +
-                 "option name — so it could be any of --mount, -v, --tmpfs, --env or --entrypoint",
+                (option is null
+                    ? "a value that is only known later, in a position where the runtime reads an " +
+                      "option name or the image — so it could be any of --mount, -v, --secret, " +
+                      "--tmpfs, --env, --entrypoint or the image itself"
+                    : $"a value that is only known later as the operand of {option}, so the " +
+                      $"variable it names cannot be read without resolving it",
                  "pass option names as literal strings; a deferred value is fine as the operand of " +
                  "one, as in WithContainerRuntimeArgs(\"--network\", network)"),
         };
@@ -3660,7 +3915,8 @@ public static class DocumentDBBuilderExtensions
             $"cannot initialise, a shared one puts two clusters on one data directory, and a " +
             $"replaced entry point or data directory silently discards everything that was checked. " +
             $"The resource is failed instead of being started on storage that was never judged. " +
-            $"Recovery: {recovery}.");
+            $"No value from the argument is reported here, because that is where a credential would " +
+            $"be. Recovery: {recovery}.");
     }
 
     /// <summary>
@@ -4465,8 +4721,8 @@ public static class DocumentDBBuilderExtensions
         resource.Annotations.Add(guard);
         resource.Annotations.Add(guard.CommandLineCallback);
         resource.Annotations.Add(guard.RuntimeCheckpoint);
+        resource.Annotations.Add(new DocumentDBManifestCheckpointAnnotation(guard.ManifestCheckpoint));
         EstablishManifestCheckpoint(resource, guard.ManifestCheckpoint);
-        RegisterTerminalManifestCheckpoint(builder.ApplicationBuilder, resource, guard);
 
         void RetakeLastPosition() => RetakeTerminalGuardPositions(resource, guard);
 
@@ -4567,95 +4823,6 @@ public static class DocumentDBBuilderExtensions
         }
 
         resource.Annotations.Add(checkpoint);
-    }
-
-    /// <summary>
-    /// Registers one application-wide publishing step that restores every DocumentDB manifest
-    /// checkpoint after all model events and before Aspire's manifest writer runs.
-    /// </summary>
-    /// <remarks>
-    /// <c>WithManifestPublishingCallback(...)</c> replaces the last callback through a supported
-    /// public API. A subscriber registered after this package's
-    /// <see cref="Publishing.BeforePublishEvent"/> subscriber can therefore remove the checkpoint
-    /// after the event-level retake. Pipeline resolution happens only after every subscriber has
-    /// completed, so this prerequisite closes that window without competing with the checker: it
-    /// only restores callback ownership, and the single callback still performs both storage and
-    /// telemetry verification at serialization.
-    /// <see cref="ResourceBuilderExtensions.ExcludeFromManifest{T}"/> remains the deliberate
-    /// boundary; a resource that emits nothing has no published configuration to verify.
-    /// An application that rewrites Aspire's publishing pipeline itself owns serialization order
-    /// and is outside this resource-annotation contract; ordinary model events and manifest
-    /// callback replacement are covered.
-    /// </remarks>
-    private static void RegisterTerminalManifestCheckpoint(
-        IDistributedApplicationBuilder appBuilder,
-        DocumentDBServerResource resource,
-        TerminalGuardAnnotation guard)
-    {
-        if (!appBuilder.ExecutionContext.IsPublishMode)
-        {
-            return;
-        }
-
-        var registration = appBuilder.Services
-            .Where(service => service.ServiceType == typeof(TerminalManifestCheckpointPipelineRegistration))
-            .Select(service => service.ImplementationInstance)
-            .OfType<TerminalManifestCheckpointPipelineRegistration>()
-            .SingleOrDefault();
-
-        if (registration is not null)
-        {
-            registration.Guards[resource] = guard;
-            return;
-        }
-
-        registration = new TerminalManifestCheckpointPipelineRegistration();
-        registration.Guards.Add(resource, guard);
-        appBuilder.Services.AddSingleton(registration);
-
-#pragma warning disable ASPIREPIPELINES001
-        appBuilder.Pipeline.AddStep(
-            TerminalManifestCheckpointPipelineStepName,
-            _ =>
-            {
-                if (!registration.ManifestPublishing)
-                {
-                    return Task.CompletedTask;
-                }
-
-                foreach (var (registeredResource, registeredGuard) in registration.Guards)
-                {
-                    EstablishManifestCheckpoint(registeredResource, registeredGuard.ManifestCheckpoint);
-                }
-
-                return Task.CompletedTask;
-            });
-
-        appBuilder.Pipeline.AddPipelineConfiguration(context =>
-        {
-            var manifestStep = context.Steps.SingleOrDefault(step =>
-                string.Equals(step.Name, ManifestPublishingPipelineStepName, StringComparison.Ordinal));
-            registration.ManifestPublishing = manifestStep is not null;
-
-            if (manifestStep is not null &&
-                !manifestStep.DependsOnSteps.Contains(
-                    TerminalManifestCheckpointPipelineStepName,
-                    StringComparer.Ordinal))
-            {
-                manifestStep.DependsOn(TerminalManifestCheckpointPipelineStepName);
-            }
-
-            return Task.CompletedTask;
-        });
-#pragma warning restore ASPIREPIPELINES001
-    }
-
-    private sealed class TerminalManifestCheckpointPipelineRegistration
-    {
-        public Dictionary<DocumentDBServerResource, TerminalGuardAnnotation> Guards { get; } =
-            new(ReferenceEqualityComparer.Instance);
-
-        public bool ManifestPublishing { get; set; }
     }
 
     /// <summary>
