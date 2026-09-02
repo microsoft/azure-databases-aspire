@@ -36,6 +36,7 @@ public class Program
     public const string DataPathArgumentEnvironmentVariable = "DOCUMENTDB_FEATURE_DATA_PATH_ARGUMENT";
     public const string ScratchBindMountPathEnvironmentVariable = "DOCUMENTDB_FEATURE_SCRATCH_BINDMOUNT";
     public const string ShellExecutionEnvironmentVariable = "DOCUMENTDB_FEATURE_SHELL_EXECUTION";
+    public const string RuntimeOperandValueEnvironmentVariable = "DOCUMENTDB_FEATURE_RUNTIME_OPERAND";
 
     /// <summary>Custom credential parameters, two databases, one with a distinct database name.</summary>
     public const string CustomCredentialsMultiDbScenario = "custom-credentials-multi-db";
@@ -87,6 +88,12 @@ public class Program
 
     /// <summary>ShellExecution is enabled after the telemetry command has already been cached.</summary>
     public const string TelemetryShellExecutionMutationScenario = "telemetry-shell-execution-mutation";
+
+    /// <summary>A secret parameter is supplied as a bare container-runtime image operand.</summary>
+    public const string TelemetrySecretRuntimeOperandScenario = "telemetry-secret-runtime-operand";
+
+    /// <summary>A credential-bearing connection expression is supplied as a runtime image operand.</summary>
+    public const string TelemetryCredentialRuntimeOperandScenario = "telemetry-credential-runtime-operand";
 
     /// <summary>WithPostgresVersion(Pg15).</summary>
     public const string Pg15Scenario = "pg15";
@@ -158,7 +165,8 @@ public class Program
             DataVolumeScenario or
             DataBindMountScenario or
             InitDataVolumeScenario or
-            ReservedUserNameScenario;
+            ReservedUserNameScenario or
+            TelemetryCredentialRuntimeOperandScenario;
 
         IResourceBuilder<ParameterResource>? pinnedUser = null;
         IResourceBuilder<ParameterResource>? pinnedPassword = null;
@@ -167,7 +175,10 @@ public class Program
         {
             builder.Configuration["Parameters:docdbuser"] =
                 scenario == ReservedUserNameScenario ? ReservedUserName : CustomUserName;
-            builder.Configuration["Parameters:docdbpass"] = CustomPassword;
+            builder.Configuration["Parameters:docdbpass"] =
+                scenario == TelemetryCredentialRuntimeOperandScenario
+                    ? GetRequired(RuntimeOperandValueEnvironmentVariable)
+                    : CustomPassword;
             pinnedUser = builder.AddParameter("docdbuser", secret: false);
             pinnedPassword = builder.AddParameter("docdbpass", secret: true);
         }
@@ -327,6 +338,22 @@ public class Program
                         .BuildAsync(builder.ExecutionContext, NullLogger.Instance, cancellationToken);
                     documentDB.Resource.ShellExecution = true;
                 });
+                break;
+
+            case TelemetrySecretRuntimeOperandScenario:
+                builder.Configuration["Parameters:runtime-operand"] =
+                    GetRequired(RuntimeOperandValueEnvironmentVariable);
+                var runtimeOperand = builder.AddParameter("runtime-operand", secret: true);
+                documentDB
+                    .WithContainerRuntimeArgs(context => context.Args.Add(runtimeOperand.Resource))
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
+                break;
+
+            case TelemetryCredentialRuntimeOperandScenario:
+                documentDB
+                    .WithContainerRuntimeArgs(context =>
+                        context.Args.Add(documentDB.Resource.ConnectionStringExpression))
+                    .WithOpenTelemetryMetrics(endpoint: "http://localhost:4317", enabled: false);
                 break;
 
             case Pg15Scenario:

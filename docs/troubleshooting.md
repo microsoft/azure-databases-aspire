@@ -141,13 +141,22 @@ serialization, so enabling it after an early configuration read also fails clear
 
 ### `WithOpenTelemetryMetrics()` rejects a container runtime option
 
-`WithContainerRuntimeArgs(...)` is applied outside the resource model. Raw mounts
-(`--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`, and `--volumes-from`) can put DATA_PATH
-storage back under a scratch root after the wrapper has selected it, and raw `--entrypoint` can replace `/bin/bash`.
-They are rejected when the compatibility wrapper is required. Protected `--env`/`-e` overrides
-are rejected too, as is `--env-file`, whose contents cannot be validated. Use `WithBindMount(...)`,
-`WithVolume(...)`, and `WithEnvironment(...)`; harmless runtime options continue to work. Error
-messages name the option class but never repeat its value.
+`WithContainerRuntimeArgs(...)` is applied outside the resource model. Raw Docker/Podman mounts
+can put DATA_PATH storage back under a scratch root after the wrapper has selected it, raw
+`--entrypoint` can replace `/bin/bash`, and Podman `--rootfs` or a bare positional operand can
+replace the model-selected image. Podman-specific `--secret`, `--image-volume`, `--chrootdirs`,
+`--ipc`, `--read-only-tmpfs`, and `--systemd` are therefore covered alongside Docker's mount
+grammar. `--pod` and `--pod-id-file` are rejected too because joining a pod can replace the
+`/dev/shm` backing through its shared IPC namespace.
+
+Protected `--env`/`-e`, `--env-merge`, and `--unsetenv` values are rejected too. So are
+`--env-file`, `--env-host`, and `--unsetenv-all`, whose complete environment effects cannot be
+validated. Use `WithBindMount(...)`, `WithVolume(...)`, and `WithEnvironment(...)`; harmless known
+runtime options continue to work.
+
+Diagnostics may name a known option or package-owned environment variable, but never repeat an
+operand or value. Image names, rootfs paths, mount specs, environment values, URIs, credentials,
+deferred resolutions, and failed-resolution exception text are deliberately omitted.
 
 ### `WithOpenTelemetryMetrics()` throws about a later command-line callback
 

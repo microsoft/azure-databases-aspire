@@ -827,6 +827,83 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    public async Task TelemetryRuntimeDiagnosticDoesNotExposeASecretParameterOperand()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var secret = $"DcpOperandSecret{Guid.NewGuid():N}";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetrySecretRuntimeOperandScenario),
+            (AppHost.RuntimeOperandValueEnvironmentVariable, secret),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("positional container runtime operand", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("DcpOperandSecret", diagnostics, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TelemetryRuntimeDiagnosticDoesNotExposeACredentialReferenceOperand()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var password = $"DcpCredentialSecret{Guid.NewGuid():N}";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryCredentialRuntimeOperandScenario),
+            (AppHost.RuntimeOperandValueEnvironmentVariable, password),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("positional container runtime operand", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(password, diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("DcpCredentialSecret", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("mongodb://", diagnostics, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task TelemetryWrapperFailsClearlyWhenEveryBindCandidateIsUnprovable()
     {
         RequireDocker();

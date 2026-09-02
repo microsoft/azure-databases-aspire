@@ -367,15 +367,28 @@ instead of guessing:
 - Setting `ContainerResource.ShellExecution` to `true`. DCP applies that switch after argument
   validation and replaces the wrapper arguments with one joined `-c` string, producing a nested
   shell command that does not start DocumentDB. Leave it `null` or set it to `false`.
-- Passing raw `--entrypoint`, `--mount`, `--volume`/`-v`, `--volume-driver`, `--tmpfs`,
-  `--volumes-from`, or `--use-api-socket` options through `WithContainerRuntimeArgs(...)`. Those
-  options bypass the resource model after the wrapper has been generated. Use `WithBindMount(...)` or
-  `WithVolume(...)` for storage.
+- Passing raw `--entrypoint`, `--rootfs`, `--mount`, `--volume`/`-v`, `--volume-driver`,
+  `--tmpfs`, `--volumes-from`, or `--use-api-socket` options through
+  `WithContainerRuntimeArgs(...)`. Podman-specific storage changes are covered too, including
+  `--secret`, `--image-volume`, `--chrootdirs`, `--ipc`, `--read-only-tmpfs`, and `--systemd`.
+  Joining a pod through `--pod` or `--pod-id-file` is rejected because it can replace the
+  `/dev/shm` backing through a shared IPC namespace. Those options bypass the resource model after
+  the wrapper has been generated. Use
+  `WithBindMount(...)` or `WithVolume(...)` for storage.
 - Passing a raw runtime environment override for `DATA_PATH`, `CONFIG_DIR`, `GATEWAY_HOME`, or a
-  telemetry value the wrapper protects. `--env-file` is also rejected because its contents cannot
-  be inspected. Use `WithEnvironment(...)`, which is part of both the validated model and the
-  published manifest. Other Docker runtime options, including unrelated `--env` values, remain
-  available.
+  telemetry value the wrapper protects. `--env-file`, Podman's `--env-host`, and `--unsetenv-all`
+  are rejected because their complete effects cannot be inspected; protected `--env-merge` and
+  `--unsetenv` values are rejected by name. Use `WithEnvironment(...)`, which is part of both the
+  validated model and the published manifest.
+- Passing a bare positional runtime operand, including one after `--`. Docker and Podman interpret
+  that operand as the image or root filesystem before the model-selected image, so it is rejected
+  without reporting its value. Unknown runtime options fail generically as well. The parser covers
+  the documented Docker/Podman `run` option union, including exact required-value arity; unrelated
+  known options remain available.
+
+Runtime diagnostics report only known option names and package-owned environment variable names.
+They never include positional operands, image or rootfs values, mount specifications, environment
+values, URIs, credentials, deferred values, or the original exception from a failed resolution.
 
 **Argument ordering is fixed, and enforced.** `/bin/bash` reads its command from the first
 arguments, so the wrapper's `-c <script> --` prefix has to stay in front of everything else: one
@@ -415,7 +428,7 @@ resource will run — and comparing it at the two points the app host never cach
 
 | Mode | Checkpoint | Runs |
 | --- | --- | --- |
-| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read; it also resolves the final Docker runtime arguments once and rejects command, environment, or storage overrides that bypass the model |
+| Run | a container-runtime-arguments callback the package adds | on every container creation, after any `WithContainerRuntimeArgs(...)` callback of yours and before the container's command, arguments and environment are read; it also resolves the final Docker/Podman runtime arguments once and rejects image operands, command, environment, or storage overrides that bypass the model |
 | Publish | `BeforePublishEvent` | after every lifecycle hook and before the pipeline serializes anything |
 
 If anything changed, the resource is failed — a publish before the manifest is written, a run

@@ -215,8 +215,9 @@ public static class DocumentDBBuilderExtensions
         None,
         Storage,
         Entrypoint,
+        ImageOrRootfs,
         Environment,
-        EnvironmentFile,
+        EnvironmentImport,
     }
 
     private readonly record struct ContainerRuntimeOption(
@@ -226,23 +227,30 @@ public static class DocumentDBBuilderExtensions
         ContainerRuntimeOptionEffect Effect = ContainerRuntimeOptionEffect.None);
 
     /// <summary>
-    /// Docker <c>run</c> options that consume a following value, plus the short boolean options
-    /// needed to parse a compact token such as <c>-it</c>. Keeping the grammar in one typed table
-    /// is what prevents a value such as <c>--mount</c>, supplied to an unrelated option, from being
-    /// mistaken for another option.
+    /// The Docker and Podman <c>run</c> option union: every required-value option, plus value-less
+    /// options needed for compact short grammar or for a safety decision. Keeping arity and effect
+    /// in one typed table prevents a value such as <c>--mount</c>, supplied to an unrelated option,
+    /// from being mistaken for another option.
     /// </summary>
     private static readonly ContainerRuntimeOption[] s_containerRuntimeOptions =
     [
         new("add-host", null, ContainerRuntimeOptionValueArity.Required),
         new("annotation", null, ContainerRuntimeOptionValueArity.Required),
+        new("arch", null, ContainerRuntimeOptionValueArity.Required),
         new("attach", 'a', ContainerRuntimeOptionValueArity.Required),
+        new("authfile", null, ContainerRuntimeOptionValueArity.Required),
         new("blkio-weight", null, ContainerRuntimeOptionValueArity.Required),
         new("blkio-weight-device", null, ContainerRuntimeOptionValueArity.Required),
         new("cap-add", null, ContainerRuntimeOptionValueArity.Required),
         new("cap-drop", null, ContainerRuntimeOptionValueArity.Required),
+        new("cert-dir", null, ContainerRuntimeOptionValueArity.Required),
+        new("cgroup-conf", null, ContainerRuntimeOptionValueArity.Required),
         new("cgroup-parent", null, ContainerRuntimeOptionValueArity.Required),
         new("cgroupns", null, ContainerRuntimeOptionValueArity.Required),
+        new("cgroups", null, ContainerRuntimeOptionValueArity.Required),
+        new("chrootdirs", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("cidfile", null, ContainerRuntimeOptionValueArity.Required),
+        new("conmon-pidfile", null, ContainerRuntimeOptionValueArity.Required),
         new("cpu-period", null, ContainerRuntimeOptionValueArity.Required),
         new("cpu-quota", null, ContainerRuntimeOptionValueArity.Required),
         new("cpu-rt-period", null, ContainerRuntimeOptionValueArity.Required),
@@ -251,6 +259,8 @@ public static class DocumentDBBuilderExtensions
         new("cpus", null, ContainerRuntimeOptionValueArity.Required),
         new("cpuset-cpus", null, ContainerRuntimeOptionValueArity.Required),
         new("cpuset-mems", null, ContainerRuntimeOptionValueArity.Required),
+        new("creds", null, ContainerRuntimeOptionValueArity.Required),
+        new("decryption-key", null, ContainerRuntimeOptionValueArity.Required),
         new("detach", 'd', ContainerRuntimeOptionValueArity.None),
         new("detach-keys", null, ContainerRuntimeOptionValueArity.Required),
         new("device", null, ContainerRuntimeOptionValueArity.Required),
@@ -259,27 +269,48 @@ public static class DocumentDBBuilderExtensions
         new("device-read-iops", null, ContainerRuntimeOptionValueArity.Required),
         new("device-write-bps", null, ContainerRuntimeOptionValueArity.Required),
         new("device-write-iops", null, ContainerRuntimeOptionValueArity.Required),
+        new("disable-content-trust", null, ContainerRuntimeOptionValueArity.None),
         new("dns", null, ContainerRuntimeOptionValueArity.Required),
         new("dns-option", null, ContainerRuntimeOptionValueArity.Required),
         new("dns-search", null, ContainerRuntimeOptionValueArity.Required),
         new("domainname", null, ContainerRuntimeOptionValueArity.Required),
         new("entrypoint", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Entrypoint),
         new("env", 'e', ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Environment),
-        new("env-file", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.EnvironmentFile),
+        new("env-file", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.EnvironmentImport),
+        new("env-host", null, ContainerRuntimeOptionValueArity.None, ContainerRuntimeOptionEffect.EnvironmentImport),
+        new("env-merge", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Environment),
         new("expose", null, ContainerRuntimeOptionValueArity.Required),
+        new("gidmap", null, ContainerRuntimeOptionValueArity.Required),
         new("gpus", null, ContainerRuntimeOptionValueArity.Required),
         new("group-add", null, ContainerRuntimeOptionValueArity.Required),
+        new("group-entry", null, ContainerRuntimeOptionValueArity.Required),
         new("health-cmd", null, ContainerRuntimeOptionValueArity.Required),
         new("health-interval", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-log-destination", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-max-log-count", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-max-log-size", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-on-failure", null, ContainerRuntimeOptionValueArity.Required),
         new("health-retries", null, ContainerRuntimeOptionValueArity.Required),
         new("health-start-interval", null, ContainerRuntimeOptionValueArity.Required),
         new("health-start-period", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-startup-cmd", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-startup-interval", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-startup-retries", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-startup-success", null, ContainerRuntimeOptionValueArity.Required),
+        new("health-startup-timeout", null, ContainerRuntimeOptionValueArity.Required),
         new("health-timeout", null, ContainerRuntimeOptionValueArity.Required),
+        new("help", null, ContainerRuntimeOptionValueArity.None),
         new("hostname", 'h', ContainerRuntimeOptionValueArity.Required),
+        new("hosts-file", null, ContainerRuntimeOptionValueArity.Required),
+        new("hostuser", null, ContainerRuntimeOptionValueArity.Required),
+        new("http-proxy", null, ContainerRuntimeOptionValueArity.None),
+        new("image-volume", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("init", null, ContainerRuntimeOptionValueArity.None),
+        new("init-path", null, ContainerRuntimeOptionValueArity.Required),
         new("interactive", 'i', ContainerRuntimeOptionValueArity.None),
         new("ip", null, ContainerRuntimeOptionValueArity.Required),
         new("ip6", null, ContainerRuntimeOptionValueArity.Required),
-        new("ipc", null, ContainerRuntimeOptionValueArity.Required),
+        new("ipc", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("isolation", null, ContainerRuntimeOptionValueArity.Required),
         new("label", 'l', ContainerRuntimeOptionValueArity.Required),
         new("label-file", null, ContainerRuntimeOptionValueArity.Required),
@@ -294,31 +325,72 @@ public static class DocumentDBBuilderExtensions
         new("memory-swappiness", null, ContainerRuntimeOptionValueArity.Required),
         new("mount", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("name", null, ContainerRuntimeOptionValueArity.Required),
+        new("net", null, ContainerRuntimeOptionValueArity.Required),
         new("network", null, ContainerRuntimeOptionValueArity.Required),
         new("network-alias", null, ContainerRuntimeOptionValueArity.Required),
+        new("no-healthcheck", null, ContainerRuntimeOptionValueArity.None),
+        new("no-hostname", null, ContainerRuntimeOptionValueArity.None),
+        new("no-hosts", null, ContainerRuntimeOptionValueArity.None),
+        new("oom-kill-disable", null, ContainerRuntimeOptionValueArity.None),
         new("oom-score-adj", null, ContainerRuntimeOptionValueArity.Required),
+        new("os", null, ContainerRuntimeOptionValueArity.Required),
+        new("passwd", null, ContainerRuntimeOptionValueArity.None),
+        new("passwd-entry", null, ContainerRuntimeOptionValueArity.Required),
+        new("personality", null, ContainerRuntimeOptionValueArity.Required),
         new("pid", null, ContainerRuntimeOptionValueArity.Required),
+        new("pidfile", null, ContainerRuntimeOptionValueArity.Required),
         new("pids-limit", null, ContainerRuntimeOptionValueArity.Required),
         new("platform", null, ContainerRuntimeOptionValueArity.Required),
+        new("pod", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("pod-id-file", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
+        new("preserve-fd", null, ContainerRuntimeOptionValueArity.Required),
+        new("preserve-fds", null, ContainerRuntimeOptionValueArity.Required),
+        new("privileged", null, ContainerRuntimeOptionValueArity.None),
         new("publish", 'p', ContainerRuntimeOptionValueArity.Required),
         new("publish-all", 'P', ContainerRuntimeOptionValueArity.None),
         new("pull", null, ContainerRuntimeOptionValueArity.Required),
         new("quiet", 'q', ContainerRuntimeOptionValueArity.None),
+        new("rdt-class", null, ContainerRuntimeOptionValueArity.Required),
+        new("read-only", null, ContainerRuntimeOptionValueArity.None),
+        new("read-only-tmpfs", null, ContainerRuntimeOptionValueArity.None, ContainerRuntimeOptionEffect.Storage),
+        new("replace", null, ContainerRuntimeOptionValueArity.None),
+        new("requires", null, ContainerRuntimeOptionValueArity.Required),
         new("restart", null, ContainerRuntimeOptionValueArity.Required),
+        new("retry", null, ContainerRuntimeOptionValueArity.Required),
+        new("retry-delay", null, ContainerRuntimeOptionValueArity.Required),
+        new("rm", null, ContainerRuntimeOptionValueArity.None),
+        new("rmi", null, ContainerRuntimeOptionValueArity.None),
+        new("rootfs", null, ContainerRuntimeOptionValueArity.None, ContainerRuntimeOptionEffect.ImageOrRootfs),
         new("runtime", null, ContainerRuntimeOptionValueArity.Required),
+        new("sdnotify", null, ContainerRuntimeOptionValueArity.Required),
+        new("seccomp-policy", null, ContainerRuntimeOptionValueArity.Required),
+        new("secret", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("security-opt", null, ContainerRuntimeOptionValueArity.Required),
         new("shm-size", null, ContainerRuntimeOptionValueArity.Required),
+        new("shm-size-systemd", null, ContainerRuntimeOptionValueArity.Required),
+        new("sig-proxy", null, ContainerRuntimeOptionValueArity.None),
         new("stop-signal", null, ContainerRuntimeOptionValueArity.Required),
         new("stop-timeout", null, ContainerRuntimeOptionValueArity.Required),
         new("storage-opt", null, ContainerRuntimeOptionValueArity.Required),
+        new("subgidname", null, ContainerRuntimeOptionValueArity.Required),
+        new("subuidname", null, ContainerRuntimeOptionValueArity.Required),
         new("sysctl", null, ContainerRuntimeOptionValueArity.Required),
+        new("systemd", null, ContainerRuntimeOptionValueArity.None, ContainerRuntimeOptionEffect.Storage),
+        new("timeout", null, ContainerRuntimeOptionValueArity.Required),
+        new("tls-verify", null, ContainerRuntimeOptionValueArity.None),
         new("tmpfs", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("tty", 't', ContainerRuntimeOptionValueArity.None),
+        new("tz", null, ContainerRuntimeOptionValueArity.Required),
+        new("uidmap", null, ContainerRuntimeOptionValueArity.Required),
         new("ulimit", null, ContainerRuntimeOptionValueArity.Required),
+        new("umask", null, ContainerRuntimeOptionValueArity.Required),
+        new("unsetenv", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Environment),
+        new("unsetenv-all", null, ContainerRuntimeOptionValueArity.None, ContainerRuntimeOptionEffect.EnvironmentImport),
         new("use-api-socket", null, ContainerRuntimeOptionValueArity.None, ContainerRuntimeOptionEffect.Storage),
         new("user", 'u', ContainerRuntimeOptionValueArity.Required),
         new("userns", null, ContainerRuntimeOptionValueArity.Required),
         new("uts", null, ContainerRuntimeOptionValueArity.Required),
+        new("variant", null, ContainerRuntimeOptionValueArity.Required),
         new("volume", 'v', ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("volume-driver", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
         new("volumes-from", null, ContainerRuntimeOptionValueArity.Required, ContainerRuntimeOptionEffect.Storage),
@@ -367,7 +439,7 @@ public static class DocumentDBBuilderExtensions
 
             if (_endOfOptions)
             {
-                return;
+                throw UnsafeContainerRuntimeOperand(resource);
             }
 
             if (string.Equals(argument, "--", StringComparison.Ordinal))
@@ -385,14 +457,17 @@ public static class DocumentDBBuilderExtensions
             if (argument.Length > 1 && argument[0] == '-' && argument[1] != '-')
             {
                 ParseShortOptions(argument);
+                return;
             }
+
+            throw UnsafeContainerRuntimeOperand(resource);
         }
 
         public void Complete()
         {
-            if (_pendingOption is { Effect: ContainerRuntimeOptionEffect.Environment })
+            if (_pendingOption is { } pending)
             {
-                throw UnsafeContainerRuntimeEnvironment(resource, "the option has no value");
+                throw MissingContainerRuntimeOptionValue(resource, pending);
             }
         }
 
@@ -403,7 +478,7 @@ public static class DocumentDBBuilderExtensions
 
             if (!s_longContainerRuntimeOptions.TryGetValue(name, out var option))
             {
-                return;
+                throw UnsupportedContainerRuntimeOption(resource);
             }
 
             var hasAttachedValue = equals >= 0;
@@ -417,11 +492,11 @@ public static class DocumentDBBuilderExtensions
             {
                 if (!s_shortContainerRuntimeOptions.TryGetValue(argument[index], out var option))
                 {
-                    return;
+                    throw UnsupportedContainerRuntimeOption(resource);
                 }
 
-                if (option.Effect is ContainerRuntimeOptionEffect.Storage or
-                    ContainerRuntimeOptionEffect.Entrypoint)
+                if (option.Effect != ContainerRuntimeOptionEffect.None &&
+                    option.Effect != ContainerRuntimeOptionEffect.Environment)
                 {
                     Reject(option);
                 }
@@ -446,9 +521,8 @@ public static class DocumentDBBuilderExtensions
 
         private void Apply(ContainerRuntimeOption option, bool hasAttachedValue, string? attachedValue)
         {
-            if (option.Effect is ContainerRuntimeOptionEffect.Storage or
-                ContainerRuntimeOptionEffect.Entrypoint or
-                ContainerRuntimeOptionEffect.EnvironmentFile)
+            if (option.Effect != ContainerRuntimeOptionEffect.None &&
+                option.Effect != ContainerRuntimeOptionEffect.Environment)
             {
                 Reject(option);
             }
@@ -492,8 +566,9 @@ public static class DocumentDBBuilderExtensions
             {
                 ContainerRuntimeOptionEffect.Storage => UnsafeContainerRuntimeStorage(resource, displayName),
                 ContainerRuntimeOptionEffect.Entrypoint => UnsafeContainerRuntimeEntrypoint(resource),
-                ContainerRuntimeOptionEffect.EnvironmentFile =>
-                    UnsafeContainerRuntimeEnvironment(resource, "an environment file cannot be inspected"),
+                ContainerRuntimeOptionEffect.ImageOrRootfs => UnsafeContainerRuntimeImageOrRootfs(resource, displayName),
+                ContainerRuntimeOptionEffect.EnvironmentImport =>
+                    UnsafeContainerRuntimeEnvironment(resource, "the option imports or clears environment values outside the model"),
                 _ => throw new InvalidOperationException(),
             };
         }
@@ -505,10 +580,10 @@ public static class DocumentDBBuilderExtensions
         new(
             $"DocumentDB resource '{resource.Name}' adds the storage-changing container runtime " +
             $"option '{option}' while the WithOpenTelemetryMetrics() compatibility wrapper is " +
-            $"required. Raw runtime mounts are applied outside the resource's mount model, so the " +
+            $"required. That option can add or replace mounts outside the resource model, so the " +
             $"wrapper cannot prove that its temporary configuration stays off DATA_PATH storage. " +
-            $"Use WithBindMount(...) or WithVolume(...) so the mount can be validated, or remove " +
-            $"the raw runtime option.");
+            $"Use the modeled mount and environment APIs where applicable, or remove the raw " +
+            $"runtime option.");
 
     private static InvalidOperationException UnsafeContainerRuntimeEntrypoint(
         DocumentDBServerResource resource) =>
@@ -518,6 +593,41 @@ public static class DocumentDBBuilderExtensions
             $"required. That raw option can replace the verified '/bin/bash' entrypoint after the " +
             $"resource model has been sealed. Configure no custom entrypoint, or drop " +
             $"WithOpenTelemetryMetrics() and configure telemetry from your own entrypoint.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeImageOrRootfs(
+        DocumentDBServerResource resource,
+        string option) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds the container runtime option '{option}' " +
+            $"while the WithOpenTelemetryMetrics() compatibility wrapper is required. That option " +
+            $"can replace the image or root filesystem whose entrypoint and telemetry layout the " +
+            $"wrapper validated. Select the image through the resource model instead.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeOperand(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds a positional container runtime operand " +
+            $"while the WithOpenTelemetryMetrics() compatibility wrapper is required. A positional " +
+            $"operand in runtime options can replace the model-selected image or root filesystem. " +
+            $"The value is intentionally omitted because runtime operands may contain secrets. " +
+            $"Select the image through the resource model and pass container arguments with " +
+            $"WithArgs(...).");
+
+    private static InvalidOperationException UnsupportedContainerRuntimeOption(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds a container runtime option outside the " +
+            $"Docker and Podman run grammar understood by the WithOpenTelemetryMetrics() safety " +
+            $"check. The option and its value are intentionally omitted because a deferred runtime " +
+            $"argument may contain secrets. Use a supported modeled API or remove the option.");
+
+    private static InvalidOperationException MissingContainerRuntimeOptionValue(
+        DocumentDBServerResource resource,
+        ContainerRuntimeOption option) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' does not provide the required value for " +
+            $"container runtime option '--{option.LongName}'. The value is intentionally omitted " +
+            $"because runtime option values may contain secrets.");
 
     private static InvalidOperationException UnsafeContainerRuntimeEnvironment(
         DocumentDBServerResource resource,
@@ -529,10 +639,18 @@ public static class DocumentDBBuilderExtensions
             $"isolation after the resource model has been sealed. Use WithEnvironment(...) so " +
             $"the value is part of the validated model.");
 
+    private static InvalidOperationException UnresolvedContainerRuntimeArgument(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' has a deferred container runtime argument that " +
+            $"could not be resolved for the WithOpenTelemetryMetrics() safety check. The argument, " +
+            $"its partial value and the resolution error are intentionally omitted because they " +
+            $"may contain credentials or other secrets.");
+
     /// <summary>
-    /// Resolves the completed runtime-argument list once, validates the exact strings Docker will
-    /// receive, and replaces deferred values with those strings so Aspire does not resolve them a
-    /// second time.
+    /// Resolves the completed runtime-argument list once, validates the exact strings Docker or
+    /// Podman will receive, and replaces deferred values with those strings so Aspire does not
+    /// resolve them a second time.
     /// </summary>
     private static async Task ValidateOpenTelemetryContainerRuntimeArgumentsAsync(
         DocumentDBServerResource resource,
@@ -555,15 +673,28 @@ public static class DocumentDBBuilderExtensions
 
         foreach (var argument in context.Args.ToArray())
         {
-            var resolved = argument switch
+            string? resolved;
+
+            try
             {
-                string value => value,
-                IValueProvider provider => await provider
-                    .GetValueAsync(valueProviderContext, context.CancellationToken)
-                    .ConfigureAwait(false),
-                null => null,
-                _ => argument.ToString(),
-            };
+                resolved = argument switch
+                {
+                    string value => value,
+                    IValueProvider provider => await provider
+                        .GetValueAsync(valueProviderContext, context.CancellationToken)
+                        .ConfigureAwait(false),
+                    null => null,
+                    _ => argument.ToString(),
+                };
+            }
+            catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                throw UnresolvedContainerRuntimeArgument(resource);
+            }
 
             if (resolved is null)
             {
@@ -1976,11 +2107,12 @@ public static class DocumentDBBuilderExtensions
     /// throws, because the digest makes the version opaque and both applying and skipping the
     /// wrapper on a guess are silently wrong. Supplying your own container entrypoint or enabling
     /// <see cref="ContainerResource.ShellExecution"/> on the same resource also throws, because
-    /// either can replace the verified command. Raw runtime mounts, entrypoint overrides and
-    /// protected environment overrides are rejected for the same reason; express them through the
-    /// resource model instead. The wrapper needs <c>bash</c> and <c>jq</c>, which the official
-    /// image provides; it fails the container start with a diagnostic rather than starting without
-    /// the override if either is missing.
+    /// either can replace the verified command. Raw Docker/Podman image operands, rootfs,
+    /// storage, entrypoint and protected environment overrides are rejected for the same reason;
+    /// express them through the resource model instead. Runtime diagnostics never repeat an
+    /// operand or value. The wrapper needs <c>bash</c> and <c>jq</c>, which the official image
+    /// provides; it fails the container start with a diagnostic rather than starting without the
+    /// override if either is missing.
     /// </para>
     /// <para>
     /// Merge semantics across multiple calls on the same builder:
@@ -2050,8 +2182,9 @@ public static class DocumentDBBuilderExtensions
     /// </exception>
     /// <exception cref="InvalidOperationException">
     /// The affected official image cannot be classified safely, or a custom entrypoint,
-    /// <see cref="ContainerResource.ShellExecution"/>, raw runtime mount, or protected runtime
-    /// environment override would replace part of the compatibility command.
+    /// <see cref="ContainerResource.ShellExecution"/>, or raw Docker/Podman image, rootfs, storage,
+    /// entrypoint, or protected environment override would replace part of the compatibility
+    /// command.
     /// </exception>
     /// <example>
     /// <code>
@@ -2318,8 +2451,8 @@ public static class DocumentDBBuilderExtensions
     /// every container creation without caching, and it does so after the last opportunity a
     /// caller has to change anything — a caller's own runtime-arguments callback — and before the
     /// container's command, arguments and environment are read. It also resolves the completed
-    /// Docker runtime argument list once and rejects raw command, environment and mount overrides
-    /// that bypass the resource model.</description></item>
+    /// Docker/Podman runtime argument list once and rejects raw image operands, command,
+    /// environment and mount overrides that bypass the resource model.</description></item>
     /// <item><description>Publish: the manifest callback itself. A publishing-pipeline prerequisite
     /// re-establishes it after every <see cref="Publishing.BeforePublishEvent"/> subscriber has
     /// completed, so a normal model event cannot replace or shadow the checkpoint; the callback
