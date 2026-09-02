@@ -152,8 +152,11 @@ replace the `/dev/shm` backing through its shared IPC namespace.
 
 Protected `--env`/`-e`, `--env-merge`, and `--unsetenv` values are rejected too. So are
 `--env-file`, `--env-host`, and `--unsetenv-all`, whose complete environment effects cannot be
-validated. Use `WithBindMount(...)`, `WithVolume(...)`, and `WithEnvironment(...)`; harmless known
-runtime options continue to work.
+validated. Podman's value-less `--env`/`-e` names ending in `*` import every matching host
+variable, so a prefix that can match protected telemetry configuration is rejected without being
+reported. Unrelated prefixes and wildcard-looking assigned forms containing `=` remain valid. Use
+`WithBindMount(...)`, `WithVolume(...)`, and `WithEnvironment(...)`; harmless known runtime options
+continue to work.
 
 Diagnostics may name a known option or package-owned environment variable, but never repeat an
 operand or value. Image names, rootfs paths, mount specs, environment values, URIs, credentials,

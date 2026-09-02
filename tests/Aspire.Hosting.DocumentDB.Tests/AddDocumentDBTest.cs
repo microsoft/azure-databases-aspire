@@ -2804,6 +2804,104 @@ public class AddDocumentDBTests
         Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
     }
 
+    public static TheoryData<string[], string, string> ProtectedPodmanEnvironmentGlobCases => new()
+    {
+        { ["--env", "DATA_*"], "DATA_*", "DATA_" },
+        { ["--env=OTEL_*"], "OTEL_*", "OTEL_" },
+        { ["-e", "*"], "*", "*" },
+        { ["-eDATA_*"], "DATA_*", "DATA_" },
+        { ["-e=OTEL_*"], "OTEL_*", "OTEL_" },
+        { ["--env=CONFIG_*"], "CONFIG_*", "CONFIG_" },
+        { ["-eGATEWAY_*"], "GATEWAY_*", "GATEWAY_" },
+        { ["--env", "ENABLE_*"], "ENABLE_*", "ENABLE_" },
+        { ["-eOTEL_SERVICE_NAME*"], "OTEL_SERVICE_NAME*", "OTEL_SERVICE_NAME" },
+    };
+
+    [Theory]
+    [MemberData(nameof(ProtectedPodmanEnvironmentGlobCases))]
+    public async Task RuntimeArgumentParserRejectsProtectedPodmanEnvironmentGlobs(
+        string[] runtimeArguments,
+        string wildcard,
+        string prefix)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("value-less '--env'/'-e' wildcard", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(wildcard, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(prefix, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("DATA_PATH", exception.Message, StringComparison.Ordinal);
+    }
+
+    public static TheoryData<string[]> HarmlessPodmanEnvironmentGlobCases => new()
+    {
+        { ["--env", "APP_*"] },
+        { ["--env=APP_*"] },
+        { ["-e", "APP_*"] },
+        { ["-eAPP_*"] },
+        { ["-e=APP_*"] },
+        { ["--env", "DATABASE_*"] },
+        { ["--env", "DATA_*=literal"] },
+        { ["--env=OTEL_*=literal"] },
+        { ["-eCONFIG_*=literal"] },
+        { ["-e=GATEWAY_*=literal"] },
+    };
+
+    [Theory]
+    [MemberData(nameof(HarmlessPodmanEnvironmentGlobCases))]
+    public async Task RuntimeArgumentParserPreservesUnrelatedAndAssignedEnvironmentGlobs(
+        string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            runtimeArguments,
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredProtectedEnvironmentGlob()
+    {
+        var wildcard = new CountingValueProvider("OTEL_*");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--env");
+                context.Args.Add(wildcard);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, wildcard.Evaluations);
+        Assert.Contains("value-less '--env'/'-e' wildcard", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("OTEL_", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("*", exception.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData("--rootfs", "/runtime-secret/rootfs")]
     [InlineData("--rootfs=/runtime-secret/rootfs")]

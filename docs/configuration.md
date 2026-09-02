@@ -378,8 +378,11 @@ instead of guessing:
 - Passing a raw runtime environment override for `DATA_PATH`, `CONFIG_DIR`, `GATEWAY_HOME`, or a
   telemetry value the wrapper protects. `--env-file`, Podman's `--env-host`, and `--unsetenv-all`
   are rejected because their complete effects cannot be inspected; protected `--env-merge` and
-  `--unsetenv` values are rejected by name. Use `WithEnvironment(...)`, which is part of both the
-  validated model and the published manifest.
+  `--unsetenv` values are rejected by name. Podman's value-less `--env`/`-e` wildcard form is
+  checked as a host import: `DATA_*`, `OTEL_*`, `*`, and any other prefix that can match a
+  protected variable are rejected. Unrelated prefixes and assigned forms containing `=` remain
+  ordinary explicit values. Use `WithEnvironment(...)`, which is part of both the validated model
+  and the published manifest.
 - Passing a bare positional runtime operand, including one after `--`. Docker and Podman interpret
   that operand as the image or root filesystem before the model-selected image, so it is rejected
   without reporting its value. Unknown runtime options fail generically as well. The parser covers

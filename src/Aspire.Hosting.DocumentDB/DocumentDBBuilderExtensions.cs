@@ -550,6 +550,16 @@ public static class DocumentDBBuilderExtensions
             }
 
             var equals = value.IndexOf('=');
+            if (equals < 0 && value.EndsWith('*'))
+            {
+                var prefix = value[..^1];
+                if (s_openTelemetryRuntimeProtectedEnvironmentVariables.Any(
+                    name => name.StartsWith(prefix, StringComparison.Ordinal)))
+                {
+                    throw UnsafeContainerRuntimeEnvironmentGlob(resource);
+                }
+            }
+
             var name = equals < 0 ? value : value[..equals];
 
             if (s_openTelemetryRuntimeProtectedEnvironmentVariables.Contains(name))
@@ -638,6 +648,15 @@ public static class DocumentDBBuilderExtensions
             $"but {reason}. The override could invalidate the telemetry command or its DATA_PATH " +
             $"isolation after the resource model has been sealed. Use WithEnvironment(...) so " +
             $"the value is part of the validated model.");
+
+    private static InvalidOperationException UnsafeContainerRuntimeEnvironmentGlob(
+        DocumentDBServerResource resource) =>
+        new(
+            $"DocumentDB resource '{resource.Name}' adds a value-less '--env'/'-e' wildcard that " +
+            $"can import protected host environment values while the WithOpenTelemetryMetrics() " +
+            $"compatibility wrapper is required. The wildcard and its prefix are intentionally " +
+            $"omitted. Use explicit WithEnvironment(...) entries so each value is part of the " +
+            $"validated model.");
 
     private static InvalidOperationException UnresolvedContainerRuntimeArgument(
         DocumentDBServerResource resource) =>
