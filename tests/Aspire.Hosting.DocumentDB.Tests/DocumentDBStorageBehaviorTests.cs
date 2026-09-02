@@ -294,6 +294,117 @@ public class DocumentDBStorageBehaviorTests
     }
 
     /// <summary>
+    /// A mount target that reaches above the container root is <em>not</em> refused: the daemon
+    /// clamps it to the root and mounts on the clamped destination, so <c>/../data</c> is the data
+    /// directory and nothing says so.
+    /// </summary>
+    /// <remarks>
+    /// This is why the model-level guard refuses the spelling rather than treating the mount as
+    /// landing somewhere else: silently, the storage takes over — or collides with — the
+    /// DocumentDB data directory. A path that clamps all the way to <c>/</c> is a different case
+    /// and is refused outright.
+    /// </remarks>
+    [Fact]
+    public async Task TheRuntimeClampsAboveRootMountTargetsInsteadOfRefusingThem()
+    {
+        RequireDocker();
+        await EnsureImageAsync(s_candidateImage);
+
+        var escapeVolume = UniqueName("escape-vol");
+        var otherVolume = UniqueName("escape-other-vol");
+        var escapeContainer = UniqueName("escape");
+        var duplicateContainer = UniqueName("escape-duplicate");
+        var rootContainer = UniqueName("escape-root");
+
+        try
+        {
+            var (escapeVolumeExit, _) = await RunDockerAsync("volume", "create", escapeVolume);
+            Assert.Equal(0, escapeVolumeExit);
+
+            var (otherVolumeExit, _) = await RunDockerAsync("volume", "create", otherVolume);
+            Assert.Equal(0, otherVolumeExit);
+
+            // '/../data' is accepted, and the destination recorded on the container is '/data'.
+            var (createExit, _) = await RunDockerAsync(
+                "create", "--name", escapeContainer, "-v", $"{escapeVolume}:/../data", s_candidateImage);
+            Assert.Equal(0, createExit);
+
+            var (mountsExit, mountsJson) = await RunDockerAsync(
+                "inspect", escapeContainer, "--format", "{{json .Mounts}}");
+            Assert.Equal(0, mountsExit);
+
+            using var document = JsonDocument.Parse(mountsJson);
+            var mount = document.RootElement
+                .EnumerateArray()
+                .Single(entry => entry.GetProperty("Name").GetString() == escapeVolume);
+
+            Assert.Equal("/data", mount.GetProperty("Destination").GetString());
+
+            // And because it clamps rather than refuses, it collides with a plainly spelled '/data'.
+            var (duplicateExit, duplicateOutput, duplicateError) = await RunDockerWithTimeoutAsync(
+                ContainerCreateTimeout,
+                "create", "--name", duplicateContainer,
+                "-v", $"{escapeVolume}:/data",
+                "-v", $"{otherVolume}:/../data",
+                s_candidateImage);
+
+            Assert.NotEqual(0, duplicateExit);
+            Assert.Contains(
+                "Duplicate mount point: /data",
+                CombineStandardOutputAndError(duplicateOutput, duplicateError),
+                StringComparison.Ordinal);
+
+            // Clamping all the way to the root is the one case the daemon does refuse.
+            var (rootExit, rootOutput, rootError) = await RunDockerWithTimeoutAsync(
+                ContainerCreateTimeout,
+                "create", "--name", rootContainer, "-v", $"{escapeVolume}:/data/../..", s_candidateImage);
+
+            Assert.NotEqual(0, rootExit);
+            Assert.Contains(
+                "destination can't be '/'",
+                CombineStandardOutputAndError(rootOutput, rootError),
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            await RunDockerAsync("rm", "-f", "-v", escapeContainer);
+            await RunDockerAsync("rm", "-f", "-v", duplicateContainer);
+            await RunDockerAsync("rm", "-f", "-v", rootContainer);
+            await RemoveVolumeAsync(escapeVolume);
+            await RemoveVolumeAsync(otherVolume);
+        }
+    }
+
+    /// <summary>
+    /// The entrypoint applies <c>DATA_PATH=${DATA_PATH:-/data}</c>, so an empty <c>DATA_PATH</c>
+    /// is the same as no <c>DATA_PATH</c>: the image's own default applies. That is why the guard
+    /// judges an empty value as <c>/data</c> instead of rejecting it.
+    /// </summary>
+    [Fact]
+    public async Task AnEmptyDataPathFallsBackToTheImageDefault()
+    {
+        RequireDocker();
+        await EnsureImageAsync(s_candidateImage);
+
+        var containerName = UniqueName("empty-data-path");
+
+        try
+        {
+            var (runExit, _) = await RunDockerAsync(
+                ["run", "-d", "--name", containerName, "-e", "DATA_PATH=", .. s_credentialEnvironment, s_candidateImage]);
+            Assert.Equal(0, runExit);
+
+            var logs = await WaitForLogAsync(containerName, "Using data path:");
+
+            Assert.Contains("Using data path: /data", logs, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await RunDockerAsync("rm", "-f", "-v", containerName);
+        }
+    }
+
+    /// <summary>
     /// A data directory that holds anything other than a PostgreSQL cluster is refused, not
     /// cleaned: the container leaves the contents alone, never starts PostgreSQL, and exits behind
     /// the same misleading 60-second banner. One stray dot-file — a <c>.gitkeep</c> committed to
