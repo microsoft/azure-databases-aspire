@@ -560,6 +560,47 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TelemetryWrapperDoesNotContaminateTmpDataPath(bool enabled)
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryTemporaryDataPathScenario),
+            (AppHost.OtelEnabledEnvironmentVariable, enabled.ToString()),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "tmp-data", enabled.ToString(), cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+        Assert.Equal("/tmp", environment["DATA_PATH"]);
+        Assert.Equal(enabled.ToString().ToLowerInvariant(), environment["OTEL_METRICS_ENABLED"]);
+
+        var command = await GetContainerConfigListAsync(containerId, "Cmd");
+        Assert.Contains("mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\"", command[1], StringComparison.Ordinal);
+
+        var (exitCode, output) = await RunDockerAsync(
+            "exec", containerId, "/bin/bash", "-c",
+            "find /tmp -maxdepth 1 -type d -name 'aspire-documentdb-otel.*' -print");
+        Assert.True(exitCode == 0, $"Could not inspect DATA_PATH: {output}");
+        Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
+    }
+
+    [Theory]
     // No serviceName override: the shipped TelemetryOptions.ServiceName must survive.
     [InlineData(null, "documentdb_gateway")]
     // Explicit serviceName override: the shared JSON identity is removed so the variable wins.

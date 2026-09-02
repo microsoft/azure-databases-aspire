@@ -28,6 +28,7 @@ public class Program
     public const string InitDataPathEnvironmentVariable = "DOCUMENTDB_FEATURE_INIT_DATA";
     public const string OtelOutputPathEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_OUTPUT";
     public const string OtelEndpointEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_ENDPOINT";
+    public const string OtelEnabledEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_ENABLED";
 
     /// <summary>Custom credential parameters, two databases, one with a distinct database name.</summary>
     public const string CustomCredentialsMultiDbScenario = "custom-credentials-multi-db";
@@ -46,6 +47,9 @@ public class Program
 
     /// <summary>WithLogLevel + WithOwner + WithOpenTelemetryMetrics, all observable on the container.</summary>
     public const string ObservableConfigScenario = "observable-config";
+
+    /// <summary>Telemetry wrapper with DATA_PATH set to /tmp.</summary>
+    public const string TelemetryTemporaryDataPathScenario = "telemetry-temporary-data-path";
 
     /// <summary>WithPostgresVersion(Pg15).</summary>
     public const string Pg15Scenario = "pg15";
@@ -197,6 +201,15 @@ public class Program
                 {
                     documentDB.WaitFor(collector);
                 }
+                break;
+
+            case TelemetryTemporaryDataPathScenario:
+                documentDB
+                    .WithEnvironment("DATA_PATH", "/tmp")
+                    .WithOpenTelemetryMetrics(
+                        endpoint: "http://localhost:4317",
+                        enabled: bool.Parse(GetRequired(OtelEnabledEnvironmentVariable)),
+                        exportInterval: TimeSpan.FromSeconds(1));
                 break;
 
             case Pg15Scenario:

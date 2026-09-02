@@ -278,6 +278,13 @@ it therefore wraps the container entrypoint. The wrapper reads the configuration
 container would otherwise have used, removes the keys the environment has to win over, points
 `CONFIG_DIR` at the sanitized copy, and execs the image's own entrypoint.
 
+The sanitized copy is created under the first writable directory among `/tmp`, `/var/tmp`, and
+`/dev/shm` whose filesystem subtree does not overlap the canonical `DATA_PATH`. This matters when
+the database itself uses a normally temporary path such as `/tmp`: placing the copy there would
+make a fresh data directory non-empty before PostgreSQL initialization. If none of those locations
+is safely separated and writable, startup fails with a diagnostic instead of writing into the data
+directory.
+
 **Which directory the wrapper reads.** Exactly the one the image entrypoint would have read:
 
 1. `CONFIG_DIR`, when the caller set it.
@@ -354,9 +361,10 @@ tag is wrapped, because only the registry differs. Four situations throw instead
   uninstalled, and dropping its arguments would leave `/bin/bash` with nothing to run. Select the
   image before configuring metrics.
 
-The wrapper needs `bash` and `jq`, both of which the official image provides. If either is
-missing, or the configuration file cannot be read, the container fails to start with a diagnostic
-rather than starting silently without the override.
+The wrapper needs `bash`, `jq`, `realpath`, and `mktemp`, all of which the official image provides.
+If one is missing, the configuration file cannot be read, or no safe temporary directory is
+available, the container fails to start with a diagnostic rather than starting silently without
+the override.
 
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
