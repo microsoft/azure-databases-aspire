@@ -22,6 +22,11 @@ public class AddDocumentDBTests
     // OTEL_* environment variables. Pinned explicitly so these tests describe that image's
     // behaviour regardless of which version the package currently defaults to.
     private const string InterlockedTag = "pg17-0.116.0";
+    // The official image with the registry folded into the image annotation instead of kept
+    // beside it. Aspire joins the two and never re-splits them, so this resolves to exactly the
+    // reference the default spelling resolves to.
+    private const string QualifiedOfficialImage =
+        DocumentDBContainerImageTags.Registry + "/" + DocumentDBContainerImageTags.Image;
 
     private const string GatewayConfigurationShell = "/bin/bash";
     private const string GatewayConfigurationShellArgumentZero = "--";
@@ -1210,6 +1215,102 @@ public class AddDocumentDBTests
         Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The review reproduction: the official image with its registry folded into the image
+    /// annotation resolves to exactly the reference the default spelling resolves to, so it needs
+    /// the same wrapper.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForAQualifiedOfficialImage()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Theory]
+    // Only the registry differs, in every spelling of the boundary.
+    [InlineData("contoso.azurecr.io/documentdb/documentdb-local", null)]
+    [InlineData("localhost:5000/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb/documentdb-local", "ghcr.io")]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForQualifiedPrivateMirrors(
+        string image,
+        string? registry)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+    }
+
+    [Theory]
+    // A leading path that is not a registry is part of the repository.
+    [InlineData("evil/documentdb/documentdb-local", null)]
+    [InlineData("ghcr.io/evil/documentdb/documentdb-local", null)]
+    // Leaving the registry annotation in place composes a doubled, unresolvable reference.
+    [InlineData("ghcr.io/documentdb/documentdb/documentdb-local", "ghcr.io/documentdb")]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForLookalikeReferences(
+        string image,
+        string? registry)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// A digest pin makes the version opaque whichever way the reference is spelled, and whether
+    /// the digest arrives through <c>WithImageSHA256</c> or inside the reference itself.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedQualifiedOfficialImage(bool digestInline)
+    {
+        const string Digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        if (digestInline)
+        {
+            documentDB.WithImage($"{QualifiedOfficialImage}@sha256:{Digest}");
+        }
+        else
+        {
+            documentDB.WithImage(QualifiedOfficialImage, InterlockedTag).WithImageSHA256(Digest);
+        }
+
+        documentDB.WithImageRegistry(null!).WithOpenTelemetryMetrics();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(Digest, exception.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenDisabled()
     {
@@ -1978,6 +2079,27 @@ public class AddDocumentDBTests
         Assert.Null(resource["entrypoint"]);
         Assert.Null(resource["args"]);
         Assert.Equal("true", resource["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// Through the real publishing pipeline: the rearranged spelling publishes the same image
+    /// reference as the default one, and carries the wrapper with it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAWrappedManifestForAQualifiedOfficialImage()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage(QualifiedOfficialImage, InterlockedTag)
+                .WithImageRegistry(null!)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Equal($"{QualifiedOfficialImage}:{InterlockedTag}", resource!["image"]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+        Assert.Equal(3, resource["args"]?.AsArray().Count);
     }
 
     [Fact]

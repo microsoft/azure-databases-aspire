@@ -359,6 +359,18 @@ public static class DocumentDBBuilderExtensions
     /// <c>KnownVersion is { } version</c>: one place decides what is known, and no caller can
     /// conclude a version from an image whose version is not known.
     /// </remarks>
+    /// <param name="Origin">How much is known about the image.</param>
+    /// <param name="Image">
+    /// The repository as the annotation spells it, for diagnostics. It is not the identity: see
+    /// <see cref="DocumentDBContainerImageTags.NamesCuratedRepository"/>.
+    /// </param>
+    /// <param name="Tag">The effective tag, whether the annotation or the reference carried it.</param>
+    /// <param name="Digest">
+    /// The effective digest, whether the annotation or the reference carried it, without its
+    /// algorithm prefix.
+    /// </param>
+    /// <param name="PostgresVariant">The PostgreSQL major version of a curated tag.</param>
+    /// <param name="KnownVersion">The DocumentDB version of a curated tag.</param>
     private readonly record struct DocumentDBEffectiveImage(
         DocumentDBImageOrigin Origin,
         string? Image,
@@ -396,6 +408,15 @@ public static class DocumentDBBuilderExtensions
     /// a <em>generated</em> Dockerfile, and with no build to generate one it changes neither the
     /// image a container resource pulls nor the manifest it publishes.
     /// </para>
+    /// <para>
+    /// Everything else is decided on the reference Aspire composes rather than on
+    /// <see cref="ContainerImageAnnotation.Image"/> alone, because the boundary between registry
+    /// and repository is the caller's to move: see
+    /// <see cref="DocumentDBContainerImageTags.NamesCuratedRepository"/>. A tag or digest the
+    /// annotation supplies wins over one written into the reference, and a reference that supplies
+    /// both is contradictory — Aspire emits <c>repo:a:b</c>, which resolves to nothing — so the
+    /// version is treated as unknown rather than guessed from either.
+    /// </para>
     /// </remarks>
     private static DocumentDBEffectiveImage ResolveEffectiveImage(IResource resource)
     {
@@ -411,17 +432,28 @@ public static class DocumentDBBuilderExtensions
             return new(DocumentDBImageOrigin.None, null, null, null, 0, null);
         }
 
-        if (!string.Equals(image.Image, DocumentDBContainerImageTags.Image, StringComparison.Ordinal))
+        var curated = DocumentDBContainerImageTags.NamesCuratedRepository(
+            image.Registry, image.Image, out var inlineTag, out var inlineDigest);
+
+        var contradictory =
+            (!string.IsNullOrEmpty(image.Tag) && inlineTag is not null) ||
+            (!string.IsNullOrEmpty(image.SHA256) && inlineDigest is not null);
+
+        var tag = string.IsNullOrEmpty(image.Tag) ? inlineTag : image.Tag;
+        var digest = string.IsNullOrEmpty(image.SHA256) ? inlineDigest : image.SHA256;
+
+        if (!curated)
         {
-            return new(DocumentDBImageOrigin.CustomRepository, image.Image, image.Tag, image.SHA256, 0, null);
+            return new(DocumentDBImageOrigin.CustomRepository, image.Image, tag, digest, 0, null);
         }
 
-        if (!DocumentDBContainerImageTags.TryParseDocumentDBTag(image.Tag, out var pg, out var version))
+        if (contradictory ||
+            !DocumentDBContainerImageTags.TryParseDocumentDBTag(tag, out var pg, out var version))
         {
-            return new(DocumentDBImageOrigin.UnrecognizedTag, image.Image, image.Tag, image.SHA256, 0, null);
+            return new(DocumentDBImageOrigin.UnrecognizedTag, image.Image, tag, digest, 0, null);
         }
 
-        return new(DocumentDBImageOrigin.Curated, image.Image, image.Tag, image.SHA256, pg, version);
+        return new(DocumentDBImageOrigin.Curated, image.Image, tag, digest, pg, version);
     }
 
     /// <summary>
