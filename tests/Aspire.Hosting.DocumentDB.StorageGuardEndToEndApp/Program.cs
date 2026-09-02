@@ -57,6 +57,66 @@ public class Program
     /// </summary>
     public const string LateReadOnlyDataMountScenario = "late-read-only-data-mount";
 
+    /// <summary>
+    /// Storage added straight to the container runtime, where no annotation records it and no
+    /// storage rule can see it.
+    /// </summary>
+    public const string RawMountRuntimeArgumentScenario = "raw-mount-runtime-argument";
+
+    /// <summary>The same, written as a read-only <c>--volume=</c> over the data directory.</summary>
+    public const string RawReadOnlyVolumeRuntimeArgumentScenario = "raw-read-only-volume-runtime-argument";
+
+    /// <summary>A tmpfs on the data directory: storage that does not survive the container.</summary>
+    public const string RawTmpfsRuntimeArgumentScenario = "raw-tmpfs-runtime-argument";
+
+    /// <summary>The whole root filesystem made unwritable behind the storage rules.</summary>
+    public const string RawReadOnlyRootRuntimeArgumentScenario = "raw-read-only-root-runtime-argument";
+
+    /// <summary>
+    /// The data directory moved by a raw <c>--env</c>, past the one checked path the guard owns.
+    /// </summary>
+    public const string RawDataPathRuntimeArgumentScenario = "raw-data-path-runtime-argument";
+
+    /// <summary>The image's entry point replaced without touching the model.</summary>
+    public const string RawEntrypointRuntimeArgumentScenario = "raw-entrypoint-runtime-argument";
+
+    /// <summary>
+    /// A container-runtime argument whose value only arrives later, where the runtime reads an
+    /// option name.
+    /// </summary>
+    public const string DeferredRuntimeArgumentScenario = "deferred-runtime-argument";
+
+    /// <summary>
+    /// Ordinary container-runtime arguments, which have to reach the container runtime untouched.
+    /// The label is what the test reads back off the created container.
+    /// </summary>
+    public const string HarmlessRuntimeArgumentScenario = "harmless-runtime-argument";
+
+    /// <summary>The label the harmless-argument scenario passes through.</summary>
+    public const string HarmlessRuntimeArgumentLabel = "documentdb.storage-guard=harmless";
+
+    /// <summary>
+    /// The image a run is sealed on, and — beside it — a plain container that rewrites its own
+    /// image after its endpoints are allocated. The container runtime launches the image each was
+    /// prepared with, which is what the seal exists to keep this package honest about.
+    /// </summary>
+    public const string LaunchedImageScenario = "launched-image";
+
+    /// <summary>The tag the launched-image scenario pins, and the images the probe moves between.</summary>
+    public const string LaunchedImageTag = "pg17-0.116.0";
+
+    public const string ProbeImage = "docker.io/library/alpine";
+
+    public const string ProbePreparedTag = "3.20";
+
+    public const string ProbeMutatedTag = "3.19";
+
+    /// <summary>A DocumentDB image raised to a newer release after its endpoints are allocated.</summary>
+    public const string LateImageUpgradeScenario = "late-image-upgrade";
+
+    /// <summary>The same in the other direction, which is what makes the storage rules over-promise.</summary>
+    public const string LateImageDowngradeScenario = "late-image-downgrade";
+
     public static async Task Main(string[] args)
     {
         var builder = DistributedApplication.CreateBuilder(args);
@@ -126,13 +186,104 @@ public class Program
                 });
                 break;
 
+            case RawMountRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithContainerRuntimeArgs("--mount", "type=volume,source=documentdb-raw-mount,target=/data");
+                break;
+
+            case RawReadOnlyVolumeRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithContainerRuntimeArgs("--volume=documentdb-raw-shared:/data:ro");
+                break;
+
+            case RawTmpfsRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithDataVolume(name: "documentdb-raw-tmpfs-data")
+                    .WithContainerRuntimeArgs("--tmpfs", "/data");
+                break;
+
+            case RawReadOnlyRootRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithContainerRuntimeArgs("--read-only");
+                break;
+
+            case RawDataPathRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithDataVolume(name: "documentdb-raw-data-path-data")
+                    .WithContainerRuntimeArgs("--env=DATA_PATH=/pgdata");
+                break;
+
+            case RawEntrypointRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithContainerRuntimeArgs("--entrypoint", "/bin/sh");
+                break;
+
+            case DeferredRuntimeArgumentScenario:
+                var runtimeOption = builder.AddParameter("documentdb-runtime-option", "--mount");
+                builder.AddDocumentDB("documentdb")
+                    .WithContainerRuntimeArgs(context => context.Args.Add(runtimeOption.Resource));
+                break;
+
+            case HarmlessRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithDataVolume(name: "documentdb-harmless-args-data")
+                    .WithContainerRuntimeArgs("--label", HarmlessRuntimeArgumentLabel, "--label", "-v");
+                break;
+
+            case LaunchedImageScenario:
+                builder.AddDocumentDB("documentdb").WithImageTag(LaunchedImageTag);
+
+                // The control, and deliberately not a DocumentDB resource: it rewrites its own
+                // image annotation the moment its endpoints are allocated, with none of this
+                // package's code involved, so what the container runtime ends up launching is a
+                // statement about Aspire rather than about the guard.
+                var probe = builder.AddContainer("imageprobe", ProbeImage, ProbePreparedTag)
+                    .WithArgs("sleep", "600");
+
+                builder.Eventing.Subscribe<ResourceEndpointsAllocatedEvent>(probe.Resource, (_, _) =>
+                {
+                    probe.WithImage(ProbeImage, ProbeMutatedTag);
+                    return Task.CompletedTask;
+                });
+
+                // A container with no endpoints is not guaranteed the event above, so the same
+                // mutation is made again at the last phase before the container is created. Both
+                // are after the image was snapshotted into the container spec.
+                builder.Eventing.Subscribe<BeforeResourceStartedEvent>(probe.Resource, (_, _) =>
+                {
+                    probe.WithImage(ProbeImage, ProbeMutatedTag);
+                    return Task.CompletedTask;
+                });
+                break;
+
+            case LateImageUpgradeScenario:
+                var upgraded = builder.AddDocumentDB("documentdb").WithImageTag("pg17-0.111.0");
+
+                builder.Eventing.Subscribe<ResourceEndpointsAllocatedEvent>(upgraded.Resource, (_, _) =>
+                {
+                    upgraded.WithImageTag(LaunchedImageTag);
+                    return Task.CompletedTask;
+                });
+                break;
+
+            case LateImageDowngradeScenario:
+                var downgraded = builder.AddDocumentDB("documentdb")
+                    .WithImageTag(LaunchedImageTag)
+                    .WithDataVolume(name: "documentdb-late-downgrade-data");
+
+                builder.Eventing.Subscribe<ResourceEndpointsAllocatedEvent>(downgraded.Resource, (_, _) =>
+                {
+                    downgraded.WithImageTag("pg17-0.114.0");
+                    return Task.CompletedTask;
+                });
+                break;
+
             case ReadOnlyDataMountScenario:
             default:
                 builder.AddDocumentDB("documentdb")
                     .WithVolume("documentdb-read-only-data", "/data", isReadOnly: true);
                 break;
         }
-
         using var app = builder.Build();
         await app.RunAsync();
     }

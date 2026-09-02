@@ -199,16 +199,53 @@ every model event. A mismatch fails the resource, naming what kind of thing chan
 Re-declaring the same storage is not a change: replacing a mount with an identical one, or
 reordering them, is accepted.
 
-The manifest is checked on both sides of the write, because the app host emits a container's image,
-entrypoint and mounts *before* it evaluates the environment callbacks, and its bindings after them.
-An environment callback that mutates the model while the entry is being written would therefore land
-on both sides of it at once, and the storage rules would have judged a resource the manifest does
-not describe. The safety-relevant structure — the mounts, the endpoints, the membership of the three
-callback pipelines, the entrypoint, the effective image, the container build definition and
-`WithExplicitStart()` — is recorded immediately before the writer is handed the resource and
-compared again immediately afterwards. Any difference fails the publish, which abandons the partly
-written manifest rather than completing it; writing environment values, and re-declaring or
-reordering the same mounts, are not differences.
+The manifest is checked on both sides of the write, because the app host emits a container's
+connection string, image, entrypoint and mounts *before* it evaluates the environment callbacks, and
+its bindings after them. An environment callback that mutates the model while the entry is being
+written would therefore land on both sides of it at once, and the storage rules would have judged a
+resource the manifest does not describe. The safety-relevant structure — the mounts, the endpoints,
+the membership of the three callback pipelines, the entrypoint, the effective image, the container
+build definition, `WithExplicitStart()` and the connection string's security state — is recorded
+immediately before the writer is handed the resource and compared again immediately afterwards. Any
+difference fails the publish, which abandons the partly written manifest rather than completing it;
+writing environment values, and re-declaring or reordering the same mounts, are not differences.
+
+The connection string's security state is part of that because it is written first of all. `UseTls`,
+`AllowInsecureTls` and the exact published expression are recorded, so
+`.WithEnvironment(_ => db.AllowInsecureTls(false))` — a supported call — no longer publishes
+`tlsInsecure=true` while the final model says certificates must be valid. Each database is checked
+where the database is written, since a database publishes nothing but the string its parent builds.
+The expression is kept only as a digest and never appears in a failure: it carries the resource's
+credentials.
+
+The image is settled before any of this, and before the app host prepares a single container. The
+app host snapshots a container's image into the orchestrator's container spec while it prepares
+resources, which is before endpoints are allocated and before the resource-start event, and nothing
+re-reads the image annotation for it afterwards. So a run records the image — the composed
+reference, the release it resolves to, and the container build definitions behind it — from
+`IDistributedApplicationLifecycleHook.BeforeStartAsync`, which the app host runs after every
+`BeforeStartEvent` subscriber and still before it prepares anything, and every rule in this package
+judges that record. Choosing the image while the model is built, in any order, or from a
+`BeforeStartEvent` subscriber, is ordinary and is what gets recorded. Changing it later — from a
+`ResourceEndpointsAllocatedEvent` or `BeforeResourceStartedEvent` subscriber, or from a lifecycle
+hook registered after this package's — fails the resource, naming both references: the container
+would run one release while these rules judged another, in either direction. A publish records
+nothing, because it prepares no container and writes the manifest from the model.
+
+Container-runtime arguments are read too. `WithContainerRuntimeArgs(...)` passes its arguments
+straight to the container runtime ahead of the image, so nothing added there is visible to any rule
+written against the model: `--mount`, `-v`, `--volume`, `--volumes-from` and `--tmpfs` mount storage
+with no annotation to read, `--read-only` makes the data directory unwritable without one either,
+`--env DATA_PATH=...` moves the data directory past the one checked path above, `--env`/`-e` can
+replace `USERNAME` or `PASSWORD` out from under the generated connection string, `--entrypoint`
+replaces the entry point, and a bare operand would be read as the image. All of those fail the
+resource, in every spelling the runtime accepts — `--option value`, `--option=value`, the attached
+short form `-eDATA_PATH=...`, `--env-file`, and values contributed by another callback — as does a
+token whose value is only known later sitting where the runtime reads an option name. The arguments
+are parsed with the runtime's own grammar rather than searched, so `--label -v` passes a label,
+`--memory 512m` is not a mount, and `--cap-add`, `--network`, `--pull`, `--platform`, `--dns`,
+`--ulimit`, `--sysctl`, `-it` and the rest reach the runtime untouched. No operand appears in the
+failure, which names the option and, for an environment option, the variable.
 
 A container built from a Dockerfile is recorded twice over, because every such build resolves to the
 same effective image and the `build` object is the first thing the writer emits. The annotation's
