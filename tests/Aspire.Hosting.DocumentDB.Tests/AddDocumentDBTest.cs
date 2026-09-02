@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Runtime.CompilerServices;
 using System.Net.Sockets;
 using System.Text.Json.Nodes;
 using Aspire.Hosting.ApplicationModel;
@@ -17,6 +18,11 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Trait("Category", "Unit")]
 public class AddDocumentDBTests
 {
+    // The first curated tag whose gateway gives SetupConfiguration.json precedence over the
+    // OTEL_* environment variables. Pinned explicitly so these tests describe that image's
+    // behaviour regardless of which version the package currently defaults to.
+    private const string InterlockedTag = "pg17-0.116.0";
+
     private const string GatewayConfigurationShell = "/bin/bash";
     private const string GatewayConfigurationShellArgumentZero = "--";
     private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
@@ -1059,6 +1065,124 @@ public class AddDocumentDBTests
         Assert.Empty(await BuildContainerArgsAsync(containerResource));
     }
 
+    /// <summary>
+    /// The wrapper is built entirely out of official-image facts: the entrypoint script path, the
+    /// packaged configuration layout, bash and jq. A resource built from the caller's Dockerfile
+    /// keeps the official image annotation and even builds <c>FROM</c> the official image, but
+    /// none of those facts has been established for the build output, so it keeps the stock
+    /// entrypoint.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForDockerfileBuilds()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+
+        // The environment half of the API is unconditional and still applies.
+        var environment = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]);
+    }
+
+    /// <summary>
+    /// The same, for a caller who re-points the image annotation at the official repository and
+    /// tag explicitly after adding the build — the shape in which an annotation is most
+    /// convincingly official and least informative.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointWhenABuildIsAnnotatedAsOfficial()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithImage(DocumentDBContainerImageTags.Image, InterlockedTag)
+            .WithImageRegistry(DocumentDBContainerImageTags.Registry)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// A digest pin throws for the official image because the digest makes the version opaque and
+    /// guessing is silently wrong either way. On a Dockerfile build there is nothing to guess: the
+    /// digest is no more what runs than the tag is, so the resource is simply left alone.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsADigestPinnedDockerfileBuild()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// <c>WithDockerfileBaseImage()</c> selects base images for a <em>generated</em> Dockerfile.
+    /// With no build to generate one it changes nothing about the image this resource pulls, so it
+    /// must not be mistaken for a caller-owned build and suppress the wrapper.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenOnlyTheBaseImageIsOverridden()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+
+#pragma warning disable ASPIREDOCKERFILEBUILDER001
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfileBaseImage("contoso/documentdb-local:pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+#pragma warning restore ASPIREDOCKERFILEBUILDER001
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    /// <summary>
+    /// Once the wrapper owns the entrypoint it cannot be uninstalled, so a build introduced after
+    /// it took over is reported rather than silently left with a <c>/bin/bash</c> that starts
+    /// nothing.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsADockerfileBuildAddedAfterTheWrapperWasInstalled()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+
+        documentDB.WithDockerfile(CreateOfficialLookingDockerfileContext());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains("Dockerfile build", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenDisabled()
     {
@@ -1802,6 +1926,31 @@ public class AddDocumentDBTests
 
         Assert.Null(resource!["entrypoint"]);
         Assert.Null(resource["args"]);
+    }
+
+    /// <summary>
+    /// The real publishing pipeline is where the distinction is decided for <c>azd</c>: the
+    /// manifest carries a <c>build</c> instruction rather than an <c>image</c>, and no wrapper.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAnUnwrappedManifestForDockerfileBuilds()
+    {
+        var contextPath = CreateOfficialLookingDockerfileContext();
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDockerfile(contextPath)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Null(resource!["image"]);
+        Assert.NotNull(resource["build"]);
+        Assert.Null(resource["entrypoint"]);
+        Assert.Null(resource["args"]);
+        Assert.Equal("true", resource["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
     }
 
     [Fact]
@@ -2682,5 +2831,33 @@ public class AddDocumentDBTests
         var args = await BuildContainerArgsAsync(resource);
         Assert.Equal(3, args.Count);
         return Assert.IsType<string>(args[1]);
+    }
+
+    /// <summary>
+    /// Creates a real Dockerfile build context: <c>WithDockerfile(...)</c> resolves and validates
+    /// both paths eagerly.
+    /// </summary>
+    /// <remarks>
+    /// The Dockerfile starts <c>FROM</c> the official image on purpose. Together with the image
+    /// annotation <c>AddDocumentDB</c> installs — which Aspire keeps, and which a caller can
+    /// re-point at the official repository and tag afterwards — it makes the resource look
+    /// official from every angle the package can inspect, which is exactly the case these tests
+    /// exist for.
+    /// </remarks>
+    private static string CreateOfficialLookingDockerfileContext(
+        [CallerMemberName] string? testName = null)
+    {
+        var contextPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "dockerfile-contexts",
+            $"{testName ?? "context"}-{Guid.NewGuid():N}");
+
+        Directory.CreateDirectory(contextPath);
+        File.WriteAllText(
+            Path.Combine(contextPath, "Dockerfile"),
+            $"FROM {DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{InterlockedTag}\n" +
+            "RUN echo caller-owned-layer\n");
+
+        return contextPath;
     }
 }

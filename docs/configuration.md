@@ -333,8 +333,10 @@ only file-shaped mechanisms that round-trip through the Aspire manifest. Consequ
   `.WithOpenTelemetryMetrics().WithImageTag(...)` behave the same as the reverse order.
 
 **What is left alone, and what fails loudly.** Custom images and tags outside the `pgNN-X.Y.Z`
-grammar are untouched. A private registry mirror that keeps the official image path and tag is
-wrapped, because only the registry differs. Four situations throw instead of guessing:
+grammar are untouched, as is any resource built from your own Dockerfile — including one whose
+image annotation names the official image and a recognised tag, and one pinned by digest, because
+for a build neither is what runs. A private registry mirror that keeps the official image path and
+tag is wrapped, because only the registry differs. Four situations throw instead of guessing:
 
 - Pinning the official image by digest (`WithImageSHA256`). The digest supersedes the tag — Aspire
   clears it — so the DocumentDB version is unknowable, and both applying and skipping the wrapper
@@ -348,8 +350,9 @@ wrapped, because only the registry differs. Four situations throw instead of gue
   resolved, which is after every subscriber has run, so this is caught rather than splicing those
   arguments into somebody else's command line.
 - Selecting an image that does not need the wrapper *after* the wrapper has taken over the
-  entrypoint. The wrapper cannot be uninstalled at that point, and dropping its arguments would
-  leave `/bin/bash` with nothing to run. Select the image before configuring metrics.
+  entrypoint — including by adding a Dockerfile build at that point. The wrapper cannot be
+  uninstalled, and dropping its arguments would leave `/bin/bash` with nothing to run. Select the
+  image before configuring metrics.
 
 The wrapper needs `bash` and `jq`, both of which the official image provides. If either is
 missing, or the configuration file cannot be read, the container fails to start with a diagnostic
@@ -583,6 +586,32 @@ builder.AddDocumentDB("documentdb")
        .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
        .WithImageTag("pg17-0.999.0");
 ```
+
+### Building your own image from a Dockerfile
+
+`WithDockerfile(...)` — and `WithDockerfileFactory(...)` / `WithDockerfileBuilder(...)` — tells
+Aspire to *build* the resource's container image instead of pulling one. Aspire keeps the
+resource's `ContainerImageAnnotation` when you do that, and you can set it yourself afterwards, so
+a Dockerfile-built resource may be labelled
+`ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0` while running something else
+entirely. The published manifest makes this explicit: it emits a `build` object and no `image` at
+all.
+
+This package therefore classifies **any** resource with a Dockerfile build as a custom image of
+unknown version — whatever its repository, tag or digest says, and whatever the Dockerfile's own
+`FROM` line is:
+
+- `WithOpenTelemetryMetrics(...)` does not install the gateway configuration wrapper. On a
+  `0.116.0`-or-later base your image's own `SetupConfiguration.json` therefore still wins over the
+  `OTEL_*` variables — configure telemetry inside your Dockerfile, or use the official image
+  instead of building one.
+
+Everything that does not depend on the image version still applies: the connection string, the
+`OTEL_*` and other environment variables, the mounts, and the health check.
+
+Overriding only the base image of a *generated* Dockerfile (`WithDockerfileBaseImage(...)`) is not
+a build. With no Dockerfile to generate, it changes neither the image the resource pulls nor the
+manifest it publishes, so it does not change the classification.
 
 ## Connection string format
 
