@@ -527,7 +527,7 @@ public static class DocumentDBBuilderExtensions
                 targetPort: DefaultPostgresContainerPort,
                 scheme: "postgresql",
                 name: DocumentDBServerResource.PostgresEndpointName)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 // Explicitly opt the upstream entrypoint into accepting external PostgreSQL
                 // connections (sets PGOPTIONS=-e -> listen_addresses='*' + permissive pg_hba.conf).
@@ -764,7 +764,7 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), targetPath, isReadOnly: false)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
             });
@@ -826,7 +826,7 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithBindMount(source, targetPath, isReadOnly: false)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[DataPathEnvVarName] = targetPath;
             });
@@ -1178,6 +1178,19 @@ public static class DocumentDBBuilderExtensions
         var resource = builder.Resource;
         var coordinator = DataStorageCoordinator.For(builder.ApplicationBuilder);
 
+        // Installed before AddDocumentDB returns, not at the first lifecycle phase. Aspire records
+        // each callback's result the first time a pipeline is gathered and then takes the last
+        // annotation's recording as the answer for the rest of the run, so a callback that appears
+        // after a gather does not add to that answer — it replaces it, and every value recorded
+        // while it did not exist is dropped. A subscriber registered before AddDocumentDB gathers
+        // the environment while BeforeStartEvent is being published, which is before this
+        // package's own subscriber for that event runs, so installing there would have lost
+        // USERNAME, PASSWORD and every other value the resource had already produced. The lifecycle
+        // phases below only move these same annotation instances back to the end of their
+        // pipelines and attach the services the advisory warnings log to; none of them introduces a
+        // callback a gather has not already seen.
+        InstallDataStorageGuard(resource, coordinator, services: null);
+
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((evt, _) =>
         {
             InstallDataStorageGuard(resource, coordinator, evt.Services);
@@ -1232,10 +1245,7 @@ public static class DocumentDBBuilderExtensions
         if (resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault() is { } installed)
         {
             installed.Services ??= services;
-            MoveToEnd(resource, installed.Environment);
-            MoveToEnd(resource, installed.Arguments);
-            MoveToEnd(resource, installed.RuntimeCheckpoint);
-            EstablishManifestCheckpoint(resource, installed);
+            RetakeDataStorageGuardPositions(resource);
             return;
         }
 
@@ -1338,6 +1348,13 @@ public static class DocumentDBBuilderExtensions
         {
             VerifyDataStorageSeal(resource, guard!);
 
+            // Aspire writes a container's image, entrypoint and mounts before it evaluates the
+            // environment callbacks, so the structure this checkpoint just judged is only the
+            // structure the manifest describes for as long as nothing changes it while the writer
+            // is running. A supported WithEnvironment(...) callback can add, remove or replace a
+            // mount, re-point an endpoint or swap the image from inside that evaluation.
+            var structure = CaptureManifestStructure(resource);
+
             // Whatever would have written this resource had the checkpoint not been installed
             // still writes it, so the manifest is byte-for-byte the one Aspire would have
             // produced. A caller's own writer is honoured; with none, this is a container.
@@ -1352,6 +1369,13 @@ public static class DocumentDBBuilderExtensions
             {
                 await callback(context).ConfigureAwait(false);
             }
+
+            VerifyManifestStructureUnchanged(resource, structure);
+
+            // The storage verdict is recorded while the environment is evaluated, which for this
+            // resource happens inside the call above. Re-checking it here is what judges a verdict
+            // that did not exist when this callback started.
+            VerifyDataStorageSeal(resource, guard!);
         });
 
         guard = new DataStorageGuardAnnotation(environmentCallback, argumentsCallback, runtimeCheckpoint, manifestCheckpoint)
@@ -1395,6 +1419,161 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Puts the guard's callbacks back at the end of their pipelines, and its manifest checkpoint
+    /// back in the position the publisher reads.
+    /// </summary>
+    /// <remarks>
+    /// Called from every lifecycle phase and from every API in this package that appends a
+    /// callback of its own, so the guard is last from the moment the model is written rather than
+    /// only from the moment the application starts. The annotation instances are moved, never
+    /// re-created, so Aspire's per-callback result cache — and with it the single evaluation the
+    /// verdict depends on — is untouched.
+    /// </remarks>
+    private static void RetakeDataStorageGuardPositions(DocumentDBServerResource resource)
+    {
+        if (resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault() is not { } guard)
+        {
+            return;
+        }
+
+        MoveToEnd(resource, guard.Environment);
+        MoveToEnd(resource, guard.Arguments);
+        MoveToEnd(resource, guard.RuntimeCheckpoint);
+        EstablishManifestCheckpoint(resource, guard);
+    }
+
+    /// <summary>
+    /// Adds one of this package's own environment callbacks and puts the data-storage guard's
+    /// callbacks back at the end of their pipelines.
+    /// </summary>
+    /// <remarks>
+    /// The guard is installed while <c>AddDocumentDB</c> runs, so every configuration API called
+    /// afterwards would otherwise append behind it. Re-taking the last position here keeps the two
+    /// requirements the guard is built on — being installed before anything can gather, and being
+    /// the last word once it has — true at the same time, for every call order.
+    /// </remarks>
+    private static IResourceBuilder<DocumentDBServerResource> WithDocumentDBEnvironment(
+        this IResourceBuilder<DocumentDBServerResource> builder,
+        Action<EnvironmentCallbackContext> callback)
+    {
+        builder.WithEnvironment(callback);
+        RetakeDataStorageGuardPositions(builder.Resource);
+
+        return builder;
+    }
+
+    /// <summary>
+    /// Everything about a resource that decides what its manifest entry says, recorded so that a
+    /// change made while the entry is being written can be detected.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Aspire's container writer emits the image, the entrypoint and the mounts before it
+    /// evaluates the environment callbacks, and the bindings after them. A callback that mutates
+    /// the model from inside that evaluation therefore lands on both sides of the entry at once:
+    /// the fields already written describe the resource as it was, the fields written afterwards
+    /// describe it as it became, and every check this package ran before delegating judged a third
+    /// thing again.
+    /// </para>
+    /// <para>
+    /// Only what is safety-relevant is recorded. Mounts are compared by value and in a fixed order,
+    /// exactly as <see cref="DataStorageSeal"/> compares them, so re-declaring identical storage or
+    /// merely reordering it is not reported — neither changes a byte of the entry, because the
+    /// mounts were written before the callback ran. Endpoints are compared in declaration order,
+    /// because they are written after the callbacks and their order is the order of the manifest's
+    /// own binding keys.
+    /// </para>
+    /// </remarks>
+    private sealed record ManifestStructureSnapshot(
+        System.Collections.Immutable.ImmutableArray<string> Mounts,
+        System.Collections.Immutable.ImmutableArray<string> Endpoints,
+        System.Collections.Immutable.ImmutableArray<EnvironmentCallbackAnnotation> EnvironmentCallbacks,
+        System.Collections.Immutable.ImmutableArray<CommandLineArgsCallbackAnnotation> CommandLineCallbacks,
+        System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
+        string? Entrypoint,
+        DocumentDBEffectiveImage Image,
+        bool ExplicitlyStarted);
+
+    private static ManifestStructureSnapshot CaptureManifestStructure(DocumentDBServerResource resource) =>
+        new(
+            CaptureDataStorageMounts(resource),
+            [.. resource.Annotations.OfType<EndpointAnnotation>().Select(DescribeEndpointForSeal)],
+            [.. resource.Annotations.OfType<EnvironmentCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>()],
+            [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
+            resource.Entrypoint,
+            ResolveEffectiveImage(resource),
+            resource.Annotations.OfType<ExplicitStartupAnnotation>().Any());
+
+    /// <summary>
+    /// The parts of an endpoint the manifest carries, and nothing else: an allocated address
+    /// belongs to a run and is not written to a manifest at all.
+    /// </summary>
+    private static string DescribeEndpointForSeal(EndpointAnnotation endpoint) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"{endpoint.Name}\u0000{endpoint.UriScheme}\u0000{endpoint.Protocol}\u0000{endpoint.Transport}\u0000{endpoint.Port}\u0000{endpoint.TargetPort}\u0000{endpoint.IsExternal}\u0000{endpoint.TargetHost}");
+
+    /// <summary>
+    /// Fails the publish when the model changed while the resource's manifest entry was being
+    /// written.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Nothing is repaired and the entry is not rewritten. Part of it is already in the writer by
+    /// the time the mutation is observable, and the fields that were written cannot be taken back;
+    /// what can be guaranteed is that the operation fails, which is what the publishing pipeline
+    /// reports and what makes <c>aspire publish</c> exit non-zero without leaving a usable
+    /// manifest behind.
+    /// </para>
+    /// <para>
+    /// No value is reported, only what kind of thing changed: the callback that changed the model
+    /// may well be the one carrying a secret.
+    /// </para>
+    /// </remarks>
+    private static void VerifyManifestStructureUnchanged(
+        DocumentDBServerResource resource,
+        ManifestStructureSnapshot before)
+    {
+        var after = CaptureManifestStructure(resource);
+
+        var change =
+            !after.Mounts.SequenceEqual(before.Mounts, StringComparer.Ordinal)
+                ? "a volume or bind mount was added, removed or changed"
+            : !after.Endpoints.SequenceEqual(before.Endpoints, StringComparer.Ordinal)
+                ? "an endpoint was added, removed, reordered or re-pointed"
+            : !SameCallbacks(after.EnvironmentCallbacks, before.EnvironmentCallbacks)
+                ? "an environment callback was added or removed"
+            : !SameCallbacks(after.CommandLineCallbacks, before.CommandLineCallbacks)
+                ? "a command-line callback was added or removed"
+            : !SameCallbacks(after.RuntimeCallbacks, before.RuntimeCallbacks)
+                ? "a container-runtime-argument callback was added or removed"
+            : !string.Equals(after.Entrypoint, before.Entrypoint, StringComparison.Ordinal)
+                ? "its container entrypoint changed"
+            : !after.Image.Equals(before.Image)
+                ? "the image it will run changed"
+            : after.ExplicitlyStarted != before.ExplicitlyStarted
+                ? "its explicit-start setting changed"
+            : null;
+
+        if (change is null)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"DocumentDB resource '{resource.Name}' was changed while its manifest entry was being " +
+            $"written: {change}. Aspire writes a container's image, entrypoint and mounts before it " +
+            $"evaluates the environment callbacks and its bindings after them, so a change made from " +
+            $"inside that evaluation lands in the model but not in the fields that have already been " +
+            $"written, and the data-storage rules judged a resource the manifest does not describe. " +
+            $"The publish is failed and the partly written manifest is abandoned rather than " +
+            $"completed. Recovery: configure the resource while the application model is being built " +
+            $"(WithDataVolume(), WithDataBindMount(...), WithEndpoint(...), WithImageTag(...)) " +
+            $"instead of mutating it from a WithEnvironment(...) callback.");
+    }
+
+    /// <summary>
     /// Moves an annotation the resource already carries to the end of the collection, so it is the
     /// last of its kind when Aspire gathers it. The instance is preserved, so its cached result —
     /// and with it the guarantee of a single evaluation — is preserved too.
@@ -1415,11 +1594,11 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// <para>
     /// The guard's answer is only worth anything if nothing can change the configuration after it.
-    /// It is appended at <see cref="BeforeStartEvent"/> and moved back to the end at
-    /// <see cref="BeforeResourceStartedEvent"/>, which covers lifecycle hooks and later
-    /// <see cref="BeforeStartEvent"/> subscribers; a subscriber that appends later still — or, in
-    /// publish mode, any lifecycle hook, because no per-resource event is published there — would
-    /// otherwise be able to move the data directory past every rule.
+    /// Its callbacks are appended while <c>AddDocumentDB</c> runs, moved back to the end of their
+    /// pipelines by every configuration API in this package, and moved again at every lifecycle
+    /// phase the run offers; a callback added after the last of those — or, in publish mode, from
+    /// any lifecycle hook, because no per-resource event is published there — would otherwise be
+    /// able to move the data directory past every rule.
     /// </para>
     /// <para>
     /// That is reported rather than tolerated. No value is included in the message: the point is
@@ -1442,15 +1621,19 @@ public static class DocumentDBBuilderExtensions
         throw new InvalidOperationException(
             $"DocumentDB resource '{resource.Name}' has a later {pipeline} callback registered after " +
             $"its data-storage guard, so the guard cannot be sure the configuration it checked is the " +
-            $"one the container receives. The guard is appended when the application starts, and " +
-            $"moved back to the end of its pipeline at the latest phase the run offers; a callback " +
-            $"added after that usually comes from a subscriber registered after AddDocumentDB, or " +
-            $"from an IDistributedApplicationLifecycleHook where no later phase is published. The " +
-            $"resource is failed instead of being started on an unchecked data directory. " +
-            $"Recovery: make that configuration part of the " +
-            $"application model (WithDataVolume(), WithDataBindMount(...), " +
-            $"WithEnvironment(\"{DataPathEnvVarName}\", ...), WithArgs(...)) rather than adding it " +
-            $"after the model is built, or register the subscriber before AddDocumentDB.");
+            $"one the container receives — Aspire records each callback's result the first time it " +
+            $"runs and then takes the last callback's recording as the answer for the rest of the " +
+            $"run. The guard is installed while AddDocumentDB runs and moved back to the end of its " +
+            $"pipeline by every DocumentDB configuration API and at every lifecycle phase the run " +
+            $"offers, so a callback that is still behind it was either added after the last of those " +
+            $"phases — from an IDistributedApplicationLifecycleHook, or from a subscriber registered " +
+            $"after AddDocumentDB — or added with a raw Aspire API (WithEnvironment(...), " +
+            $"WithArgs(...)) and then read before the application started, by a subscriber registered " +
+            $"before AddDocumentDB. The resource is failed instead of being started on an unchecked " +
+            $"data directory. Recovery: finish building the application model before anything reads " +
+            $"this resource's configuration, and register a subscriber that does read it after " +
+            $"AddDocumentDB rather than before, so this package has put its callbacks back in the " +
+            $"last position first.");
     }
 
     /// <summary>
@@ -1715,10 +1898,33 @@ public static class DocumentDBBuilderExtensions
         EnvironmentCallbackContext context)
     {
         var services = resource.Annotations.OfType<DataStorageGuardAnnotation>().LastOrDefault()?.Services
-            ?? context.ExecutionContext.Services;
+            ?? TryGetExecutionServices(context.ExecutionContext);
 
         return services?.GetService<ILoggerFactory>()?.CreateLogger(StorageLoggerCategory)
             ?? context.Logger;
+    }
+
+    /// <summary>
+    /// The AppHost's services when the execution context carries them, and <see langword="null"/>
+    /// when it does not.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DistributedApplicationExecutionContext.Services"/> is documented to throw when
+    /// the context was built without a service provider, which is what a context constructed by
+    /// hand — the discovery pass, a test harness, a caller reading the configuration itself — looks
+    /// like. Not having somewhere to write an advisory warning is not a reason to fail a resource,
+    /// so the absence is treated as an absence and the callback's own logger is used instead.
+    /// </remarks>
+    private static IServiceProvider? TryGetExecutionServices(DistributedApplicationExecutionContext executionContext)
+    {
+        try
+        {
+            return executionContext.Services;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -2295,7 +2501,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[LogLevelEnvVarName] = logLevel.ToEnvironmentValue();
         });
@@ -2321,7 +2527,7 @@ public static class DocumentDBBuilderExtensions
 
         return builder
             .WithBindMount(source, InitDataMountPath, isReadOnly: true)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[InitDataPathEnvVarName] = InitDataMountPath;
                 context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
@@ -2337,7 +2543,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[SkipInitDataEnvVarName] = "true";
         });
@@ -2357,7 +2563,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[DisableExtendedRumEnvVarName] = "true";
         });
@@ -2387,7 +2593,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[CreateUserEnvVarName] = "false";
         });
@@ -2416,7 +2622,7 @@ public static class DocumentDBBuilderExtensions
         return builder
             .WithBindMount(certPath, certTargetPath, isReadOnly: true)
             .WithBindMount(keyPath, keyTargetPath, isReadOnly: true)
-            .WithEnvironment(context =>
+            .WithDocumentDBEnvironment(context =>
             {
                 context.EnvironmentVariables[CertPathEnvVarName] = certTargetPath;
                 context.EnvironmentVariables[KeyFileEnvVarName] = keyTargetPath;
@@ -2448,7 +2654,7 @@ public static class DocumentDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[EnableTelemetryEnvVarName] = enabled ? "true" : "false";
         });
@@ -2592,7 +2798,7 @@ public static class DocumentDBBuilderExtensions
 
         EnsureOpenTelemetryEnvironmentConfiguration(builder, enabled);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             if (context.Resource is DocumentDBServerResource digestPinnedResource &&
                 ResolveEffectiveImage(digestPinnedResource).Origin == DocumentDBImageOrigin.DigestPinned)
@@ -2791,7 +2997,7 @@ public static class DocumentDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentException.ThrowIfNullOrEmpty(owner);
 
-        return builder.WithEnvironment(context =>
+        return builder.WithDocumentDBEnvironment(context =>
         {
             context.EnvironmentVariables[OwnerEnvVarName] = owner;
         });

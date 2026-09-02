@@ -164,15 +164,26 @@ whose own default is somewhere other than `/data` cannot write to a directory th
 looked at. Nothing else is read or resolved: the password and every other environment value are
 left exactly as the callbacks produced them.
 
-The guard takes the last position twice and then verifies it. It is appended when the application
-starts, and moved back to the end of both pipelines immediately before the resource starts, which
-covers `IDistributedApplicationLifecycleHook.BeforeStartAsync` and any `BeforeStartEvent` subscriber
-registered after `AddDocumentDB` — both of which run after the guard is installed and can add more
-callbacks. Anything that appends later still — a `BeforeResourceStartedEvent` subscriber registered
-after `AddDocumentDB`, or, in publish mode where no per-resource event is published, a lifecycle
-hook — makes the resource fail rather than start on a data directory nothing checked. Configure
-storage through the application model rather than after it is built, or register such a subscriber
-before `AddDocumentDB`.
+The guard takes the last position and then verifies it. It is installed while `AddDocumentDB` runs
+— before the method returns, so that the very first time anything gathers the resource's
+environment the guard is already part of the pipeline — and moved back to the end of both pipelines
+by every DocumentDB configuration API and again at every lifecycle phase the run offers, up to and
+including the last one before the resource starts. That covers
+`IDistributedApplicationLifecycleHook.BeforeStartAsync` and any `BeforeStartEvent` subscriber
+registered after `AddDocumentDB`, both of which can add more callbacks. Anything that appends later
+still — a `BeforeResourceStartedEvent` subscriber registered after `AddDocumentDB`, or, in publish
+mode where no per-resource event is published, a lifecycle hook — makes the resource fail rather
+than start on a data directory nothing checked. So does the mirror image of that: a raw
+`WithEnvironment(...)` or `WithArgs(...)` added after `AddDocumentDB` and then read by a subscriber
+registered *before* `AddDocumentDB`, which gathers the pipeline before the first phase that could
+move the guard back. Configure storage through the application model rather than after it is built,
+and register a subscriber that reads the configuration after `AddDocumentDB` rather than before.
+
+Why installation timing matters: the app host records each callback's result the first time it runs
+and takes the *last* callback's recording as the environment for the rest of the run. A callback
+introduced after a gather therefore does not add to that answer, it replaces it — a guard installed
+by a lifecycle event would have dropped `USERNAME`, `PASSWORD` and every other value produced
+before that event whenever anything gathered the environment first.
 
 Position alone is not enough, because the app host records each callback's result the first time it
 runs and reuses it for the rest of the run. Storage is the sharpest form of that: a volume or bind
@@ -187,6 +198,16 @@ manifest publishing callback in a publish, which runs while the resource is seri
 every model event. A mismatch fails the resource, naming what kind of thing changed and no value.
 Re-declaring the same storage is not a change: replacing a mount with an identical one, or
 reordering them, is accepted.
+
+The manifest is checked on both sides of the write, because the app host emits a container's image,
+entrypoint and mounts *before* it evaluates the environment callbacks, and its bindings after them.
+An environment callback that mutates the model while the entry is being written would therefore land
+on both sides of it at once, and the storage rules would have judged a resource the manifest does
+not describe. The safety-relevant structure — the mounts, the endpoints, the membership of the three
+callback pipelines, the entrypoint, the effective image and `WithExplicitStart()` — is recorded
+immediately before the writer is handed the resource and compared again immediately afterwards. Any
+difference fails the publish, which abandons the partly written manifest rather than completing it;
+writing environment values, and re-declaring or reordering the same mounts, are not differences.
 
 In publish mode a `DATA_PATH` supplied as a parameter is a manifest expression, not a path.
 Resolving it is not an option — the value belongs to the deployment, and a parameter may be a

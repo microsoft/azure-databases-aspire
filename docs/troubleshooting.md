@@ -255,9 +255,9 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 **Symptom:** the resource fails with an `InvalidOperationException` saying it `has a later environment callback registered after its data-storage guard` (or `command-line callback`).
 
-**Cause:** the storage guard is appended when the application starts and moved back to the end of both pipelines immediately before the resource starts, so it sees the final `DATA_PATH` and the final argument list. Something appended another callback after that — a `BeforeResourceStartedEvent` subscriber registered after `AddDocumentDB`, or, in publish mode where no such event is published, an `IDistributedApplicationLifecycleHook`. The guard cannot vouch for a configuration that is still changing, so the resource is failed rather than started on an unchecked data directory.
+**Cause:** the storage guard is installed while `AddDocumentDB` runs and moved back to the end of both pipelines by every DocumentDB configuration API and at every lifecycle phase up to the one immediately before the resource starts, so it sees the final `DATA_PATH` and the final argument list. Something is still behind it. Either another callback was appended after the last of those phases — a `BeforeResourceStartedEvent` subscriber registered after `AddDocumentDB`, or, in publish mode where no such event is published, an `IDistributedApplicationLifecycleHook` — or a raw `WithEnvironment(...)`/`WithArgs(...)` added after `AddDocumentDB` was read by a subscriber registered *before* `AddDocumentDB`, which gathers the pipeline before any phase can move the guard back. The guard cannot vouch for a configuration that is still changing, so the resource is failed rather than started on an unchecked data directory.
 
-**Solution:** make the configuration part of the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`, `WithArgs(...)` — instead of adding it after the model is built. If a subscriber must add it, register that subscriber before `AddDocumentDB`.
+**Solution:** make the configuration part of the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`, `WithArgs(...)` — instead of adding it after the model is built, and finish building the model before anything reads the resource's configuration. If a subscriber has to read it, register that subscriber *after* `AddDocumentDB`, so this package has put its callbacks back in the last position first.
 
 ### A change made after the storage was checked fails the resource
 
@@ -266,6 +266,14 @@ Or the application fails to start with an `InvalidOperationException` saying two
 **Cause:** Aspire records each callback's result the first time it runs and reuses it for the rest of the run. Something built the resource's configuration early — `ExecutionConfigurationBuilder` (or `GetEnvironmentVariableValuesAsync`) from an `IDistributedApplicationLifecycleHook` or an event subscriber — and then changed the resource. Storage lives in annotations, so a volume or bind mount added afterwards changes what the container really mounts without any rule running again. The guard records what it judged and compares it at the last uncached points of a run and of a publish, and fails the resource rather than starting it on a data directory nothing checked.
 
 **Solution:** finish configuring the resource before anything reads its configuration, or make the change part of the application model (`WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`) while it is being built. Re-declaring the same storage is not a change: the mounts are compared by value, so replacing a mount with an identical one, or reordering them, is accepted.
+
+### A change made while the manifest was being written fails the publish
+
+**Symptom:** `aspire publish` fails and the pipeline reports an `InvalidOperationException` saying the resource `was changed while its manifest entry was being written`, followed by what changed — for example `a volume or bind mount was added, removed or changed`.
+
+**Cause:** Aspire writes a container's image, entrypoint and mounts before it evaluates the environment callbacks, and its bindings after them. A `WithEnvironment(...)` callback that adds, removes or replaces a mount, re-points an endpoint or swaps the image therefore changes the resource halfway through its own manifest entry: the fields already written describe the resource as it was, and the storage rules judged the resource as it became. The entry cannot be taken back, so the publish is failed and the partly written manifest is abandoned rather than completed.
+
+**Solution:** configure the resource while the application model is being built — `WithDataVolume()`, `WithDataBindMount(...)`, `WithEndpoint(...)`, `WithImageTag(...)` — instead of mutating it from an environment callback. Writing environment values from an environment callback is unaffected, and so is re-declaring or reordering the same mounts.
 
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 
