@@ -3,6 +3,7 @@
 
 using System.Globalization;
 using System.Text.Json.Nodes;
+using System.Runtime.CompilerServices;
 using System.Net.Sockets;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Eventing;
@@ -1022,6 +1023,126 @@ public class AddDocumentDBTests
             () => ConfigureResourceAsync(app, "fork"));
 
         Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The warning downgrade is a promise about the official image's <c>flock</c>: the pair may
+    /// share a directory because whichever container starts second refuses to start. A resource
+    /// built from the caller's Dockerfile carries the official image annotation and even builds
+    /// <c>FROM</c> the official image, but what starts is the build output, and nothing has
+    /// established that it still takes the lock. So the pair stays a hard failure.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SharedDataVolumeWithADockerfileBuiltPeerThrowsEvenWithExplicitStart(bool buildIsTheHolder)
+    {
+        var contextPath = CreateOfficialLookingDockerfileContext();
+
+        var appBuilder = CreateAppBuilder();
+
+        var primary = appBuilder.AddDocumentDB("primary")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "shared-data");
+
+        var standby = appBuilder.AddDocumentDB("standby")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        (buildIsTheHolder ? primary : standby).WithDockerfile(contextPath);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "standby"));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Dockerfile build", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The declared-volume warning is advice about the official image's <c>VOLUME /data</c>
+    /// declaration. A caller's Dockerfile decides its own volumes, so repeating that advice would
+    /// be a guess.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildDoesNotWarnAboutTheDeclaredImageVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+
+        // Control: the identical configuration without the Dockerfile build does warn, so the
+        // silence above is the classification and not some unrelated difference.
+        var controlSink = new CapturingLoggerSink();
+        var controlBuilder = CreateAppBuilder(controlSink);
+        controlBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var controlApp = controlBuilder.Build();
+
+        await ConfigureResourceAsync(controlApp, "DocumentDB", controlSink);
+
+        Assert.Contains(controlSink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// The published manifest is where the image annotation stops being what runs: a Dockerfile
+    /// build ships a <c>build</c> instruction and no <c>image</c> at all. The storage guard still
+    /// applies — only the version-dependent half of it is withheld.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildPublishesItsBuildRatherThanTheOfficialImage()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Null(manifest["image"]);
+        Assert.NotNull(manifest["build"]);
+        Assert.Equal("/pgdata", manifest["env"]?["DATA_PATH"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// Only the version-dependent half of the storage guard is withheld. The image-independent
+    /// rules — here, a read-only data directory PostgreSQL cannot initialise — still apply to a
+    /// Dockerfile build.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildIsStillSubjectToTheImageIndependentStorageRules()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithVolume("built-data", "/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -3271,6 +3392,45 @@ public class AddDocumentDBTests
         Assert.Empty(entries);
     }
 
+    /// <summary>
+    /// The compatibility file is written to a path that is a property of the official image, and
+    /// the publish rejection exists because that file cannot be shipped by every publisher. A
+    /// Dockerfile build is neither: it keeps the stock behaviour and stays publishable.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDoesNotInjectCompatibilityConfigurationForDockerfileBuilds()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
+
+        Assert.Empty(await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsPublishingADockerfileBuild()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithOpenTelemetryMetrics();
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Null(manifest["image"]);
+        Assert.NotNull(manifest["build"]);
+        Assert.Equal("true", manifest["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+    }
+
     [Fact]
     public async Task WithOpenTelemetryMetricsPreserves0116DefaultServiceName()
     {
@@ -4161,6 +4321,91 @@ public class AddDocumentDBTests
         Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
 
+    [Fact]
+    public async Task WithPostgresEndpointGuardSkippedForDockerfileBuilds()
+    {
+        // The floor is a property of the published release. The tag on a Dockerfile build names
+        // the build's starting point at best, so it is exempt on the same terms as a custom image
+        // — with a warning that says the enforcement was skipped, not a hard failure keyed on a
+        // tag that is not what runs.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.110.0")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        // Must NOT throw, even though the annotated tag is < v0.112.0.
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("Dockerfile", warnings[0].Message, StringComparison.Ordinal);
+        Assert.Contains("NOT enforced", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardStillEnforcedWhenOnlyTheBaseImageIsOverridden()
+    {
+        // WithDockerfileBaseImage() selects base images for a *generated* Dockerfile. There is no
+        // build here to generate one, so it changes nothing about the image this resource pulls
+        // and must not be mistaken for a caller-owned build.
+        var appBuilder = DistributedApplication.CreateBuilder();
+
+#pragma warning disable ASPIREDOCKERFILEBUILDER001
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.110.0")
+            .WithDockerfileBaseImage($"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{InterlockedTag}")
+            .WithPostgresEndpoint();
+#pragma warning restore ASPIREDOCKERFILEBUILDER001
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true));
+
+        Assert.Contains("requires DocumentDB", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorIsNotEnforcedOnDockerfileBuilds()
+    {
+        // pg18-0.113.0 does not exist upstream, but a Dockerfile build never asks the registry
+        // for it: the failure this floor converts into an actionable message cannot happen, so
+        // the guard has nothing to say and — like the custom-image path — says it silently.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg18-0.113.0")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext());
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+
+        // Control: the same tag without the build is still a hard failure.
+        var controlBuilder = DistributedApplication.CreateBuilder();
+        controlBuilder.AddDocumentDB("DocumentDB").WithImageTag("pg18-0.113.0");
+
+        using var controlApp = controlBuilder.Build();
+        var controlResource = Assert.Single(controlApp.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(controlApp, controlResource, useEmptyServices: true));
+    }
+
     private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)
     {
         var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
@@ -4575,5 +4820,33 @@ public class AddDocumentDBTests
             CancellationToken.None);
 
         return entries.ToList();
+    }
+
+    /// <summary>
+    /// Creates a real Dockerfile build context: <c>WithDockerfile(...)</c> resolves and validates
+    /// both paths eagerly.
+    /// </summary>
+    /// <remarks>
+    /// The Dockerfile starts <c>FROM</c> the official image on purpose. Together with the image
+    /// annotation <c>AddDocumentDB</c> installs — which Aspire keeps, and which a caller can
+    /// re-point at the official repository and tag afterwards — it makes the resource look
+    /// official from every angle the package can inspect, which is exactly the case these tests
+    /// exist for.
+    /// </remarks>
+    private static string CreateOfficialLookingDockerfileContext(
+        [CallerMemberName] string? testName = null)
+    {
+        var contextPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "dockerfile-contexts",
+            $"{testName ?? "context"}-{Guid.NewGuid():N}");
+
+        Directory.CreateDirectory(contextPath);
+        File.WriteAllText(
+            Path.Combine(contextPath, "Dockerfile"),
+            $"FROM {DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{InterlockedTag}\n" +
+            "RUN echo caller-owned-layer\n");
+
+        return contextPath;
     }
 }

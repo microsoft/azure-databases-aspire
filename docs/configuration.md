@@ -103,8 +103,9 @@ the AppHost log under the `Aspire.Hosting.DocumentDB.Storage` category (the same
 shared-data-directory warning goes; these are diagnostics about how the resource was configured, and
 they are produced before the container exists). The warning is raised only for images known to
 declare that volume — recognised
-`documentdb-local` tags at `0.116.0` or later. Older tags, unrecognised tags, and custom images
-get no warning, because for them nothing is created at `/data`.
+`documentdb-local` tags at `0.116.0` or later. Older tags, unrecognised tags, custom images, and
+resources built from your own Dockerfile get no warning, because for them nothing is known to be
+created at `/data`.
 
 > **Pin your credentials when you persist data.** The container hashes the configured password into a PostgreSQL role the first time it initialises a data directory, and that role then lives in the volume. `AddDocumentDB` generates a random password when you do not supply one, so the *second* run presents a different password than the one stored in the volume and every connection fails with `MongoAuthenticationException: ... Command saslContinue failed: Invalid key`. The data is intact but unreachable. Pass explicit `userName`/`password` parameters whenever you use `WithDataVolume` or `WithDataBindMount`:
 >
@@ -277,8 +278,9 @@ clusters and are allowed; two at `/data/cluster` are one and are refused.
 One narrow case is downgraded to a warning: both resources resolve to a recognised `0.116.0`-or-
 later tag **and** one of them is started manually with `WithExplicitStart()`. There the pair may
 never run at the same time, and if they do, the image refuses the second start loudly rather than
-corrupting anything. When either side is an older, unrecognised, or custom image, the combination
-stays a hard failure even with `WithExplicitStart()`, because there is no interlock to fall back on.
+corrupting anything. When either side is an older, unrecognised, or custom image — or is built
+from your own Dockerfile, whatever its image annotation says — the combination stays a hard failure
+even with `WithExplicitStart()`, because there is no interlock to fall back on.
 
 Sharing storage that is *not* the peer's data directory is not a conflict: a resource may point
 `WithInitData(...)` or `WithTlsCertificate(...)` at the same host directory another resource uses
@@ -510,9 +512,11 @@ Aspire publish mode is rejected for that exact image when metrics are enabled, b
 publisher carries the required runtime file override. Failing explicitly avoids publishing a
 deployment where metrics are silently disabled. Explicitly disabling metrics does not require the
 override and remains publishable. Direct AppHost run mode is supported. A custom image with
-corrected upstream telemetry configuration is not subject to this guard. A private registry mirror
-that keeps the official `documentdb/documentdb-local:pgNN-0.116.0` image path and tag receives the
-same compatibility override and publish guard.
+corrected upstream telemetry configuration is not subject to this guard, and neither is a resource
+built from your own Dockerfile — even one whose image annotation names the official image and that
+exact tag, because what starts is the build output. A private registry mirror that keeps the
+official `documentdb/documentdb-local:pgNN-0.116.0` image path and tag receives the same
+compatibility override and publish guard.
 
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
@@ -687,6 +691,10 @@ builder.AddProject<Projects.Worker>("worker")
 >   custom non-`pg{NN}-X.Y.Z` strings) bypass the version check with a
 >   one-time warning, so pinning a custom build or pre-release does not break
 >   startup.
+> - **Dockerfile builds.** A resource built with `WithDockerfile(...)` is exempt
+>   on the same terms, with a one-time warning, even when its image annotation
+>   names the curated image and a recognised tag. The build output is what
+>   starts, and the floor is a property of the published release.
 
 ### Generated PostgreSQL connection string
 
@@ -742,6 +750,39 @@ builder.AddDocumentDB("documentdb")
        .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
        .WithImageTag("pg17-0.999.0");
 ```
+
+### Building your own image from a Dockerfile
+
+`WithDockerfile(...)` — and `WithDockerfileFactory(...)` / `WithDockerfileBuilder(...)` — tells
+Aspire to *build* the resource's container image instead of pulling one. Aspire keeps the
+resource's `ContainerImageAnnotation` when you do that, and you can set it yourself afterwards, so
+a Dockerfile-built resource may be labelled
+`ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0` while running something else
+entirely. The published manifest makes this explicit: it emits a `build` object and no `image` at
+all.
+
+This package therefore classifies **any** resource with a Dockerfile build as a custom image of
+unknown version — whatever its repository, tag or digest says, and whatever the Dockerfile's own
+`FROM` line is:
+
+- version floors are not enforced: `WithPostgresEndpoint()` warns once instead of failing, and the
+  `Pg18` publish floor stays silent;
+- `0.116.0`-only storage behaviour is not assumed. There is no declared-`/data`-volume warning, and
+  a data directory shared with another DocumentDB resource stays a hard failure instead of being
+  downgraded to a warning by `WithExplicitStart()`, because nothing establishes that your image
+  still claims the directory with an exclusive `flock`;
+- `WithOpenTelemetryMetrics(...)` does not inject the `0.116.0` compatibility
+  `SetupConfiguration.json`, and does not reject publishing. On a `0.116.0`-or-later base your
+  image's own configuration therefore still wins over the `OTEL_*` variables — configure telemetry
+  inside your Dockerfile, or use the official image instead of building one.
+
+Everything that does not depend on the image version still applies: the connection string, the
+environment variables, the health check, and the image-independent storage rules (a writable data
+directory, one mount per data path, no `--data-path` argument).
+
+Overriding only the base image of a *generated* Dockerfile (`WithDockerfileBaseImage(...)`) is not
+a build. With no Dockerfile to generate, it changes neither the image the resource pulls nor the
+manifest it publishes, so it does not change the classification.
 
 ## Connection string format
 
