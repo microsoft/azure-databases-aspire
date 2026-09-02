@@ -29,6 +29,7 @@ public class Program
     public const string OtelOutputPathEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_OUTPUT";
     public const string OtelEndpointEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_ENDPOINT";
     public const string OtelEnabledEnvironmentVariable = "DOCUMENTDB_FEATURE_OTEL_ENABLED";
+    public const string DataPathArgumentEnvironmentVariable = "DOCUMENTDB_FEATURE_DATA_PATH_ARGUMENT";
 
     /// <summary>Custom credential parameters, two databases, one with a distinct database name.</summary>
     public const string CustomCredentialsMultiDbScenario = "custom-credentials-multi-db";
@@ -204,12 +205,22 @@ public class Program
                 break;
 
             case TelemetryTemporaryDataPathScenario:
-                documentDB
-                    .WithEnvironment("DATA_PATH", "/tmp")
-                    .WithOpenTelemetryMetrics(
-                        endpoint: "http://localhost:4317",
-                        enabled: bool.Parse(GetRequired(OtelEnabledEnvironmentVariable)),
-                        exportInterval: TimeSpan.FromSeconds(1));
+                if (bool.TryParse(
+                        Environment.GetEnvironmentVariable(DataPathArgumentEnvironmentVariable),
+                        out var useDataPathArgument) &&
+                    useDataPathArgument)
+                {
+                    documentDB.WithArgs("--data-path", "/tmp");
+                }
+                else
+                {
+                    documentDB.WithEnvironment("DATA_PATH", "/tmp");
+                }
+
+                documentDB.WithOpenTelemetryMetrics(
+                    endpoint: "http://localhost:4317",
+                    enabled: bool.Parse(GetRequired(OtelEnabledEnvironmentVariable)),
+                    exportInterval: TimeSpan.FromSeconds(1));
                 break;
 
             case Pg15Scenario:

@@ -65,6 +65,10 @@ public static class DocumentDBBuilderExtensions
     private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
     private const string GatewayConfigurationShell = "/bin/bash";
     private const string GatewayConfigurationShellArgumentZero = "--";
+    private const string GatewayValueTakingOptionsShellPattern =
+        "--allow-external-connections|--cert-path|--create-user|--documentdb-port|--enable-telemetry|" +
+        "--init-data|--init-data-path|--key-file|--log-level|--owner|--password|--pg-port|--start-pg|" +
+        "--tlsMode|--toast-compression|--username";
 
     /// <summary>
     /// Builds the wrapper script that makes the OpenTelemetry environment variables this package
@@ -102,7 +106,16 @@ public static class DocumentDBBuilderExtensions
         "if [ ! -r \"$s\" ]; then echo \"aspire-documentdb -- gateway configuration $s is missing or unreadable\" >&2; exit 1; fi; " +
         "if ! command -v jq >/dev/null 2>&1; then echo \"aspire-documentdb -- jq is required to make the OpenTelemetry environment variables authoritative\" >&2; exit 1; fi; " +
         "if ! command -v realpath >/dev/null 2>&1; then echo \"aspire-documentdb -- realpath is required to keep the telemetry configuration outside DATA_PATH\" >&2; exit 1; fi; " +
-        "d=\"$DATA_PATH\"; " +
+        "d=\"$DATA_PATH\"; q=\"\"; " +
+        "for a in \"$@\"; do " +
+            "if [ \"$q\" = \"d\" ]; then d=\"$a\"; q=\"\"; continue; fi; " +
+            "if [ \"$q\" = \"v\" ]; then q=\"\"; continue; fi; " +
+            "case \"$a\" in " +
+                "-d|--data-path) q=\"d\";; " +
+                $"{GatewayValueTakingOptionsShellPattern}) q=\"v\";; " +
+            "esac; " +
+        "done; " +
+        "if [ \"$q\" = \"d\" ]; then echo \"aspire-documentdb -- --data-path requires a value before telemetry configuration can be prepared\" >&2; exit 1; fi; " +
         $"if [ -z \"$d\" ]; then d=\"{DefaultMountedDataPath}\"; fi; " +
         "if ! d=\"$(realpath -m -- \"$d\" 2>/dev/null)\"; then echo \"aspire-documentdb -- DATA_PATH could not be canonicalized for the telemetry configuration\" >&2; exit 1; fi; " +
         "if [ \"$d\" = \"/\" ]; then echo \"aspire-documentdb -- no temporary directory can be safely separated from a root DATA_PATH\" >&2; exit 1; fi; " +

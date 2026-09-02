@@ -600,6 +600,43 @@ public class DocumentDBFeatureMatrixEndToEndTests
         Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
     }
 
+    [Fact]
+    public async Task TelemetryWrapperUsesDataPathArgumentWhenChoosingTemporaryDirectory()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryTemporaryDataPathScenario),
+            (AppHost.OtelEnabledEnvironmentVariable, bool.FalseString),
+            (AppHost.DataPathArgumentEnvironmentVariable, bool.TrueString),
+            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "tmp-argument", "safe", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var command = await GetContainerConfigListAsync(containerId, "Cmd");
+        Assert.Equal("--data-path", command[3]);
+        Assert.Equal("/tmp", command[4]);
+
+        var (exitCode, output) = await RunDockerAsync(
+            "exec", containerId, "/bin/bash", "-c",
+            "find /tmp -maxdepth 1 -type d -name 'aspire-documentdb-otel.*' -print");
+        Assert.True(exitCode == 0, $"Could not inspect DATA_PATH: {output}");
+        Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
+    }
+
     [Theory]
     // No serviceName override: the shipped TelemetryOptions.ServiceName must survive.
     [InlineData(null, "documentdb_gateway")]
