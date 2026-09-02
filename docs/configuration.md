@@ -206,10 +206,20 @@ entrypoint and mounts *before* it evaluates the environment callbacks, and its b
 An environment callback that mutates the model while the entry is being written would therefore land
 on both sides of it at once, and the rules above would have judged a resource the manifest does not
 describe. The safety-relevant structure — the mounts, the endpoints, the membership of the three
-callback pipelines, the entrypoint, the effective image and `WithExplicitStart()` — is recorded
-immediately before the writer is handed the resource and compared again immediately afterwards. Any
-difference fails the publish, which abandons the partly written manifest rather than completing it;
-writing environment values, and re-declaring or reordering the same mounts, are not differences.
+callback pipelines, the entrypoint, the effective image, the container build definition and
+`WithExplicitStart()` — is recorded immediately before the writer is handed the resource and
+compared again immediately afterwards. Any difference fails the publish, which abandons the partly
+written manifest rather than completing it; writing environment values, and re-declaring or
+reordering the same mounts, are not differences.
+
+A container built from a Dockerfile is recorded twice over, because every such build resolves to the
+same effective image and the `build` object is the first thing the writer emits. The annotation's
+identity is recorded, which catches a definition added, removed or swapped — including one whose
+Dockerfile factory changed, which no by-value comparison could see — and so are its values: the
+build arguments and secrets, the image name and tag, whether the image has an entry point, and the
+generated `.dockerignore`. Swapping the definition for an identically valued one is still reported,
+because identical values do not mean an identical Dockerfile. Secrets are recorded as digests, and
+no value of any kind appears in the failure.
 
 In publish mode a `DATA_PATH` supplied as a parameter is a manifest expression, not a path.
 Resolving it is not an option — the value belongs to the deployment, and a parameter may be a

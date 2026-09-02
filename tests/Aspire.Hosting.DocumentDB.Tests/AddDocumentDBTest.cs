@@ -3597,6 +3597,210 @@ public class AddDocumentDBTests
     }
 
     /// <summary>
+    /// Every build definition resolves to the same effective image — "this image is built from a
+    /// Dockerfile the caller owns" — so the image alone cannot tell one from another. Aspire writes
+    /// the whole <c>build</c> object before it evaluates a single environment callback, which is
+    /// what makes swapping the definition from inside one invisible in the entry that was written.
+    /// </summary>
+    [Fact]
+    public async Task ABuildDefinitionReplacedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final"));
+        documentDB.WithEnvironment(context =>
+        {
+            var build = context.Resource.Annotations.OfType<DockerfileBuildAnnotation>().Single();
+            context.Resource.Annotations.Remove(build);
+            context.Resource.Annotations.Add(
+                new DockerfileBuildAnnotation("/elsewhere", "/elsewhere/Dockerfile", "release"));
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("while its manifest entry was being written", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            "the container build definition it publishes was added, removed or replaced",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Replacement is judged by identity even when the replacement carries the same values, because
+    /// <see cref="DockerfileBuildAnnotation.DockerfileFactory"/> generates the Dockerfile's content
+    /// and cannot be compared by value: "the same values" does not mean "the same build".
+    /// </summary>
+    [Fact]
+    public async Task ABuildDefinitionReplacedByAnIdenticallyValuedOneIsStillRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final"));
+        documentDB.WithEnvironment(context =>
+        {
+            var build = context.Resource.Annotations.OfType<DockerfileBuildAnnotation>().Single();
+            context.Resource.Annotations.Remove(build);
+            context.Resource.Annotations.Add(
+                new DockerfileBuildAnnotation(build.ContextPath, build.DockerfilePath, build.Stage));
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains(
+            "the container build definition it publishes was added, removed or replaced",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The build arguments, the image name and tag, the entry-point flag and the generated
+    /// <c>.dockerignore</c> are settable on the annotation that is already there, so replacing it
+    /// is not the only way to change what the entry should have said.
+    /// </summary>
+    [Theory]
+    [InlineData("argument")]
+    [InlineData("image-name")]
+    [InlineData("build-only")]
+    public async Task ABuildDefinitionMutatedInPlaceWhileTheManifestIsWrittenIsRefused(string mutation)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        var build = new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null);
+        build.BuildArguments["ARG_ONE"] = "one";
+        documentDB.WithAnnotation(build);
+
+        documentDB.WithEnvironment(_ =>
+        {
+            switch (mutation)
+            {
+                case "argument":
+                    build.BuildArguments["ARG_TWO"] = "two";
+                    break;
+                case "image-name":
+                    build.ImageName = "contoso/documentdb-fork";
+                    break;
+                default:
+                    build.HasEntrypoint = false;
+                    break;
+            }
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains(
+            "the container build definition it publishes changed",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A build secret changed during serialization is caught like any other part of the definition,
+    /// and neither the value that was recorded nor the one that replaced it appears anywhere in the
+    /// diagnostic.
+    /// </summary>
+    [Fact]
+    public async Task ABuildSecretChangedWhileTheManifestIsWrittenIsRefusedWithoutNamingIt()
+    {
+        const string RecordedSecret = "recorded-build-secret-value";
+        const string ReplacementSecret = "replacement-build-secret-value";
+
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        var build = new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null);
+        build.BuildSecrets["REGISTRY_TOKEN"] = RecordedSecret;
+        documentDB.WithAnnotation(build);
+        documentDB.WithEnvironment(_ => build.BuildSecrets["REGISTRY_TOKEN"] = ReplacementSecret);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains(
+            "the container build definition it publishes changed",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(RecordedSecret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ReplacementSecret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("REGISTRY_TOKEN", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ABuildDefinitionAddedOrRemovedWhileTheManifestIsWrittenIsRefused(bool startsWithBuild)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        if (startsWithBuild)
+        {
+            documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null));
+        }
+
+        documentDB.WithEnvironment(context =>
+        {
+            if (context.Resource.Annotations.OfType<DockerfileBuildAnnotation>().SingleOrDefault() is { } build)
+            {
+                context.Resource.Annotations.Remove(build);
+                return;
+            }
+
+            context.Resource.Annotations.Add(
+                new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null));
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("while its manifest entry was being written", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A build definition nothing touches is published exactly as it would be with no callback at
+    /// all — including its arguments and secrets — and writing environment values alongside it is
+    /// not a structural change.
+    /// </summary>
+    [Fact]
+    public async Task ABuildDefinitionLeftAloneWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+        var withEnvironmentValues = await PublishOnceAsync(builder =>
+            builder.WithEnvironment(context => context.EnvironmentVariables["CONTOSO"] = "value"));
+
+        Assert.Equal("final", expected["build"]?["stage"]?.ToString());
+        Assert.Equal("one", expected["build"]?["args"]?["ARG_ONE"]?.ToString());
+        Assert.Equal("env", expected["build"]?["secrets"]?["REGISTRY_TOKEN"]?["type"]?.ToString());
+        Assert.Equal(expected["build"]?.ToJsonString(), withEnvironmentValues["build"]?.ToJsonString());
+        Assert.Equal("value", withEnvironmentValues["env"]?["CONTOSO"]?.ToString());
+
+        static async Task<JsonNode> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(name: "documentdb-data");
+            var build = new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final");
+            build.BuildArguments["ARG_ONE"] = "one";
+            build.BuildSecrets["REGISTRY_TOKEN"] = "recorded-build-secret-value";
+            documentDB.WithAnnotation(build);
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return await PublishManifestAsync(app, "DocumentDB");
+        }
+    }
+
+    /// <summary>
     /// A resource taken out of the manifest has no published entry to check, and a caller's own
     /// writer still writes the entry it would have written.
     /// </summary>
@@ -4288,6 +4492,15 @@ public class AddDocumentDBTests
         Assert.DoesNotContain("\"/tmp|/data/cluster\"", script, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Two bind sources that are different directories leave every candidate usable, and the
+    /// emitted script is the one a resource with no mounts gets. This is also where the documented
+    /// limit sits: sources are compared as written, so two spellings that name one directory only
+    /// through a symbolic link are treated as different storage here. Resolving them would require
+    /// the path to exist on the machine building the model — which a bind source aimed at a VM,
+    /// a remote daemon, or a directory Docker has yet to create does not — and would make the
+    /// published manifest depend on the publishing machine's filesystem.
+    /// </summary>
     [Fact]
     public async Task ATemporaryRootBackedByDifferentStorageIsLeftAlone()
     {

@@ -1654,12 +1654,19 @@ public static class DocumentDBBuilderExtensions
     /// resolution and needs no filesystem access.
     /// </para>
     /// <para>
-    /// Symbolic links are deliberately <em>not</em> resolved. Doing so requires the directory to
-    /// exist at model-build time, and would make the answer depend on the state of the host
-    /// filesystem at a moment that has nothing to do with the run — two spellings that resolve to
-    /// one directory only after a link is created would be judged differently before and after.
-    /// Two DocumentDB resources aimed at one directory through different symlinks are therefore
-    /// not detected; the <c>0.116.0</c> and later interlock still refuses the overlap at runtime.
+    /// Symbolic links are deliberately not resolved, and that is a bounded limitation rather than
+    /// an oversight. Resolving one needs the whole path to exist on the machine building the model
+    /// — <see cref="Directory.ResolveLinkTarget(string, bool)"/> throws for a path that does not,
+    /// and resolves no intermediate link component of a longer path — and a bind source routinely
+    /// does not exist there: the daemon may be in a VM or on another machine entirely, and a
+    /// publish has no daemon at all. Resolving what does exist locally would also make the emitted
+    /// container command, and therefore the manifest, depend on the publishing machine's
+    /// filesystem, which is the one property this package's manifest handling is built to avoid.
+    /// Two bind sources that name one directory only through a link are therefore compared as
+    /// written and treated as different storage. The container's own <c>realpath</c> still resolves
+    /// links inside the image at runtime, Docker resolves the bind source on the daemon side, and
+    /// the <c>0.116.0</c> data-directory interlock still refuses two clusters on one directory, so
+    /// what is lost is the early diagnosis and not the protection.
     /// </para>
     /// </remarks>
     private static string CanonicalizeHostPath(string source)
@@ -2171,6 +2178,7 @@ public static class DocumentDBBuilderExtensions
         System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
         string? Entrypoint,
         DocumentDBEffectiveImage Image,
+        ManifestBuildSnapshot Build,
         bool ExplicitlyStarted);
 
     private static ManifestStructureSnapshot CaptureManifestStructure(DocumentDBServerResource resource) =>
@@ -2182,6 +2190,7 @@ public static class DocumentDBBuilderExtensions
             [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
             resource.Entrypoint,
             ResolveEffectiveImage(resource),
+            CaptureManifestBuild(resource),
             resource.Annotations.OfType<ExplicitStartupAnnotation>().Any());
 
     /// <summary>
@@ -2192,6 +2201,139 @@ public static class DocumentDBBuilderExtensions
         string.Create(
             CultureInfo.InvariantCulture,
             $"{endpoint.Name}\u0000{endpoint.UriScheme}\u0000{endpoint.Protocol}\u0000{endpoint.Transport}\u0000{endpoint.Port}\u0000{endpoint.TargetPort}\u0000{endpoint.IsExternal}\u0000{endpoint.TargetHost}");
+
+    /// <summary>
+    /// The container build definitions a manifest entry's <c>build</c> object is written from,
+    /// recorded both by instance and by value.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two recordings are needed because the annotation is mutable in two different ways.
+    /// <see cref="DockerfileBuildAnnotation.ContextPath"/>,
+    /// <see cref="DockerfileBuildAnnotation.DockerfilePath"/>,
+    /// <see cref="DockerfileBuildAnnotation.Stage"/> and
+    /// <see cref="DockerfileBuildAnnotation.DockerfileFactory"/> are fixed when the annotation is
+    /// constructed, so the only way to change them is to replace the annotation — which the
+    /// instances catch, and which the values could not, because a factory delegate cannot be
+    /// compared by value at all. Everything else — the build arguments and secrets, the image name
+    /// and tag, whether the image has an entry point, the generated <c>.dockerignore</c> content —
+    /// is settable on the annotation that is already there, which the instances cannot catch and
+    /// the values can.
+    /// </para>
+    /// <para>
+    /// Both matter here because Aspire writes the whole <c>build</c> object before it evaluates a
+    /// single environment callback: the effective image alone cannot tell one build definition from
+    /// another, since every one of them resolves to the same "this image is built from a Dockerfile
+    /// the caller owns" answer.
+    /// </para>
+    /// </remarks>
+    private sealed record ManifestBuildSnapshot(
+        System.Collections.Immutable.ImmutableArray<DockerfileBuildAnnotation> Definitions,
+        System.Collections.Immutable.ImmutableArray<string> Descriptions);
+
+    private static ManifestBuildSnapshot CaptureManifestBuild(IResource resource)
+    {
+        System.Collections.Immutable.ImmutableArray<DockerfileBuildAnnotation> definitions =
+            [.. resource.Annotations.OfType<DockerfileBuildAnnotation>()];
+
+        return new(definitions, [.. definitions.Select(DescribeBuildForSeal)]);
+    }
+
+    /// <summary>
+    /// Compares the build definitions by identity, in order. Order is compared because Aspire
+    /// writes the entry from the <em>single</em> build annotation a resource carries and refuses
+    /// the entry outright when there is more than one, so no legitimate reordering exists.
+    /// </summary>
+    private static bool SameBuildDefinitions(ManifestBuildSnapshot current, ManifestBuildSnapshot recorded)
+    {
+        if (current.Definitions.Length != recorded.Definitions.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < current.Definitions.Length; index++)
+        {
+            // Identity, not equality: two annotations can be indistinguishable by value and still
+            // carry two different Dockerfile factories.
+            if (!ReferenceEquals(current.Definitions[index], recorded.Definitions[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Everything a build definition contributes to the manifest, in a fixed order, with the
+    /// arguments and secrets keyed rather than positional so that re-declaring them in a different
+    /// order is not reported as a change.
+    /// </summary>
+    /// <remarks>
+    /// Build arguments are described by the value Aspire itself writes into the manifest, because
+    /// that is what the published artifact carries; a build secret is described by its kind and a
+    /// digest instead, because the annotation may hold a literal secret and this package has no
+    /// reason to keep a second copy of one. Neither ever reaches a diagnostic: the failure names
+    /// the kind of change and no value at all.
+    /// </remarks>
+    private static string DescribeBuildForSeal(DockerfileBuildAnnotation build)
+    {
+        var parts = new List<string>
+        {
+            build.ContextPath,
+            build.DockerfilePath,
+            build.Stage ?? "-",
+            build.ImageName ?? "-",
+            build.ImageTag ?? "-",
+            build.HasEntrypoint ? "entrypoint" : "build-only",
+            build.BuildContextIgnoreContent is { } ignore ? "ignore=" + DigestForSeal(ignore) : "-",
+        };
+
+        foreach (var (key, value) in build.BuildArguments.OrderBy(argument => argument.Key, StringComparer.Ordinal))
+        {
+            parts.Add("arg=" + key + "=" + DescribeBuildValueForSeal(value));
+        }
+
+        foreach (var (key, value) in build.BuildSecrets.OrderBy(secret => secret.Key, StringComparer.Ordinal))
+        {
+            parts.Add("secret=" + key + "=" + DescribeBuildSecretForSeal(value));
+        }
+
+        return string.Join('\u0000', parts);
+    }
+
+    /// <summary>
+    /// A build argument as the manifest writer renders it, so that a change of rendering is a
+    /// change here too.
+    /// </summary>
+    private static string DescribeBuildValueForSeal(object? value) =>
+        value switch
+        {
+            null => "null",
+            string text => "s:" + text,
+            IManifestExpressionProvider expression => "x:" + expression.ValueExpression,
+            bool flag => flag ? "b:true" : "b:false",
+            _ => "o:" + value.ToString(),
+        };
+
+    /// <summary>
+    /// A build secret by kind and digest. A file secret is described by its path, which is what the
+    /// manifest carries for it and is not itself the secret.
+    /// </summary>
+    private static string DescribeBuildSecretForSeal(object? value) =>
+        value switch
+        {
+            FileInfo file => "file:" + file.FullName,
+            null => "env:null",
+            _ => "env:" + DigestForSeal(DescribeBuildValueForSeal(value)),
+        };
+
+    /// <summary>
+    /// A one-way digest, so a value can be compared with itself later without being retained.
+    /// </summary>
+    private static string DigestForSeal(string value) =>
+        Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value)));
 
     /// <summary>
     /// Fails the publish when the model changed while the resource's manifest entry was being
@@ -2231,6 +2373,10 @@ public static class DocumentDBBuilderExtensions
                 ? "its container entrypoint changed"
             : !after.Image.Equals(before.Image)
                 ? "the image it will run changed"
+            : !SameBuildDefinitions(after.Build, before.Build)
+                ? "the container build definition it publishes was added, removed or replaced"
+            : !after.Build.Descriptions.SequenceEqual(before.Build.Descriptions, StringComparer.Ordinal)
+                ? "the container build definition it publishes changed"
             : after.ExplicitlyStarted != before.ExplicitlyStarted
                 ? "its explicit-start setting changed"
             : null;
