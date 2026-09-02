@@ -2647,6 +2647,17 @@ public static class DocumentDBBuilderExtensions
     /// because they are written after the callbacks and their order is the order of the manifest's
     /// own binding keys.
     /// </para>
+    /// <para>
+    /// The image is recorded twice, because the two recordings answer different questions.
+    /// <see cref="Image"/> is what this package knows about the release — the repository, the tag,
+    /// the digest, the version the floors are judged on — and it deliberately says nothing about
+    /// which registry the image is pulled from, since a mirror of the curated repository is the
+    /// same release. <see cref="Reference"/> is the string the manifest actually carries, which
+    /// does include the registry. Without it a registry swapped from inside an environment
+    /// callback is invisible: <c>WithImageRegistry("mirror.example")</c> leaves every field of
+    /// <see cref="Image"/> untouched, so the entry publishes <c>ghcr.io/...</c> while the model
+    /// names the mirror and the checkpoint compares equal.
+    /// </para>
     /// </remarks>
     private sealed record ManifestStructureSnapshot(
         System.Collections.Immutable.ImmutableArray<string> Mounts,
@@ -2656,9 +2667,45 @@ public static class DocumentDBBuilderExtensions
         System.Collections.Immutable.ImmutableArray<ContainerRuntimeArgsCallbackAnnotation> RuntimeCallbacks,
         string? Entrypoint,
         DocumentDBEffectiveImage Image,
+        string? Reference,
         ManifestBuildSnapshot Build,
         bool ExplicitlyStarted,
         ConnectionStringSecuritySnapshot Security);
+
+    /// <summary>
+    /// The image reference the resource's manifest entry carries, composed by the same authority
+    /// that composes the one Aspire writes, or <see langword="null"/> when the entry carries no
+    /// image at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>ManifestPublishingContext.WriteContainerAsync</c> emits <c>image</c> from
+    /// <see cref="ResourceExtensions.TryGetContainerImageName(IResource, out string?)"/>, so this
+    /// is literally the value that was written rather than a re-derivation of it — the
+    /// <c>registry/</c> prefix, the <c>:tag</c> suffix and the <c>@sha256:</c> form a digest pin
+    /// takes are all exactly as the published entry spells them. That is the whole point: the
+    /// registry is a field of <see cref="ContainerImageAnnotation"/> that no other part of this
+    /// snapshot records, because no rule in this package judges a release by the host it is
+    /// mirrored on.
+    /// </para>
+    /// <para>
+    /// A container build the caller owns is excluded rather than recorded, because for such a
+    /// resource the reference is not what is published. The writer emits <c>build</c> and no
+    /// <c>image</c> at all, and the reference
+    /// <see cref="ResourceExtensions.TryGetContainerImageName(IResource, out string?)"/> would
+    /// compose for it is the build's own generated
+    /// <see cref="DockerfileBuildAnnotation.ImageName"/> and
+    /// <see cref="DockerfileBuildAnnotation.ImageTag"/> — which
+    /// <see cref="ManifestBuildSnapshot"/> already records in full, along with everything else the
+    /// <c>build</c> object is written from. Recording it here as well would put a string the
+    /// manifest never carries into the verdict, and would report a registry set on an annotation
+    /// the entry does not publish as though the published entry had been falsified.
+    /// </para>
+    /// </remarks>
+    private static string? CaptureManifestImageReference(IResource resource) =>
+        resource.Annotations.OfType<DockerfileBuildAnnotation>().Any()
+            ? null
+            : resource.TryGetContainerImageName(out var reference) ? reference : null;
 
     /// <summary>
     /// The security state of the connection string a resource publishes, as it stood when the
@@ -2704,6 +2751,7 @@ public static class DocumentDBBuilderExtensions
             [.. resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>()],
             resource.Entrypoint,
             ResolveEffectiveImage(resource),
+            CaptureManifestImageReference(resource),
             CaptureManifestBuild(resource),
             resource.Annotations.OfType<ExplicitStartupAnnotation>().Any(),
             CaptureConnectionStringSecurity(resource, resource));
@@ -2888,6 +2936,8 @@ public static class DocumentDBBuilderExtensions
                 ? "its container entrypoint changed"
             : !after.Image.Equals(before.Image)
                 ? "the image it will run changed"
+            : !string.Equals(after.Reference, before.Reference, StringComparison.Ordinal)
+                ? "the exact image reference it publishes changed — the registry it is pulled from, or some other part of the reference that names no different release"
             : !SameBuildDefinitions(after.Build, before.Build)
                 ? "the container build definition it publishes was added, removed or replaced"
             : !after.Build.Descriptions.SequenceEqual(before.Build.Descriptions, StringComparer.Ordinal)
@@ -2918,7 +2968,8 @@ public static class DocumentDBBuilderExtensions
             $"connection the way it was before the change. The publish is failed and the partly " +
             $"written manifest is abandoned rather than completed. Recovery: configure the resource " +
             $"while the application model is being built (WithDataVolume(), WithDataBindMount(...), " +
-            $"WithEndpoint(...), WithImageTag(...), UseTls(...), AllowInsecureTls(...)) instead of " +
+            $"WithEndpoint(...), WithImage(...), WithImageTag(...), WithImageRegistry(...), " +
+            $"UseTls(...), AllowInsecureTls(...)) instead of " +
             $"mutating it from a WithEnvironment(...) callback.");
     }
 
@@ -4717,7 +4768,9 @@ public static class DocumentDBBuilderExtensions
             // environment callbacks, so the structure this checkpoint just judged is only the
             // structure the manifest describes for as long as nothing changes it while the writer
             // is running. A supported WithEnvironment(...) callback can add, remove or replace a
-            // mount, re-point an endpoint or swap the image from inside that evaluation.
+            // mount, re-point an endpoint, swap the image or re-point the registry it is pulled
+            // from, all from inside that evaluation. A caller's own writer, which this checkpoint
+            // delegates to below, can do exactly the same.
             var structure = CaptureManifestStructure(resource);
 
             // Whatever would have written this resource had the checkpoint not been installed

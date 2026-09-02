@@ -3492,6 +3492,151 @@ public class AddDocumentDBTests
         Assert.Contains("the image it will run changed", exception.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A registry swapped from inside the environment evaluation names the same release, so
+    /// nothing this package knows about the image changes: the repository is still the curated
+    /// one, the tag is still the same version, and every floor still answers the same. What does
+    /// change is the reference the entry carries — and Aspire wrote that reference before the
+    /// callback ran, so the published manifest would send every deployment to the registry the
+    /// resource was configured with rather than the one it ended up naming.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryChangedWhileTheManifestIsWrittenIsRefusedAfterTheOldOneWasAlreadyEmitted()
+    {
+        const string Mirror = "mirror.example";
+
+        var written = $"{QualifiedOfficialImage}:{DocumentDBContainerImageTags.Tag}";
+        var modelled = $"{Mirror}/{DocumentDBContainerImageTags.Image}:{DocumentDBContainerImageTags.Tag}";
+
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithEnvironment(_ => documentDB.WithImageRegistry(Mirror));
+
+        using var app = appBuilder.Build();
+
+        var (failure, entry) = await WriteManifestExpectingFailureAsync(app, "DocumentDB");
+
+        // The writer had already emitted the registry the resource was configured with.
+        Assert.Contains($"\"image\":\"{written}\"", entry, StringComparison.Ordinal);
+        Assert.DoesNotContain(Mirror, entry, StringComparison.Ordinal);
+
+        // The model, by then, names the mirror instead.
+        Assert.True(documentDB.Resource.TryGetContainerImageName(out var reference));
+        Assert.Equal(modelled, reference);
+
+        // And the checkpoint refuses the publish rather than shipping the entry that disagrees.
+        Assert.Contains("while its manifest entry was being written", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("the exact image reference it publishes changed", failure.Message, StringComparison.Ordinal);
+
+        // The reference is configuration, not a credential, but neither reference is needed to say
+        // what went wrong and neither is put in the message.
+        Assert.DoesNotContain(written, failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(modelled, failure.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The refusal is a refusal of the whole publish, exactly as it is for every other structural
+    /// change: <c>aspire publish</c> exits non-zero and leaves no usable manifest behind.
+    /// </summary>
+    [Fact]
+    public async Task APublishThatChangesTheRegistryWhileWritingFailsClosed()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+            documentDB.WithEnvironment(_ => documentDB.WithImageRegistry("mirror.example"));
+        });
+
+        Assert.Contains("while its manifest entry was being written", log, StringComparison.Ordinal);
+        Assert.Contains("the exact image reference it publishes changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A caller's own writer is delegated to rather than displaced, so it is just as able to change
+    /// the model between the field it wrote and the checkpoint that judges it — and it is judged
+    /// the same way.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryChangedByADelegatedCustomWriterIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithManifestPublishingCallback(async context =>
+        {
+            await context.WriteContainerAsync(documentDB.Resource);
+            documentDB.WithImageRegistry("mirror.example");
+        });
+
+        using var app = appBuilder.Build();
+
+        var (failure, entry) = await WriteManifestExpectingFailureAsync(app, "DocumentDB");
+
+        Assert.Contains(
+            $"\"image\":\"{QualifiedOfficialImage}:{DocumentDBContainerImageTags.Tag}\"",
+            entry,
+            StringComparison.Ordinal);
+        Assert.Contains("the exact image reference it publishes changed", failure.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Negative control: a registry re-declared as the one it already was changes no byte of the
+    /// entry, so the publish is the one an unmutated model produces.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryReDeclaredIdenticallyWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+
+        var reDeclared = await PublishOnceAsync(documentDB => documentDB.WithEnvironment(
+            _ => documentDB.WithImageRegistry(DocumentDBContainerImageTags.Registry)));
+
+        Assert.Equal(
+            $"{QualifiedOfficialImage}:{DocumentDBContainerImageTags.Tag}",
+            expected["image"]?.ToString());
+        Assert.Equal(expected.ToJsonString(), reDeclared.ToJsonString());
+
+        static async Task<JsonNode> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(name: "documentdb-data");
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return await PublishManifestAsync(app, "DocumentDB");
+        }
+    }
+
+    /// <summary>
+    /// Negative control: a container build the caller owns publishes <c>build</c> and no
+    /// <c>image</c> at all, so the composed reference is not what the entry carries and a registry
+    /// set on the annotation beside the build falsifies nothing that was written. What protects
+    /// such a resource is the build-definition snapshot, which records the whole <c>build</c>
+    /// object — and which the other tests in this section drive.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryChangedOnADockerfileBuildWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+
+        var mutated = await PublishOnceAsync(documentDB => documentDB.WithEnvironment(
+            _ => documentDB.WithImageRegistry("mirror.example")));
+
+        Assert.Null(expected["image"]);
+        Assert.Equal("final", expected["build"]?["stage"]?.ToString());
+        Assert.Equal(expected.ToJsonString(), mutated.ToJsonString());
+
+        static async Task<JsonNode> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+            documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final"));
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return await PublishManifestAsync(app, "DocumentDB");
+        }
+    }
+
     [Fact]
     public async Task AnEntrypointChangedWhileTheManifestIsWrittenIsRefused()
     {
@@ -10062,6 +10207,23 @@ public class AddDocumentDBTests
             .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
 
         return await ManifestUtils.GetManifest(resource);
+    }
+
+    /// <summary>
+    /// Writes the resource's manifest entry through Aspire's real writer expecting the checkpoint
+    /// to refuse it, and returns the refusal together with the entry text the writer had already
+    /// produced.
+    /// </summary>
+    private static async Task<(InvalidOperationException Failure, string Entry)> WriteManifestExpectingFailureAsync(
+        DistributedApplication app,
+        string resourceName)
+    {
+        await PublishBeforeStartAsync(app);
+
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
+
+        return await ManifestUtils.WriteResourceExpectingFailureAsync(resource);
     }
 
     private static async Task<IExecutionConfigurationResult> BuildExecutionConfigurationAsync(
