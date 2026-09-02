@@ -30,6 +30,8 @@ public class DocumentDBStorageGuardStartupTests
     [InlineData(Scenarios.AboveRootMountTargetScenario, "reaches above the container root")]
     [InlineData(Scenarios.ReservedDataPathArgumentScenario, "passes the command-line argument '--data-path'")]
     [InlineData(Scenarios.SharedDataDirectoryScenario, "as their data directory")]
+    [InlineData(Scenarios.DeferredDataPathArgumentScenario, "reads an option name")]
+    [InlineData(Scenarios.LateDataPathOverrideScenario, "mounts its data directory ('/pgdata') read-only")]
     public async Task AnUnusableDataStorageConfigurationFailsTheResourceOnARealStart(string scenario, string expected)
     {
         RequireDocker();
@@ -57,6 +59,42 @@ public class DocumentDBStorageGuardStartupTests
             + hostLog.ToString();
 
         Assert.Contains(expected, diagnostics, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The guard's advisory warnings have to survive the pass Aspire makes over the environment
+    /// callbacks while discovering a container's dependencies — that pass attaches no logger, and
+    /// its result is what the one-shot cache hands to everything afterwards. This asserts the
+    /// warning still reaches the AppHost's log on a real start.
+    /// </summary>
+    [Fact]
+    public async Task AnAdvisoryWarningReachesTheAppHostLogOnARealStart()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scope = SetScenario(Scenarios.DeclaredVolumeWarningScenario);
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Scenarios>(cts.Token);
+
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        await app.StartAsync(cts.Token);
+
+        // The warning is written while the container's configuration is built, which is after the
+        // resource is first reported as starting; polling avoids depending on exactly which state
+        // transition that falls between, and does not need a healthy container.
+        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
+        while (DateTime.UtcNow < deadline &&
+               !hostLog.ToString().Contains("anonymous volume", StringComparison.Ordinal))
+        {
+            await Task.Delay(TimeSpan.FromSeconds(1), cts.Token);
+        }
+
+        Assert.Contains("stores data at '/pgdata'", hostLog.ToString(), StringComparison.Ordinal);
+        Assert.Contains("anonymous volume", hostLog.ToString(), StringComparison.Ordinal);
     }
 
     private static IDisposable SetScenario(string scenario)

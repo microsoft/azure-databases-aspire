@@ -305,6 +305,30 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 **Solution:** set the data directory through storage: `WithDataVolume()`, `WithDataBindMount(...)`, or `WithEnvironment("DATA_PATH", ...)`. Remove the argument.
 
+### A command-line argument "is only known later"
+
+**Symptom:** starting or publishing the resource throws an `InvalidOperationException` saying it `passes a command-line argument whose value is only known later ... in a position where the container entrypoint reads an option name`.
+
+**Cause:** the token is a parameter or a `ReferenceExpression`, so its value does not exist yet. It could resolve to `--data-path`, which would move the data directory past every storage check, and the only way to rule that out would be to resolve the token a second time — duplicating the evaluation Aspire is about to make, and risking a secret ending up somewhere it does not belong.
+
+**Solution:** write option names as literal strings. A deferred value is fine as an option's *operand* — `WithArgs("--log-level", level)` or `WithArgs("--password", password)` — because the entrypoint reads that position as a value, never as an option name. Note that an option taking no value (`--skip-init-data`, `--disable-extended-rum`) and an option that already carries its value (`--log-level=debug`) do not shelter the token after them.
+
+### `DATA_PATH` from a parameter is rejected when publishing
+
+**Symptom:** `aspire publish` (or manifest generation) throws an `InvalidOperationException` saying the resource `sets DATA_PATH to a value that is only known at deployment time, and also mounts storage`.
+
+**Cause:** in publish mode a parameter is a manifest expression, not a path, so the data directory cannot be identified. The read-only, duplicate-mount and shared-data-directory rules would all be skipped silently, and a manifest that puts two DocumentDB resources on one data directory would be published without complaint. The value is deliberately not resolved: it belongs to the deployment, and a parameter may be a secret.
+
+**Solution:** give `DATA_PATH` a literal container path — or leave it to `WithDataVolume()`/`WithDataBindMount(...)` — and use a parameter for the storage *source* if that is what varies per environment. Run mode is unaffected: there the value is resolved once and checked normally.
+
+### A callback registered after the guard fails the resource
+
+**Symptom:** the resource fails with an `InvalidOperationException` saying it `has a later environment callback registered after its data-storage guard` (or `command-line callback`).
+
+**Cause:** the storage guard is appended when the application starts and moved back to the end of both pipelines immediately before the resource starts, so it sees the final `DATA_PATH` and the final argument list. Something appended another callback after that — a `BeforeResourceStartedEvent` subscriber registered after `AddDocumentDB`, or, in publish mode where no such event is published, an `IDistributedApplicationLifecycleHook`. The guard cannot vouch for a configuration that is still changing, so the resource is failed rather than started on an unchecked data directory.
+
+**Solution:** make the configuration part of the application model — `WithDataVolume()`, `WithDataBindMount(...)`, `WithEnvironment("DATA_PATH", ...)`, `WithArgs(...)` — instead of adding it after the model is built. If a subscriber must add it, register that subscriber before `AddDocumentDB`.
+
 ### "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory"
 
 **Symptom:** A container using a bind-mounted data directory logs

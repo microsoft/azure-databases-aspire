@@ -98,8 +98,11 @@ persistence is intentional.
 On `0.116.0` and later, mounting on `/data` is also the *only* way to suppress the anonymous
 volume: neither Docker nor Aspire can un-declare an image `VOLUME`. Leaving `targetPath` at its
 default does that for you. A non-default `targetPath` still stores data where you asked, but an
-unused anonymous volume is created at `/data` on every run, and the resource logs a warning saying
-so. The warning is raised only for images known to declare that volume — recognised
+unused anonymous volume is created at `/data` on every run, and a warning saying so is written to
+the AppHost log under the `Aspire.Hosting.DocumentDB.Storage` category (the same place the
+shared-data-directory warning goes; these are diagnostics about how the resource was configured, and
+they are produced before the container exists). The warning is raised only for images known to
+declare that volume — recognised
 `documentdb-local` tags at `0.116.0` or later. Older tags, unrecognised tags, and custom images
 get no warning, because for them nothing is created at `/data`.
 
@@ -157,10 +160,27 @@ nothing sets it — or when it is set to an empty value, which the entrypoint's
 The checks run inside the resource's own configuration pipeline, as its last environment callback,
 so they read the final value rather than recomputing it: a callback that answers differently each
 time it runs is evaluated once, and the guard and the container cannot see different directories.
-The canonical path replaces `DATA_PATH`, so the value the container receives is the value that was
-checked. Nothing else is read or resolved — the password and every other environment value are left
-exactly as the callbacks produced them. In publish mode a `DATA_PATH` supplied as a parameter stays
-a manifest expression and is left alone; it is checked when the resource starts.
+The canonical path replaces `DATA_PATH` — and is written even when nothing else set it, so an image
+whose own default is somewhere other than `/data` cannot write to a directory the checks never
+looked at. Nothing else is read or resolved: the password and every other environment value are
+left exactly as the callbacks produced them.
+
+The guard takes the last position twice and then verifies it. It is appended when the application
+starts, and moved back to the end of both pipelines immediately before the resource starts, which
+covers `IDistributedApplicationLifecycleHook.BeforeStartAsync` and any `BeforeStartEvent` subscriber
+registered after `AddDocumentDB` — both of which run after the guard is installed and can add more
+callbacks. Anything that appends later still — a `BeforeResourceStartedEvent` subscriber registered
+after `AddDocumentDB`, or, in publish mode where no per-resource event is published, a lifecycle
+hook — makes the resource fail rather than start on a data directory nothing checked. Configure
+storage through the application model rather than after it is built, or register such a subscriber
+before `AddDocumentDB`.
+
+In publish mode a `DATA_PATH` supplied as a parameter is a manifest expression, not a path.
+Resolving it is not an option — the value belongs to the deployment, and a parameter may be a
+secret — so a resource that supplies one *and* mounts storage is refused: every rule below would
+otherwise be silently skipped, and a manifest putting two DocumentDB resources on one data
+directory would publish without complaint. A resource that mounts nothing has no storage to get
+wrong, so there the expression is kept. Run mode resolves the value once and checks it normally.
 
 Container paths are compared the way the container runtime resolves them: repeated separators
 collapse, and `.` and `..` segments are resolved before the mount is created. `/data`, `/data/`,
@@ -179,6 +199,9 @@ read-only and duplicate rules apply to it. The most specific mount wins, matchin
 boundaries: a mount on `/data/cluster` takes precedence over one on `/data`, and `/database` is not
 below `/data`.
 
+When `DATA_PATH` is set to an empty value, or is not set at all, the container default `/data`
+applies and is written into the environment as such.
+
 ### The entrypoint's `--data-path` argument is reserved
 
 The container entrypoint accepts `--data-path`, documented by the image as "Overrides DATA_PATH
@@ -190,9 +213,15 @@ before the container is created. `-d` is refused with it: today's entrypoint ans
 later. Use `WithDataVolume()`, `WithDataBindMount(...)` or `WithEnvironment("DATA_PATH", ...)`
 instead.
 
-Only literal string arguments are examined. An argument supplied as a parameter is left alone:
-inspecting it would mean resolving it a second time, and replacing it with its resolved value would
-discard the sensitivity Aspire tracks for parameters.
+A token whose value only arrives later — a parameter, or a `ReferenceExpression` — cannot be read
+without resolving it, and resolving it here would duplicate the evaluation Aspire is about to make
+and risk putting a secret somewhere it does not belong. Such a token is therefore refused wherever
+the entrypoint would read an option name, because it could resolve to `--data-path`. It is accepted
+in the one position where it cannot be an option: directly after a literal option that takes a
+value, which is the entrypoint's own `--option value` grammar. So `WithArgs("--log-level", level)`
+is fine, while `WithArgs(flag, "/pgdata")`, `WithArgs("--skip-init-data", flag)` (that option takes
+no value, so the next token is read as an option name) and `WithArgs("--log-level=debug", flag)`
+(the option already carries its value) are refused.
 
 ### The data directory must be writable
 
@@ -229,14 +258,23 @@ fail with an explanatory `InvalidOperationException`. Each resource registers th
 directory occupies while its own configuration is built, so the second one to reach the same
 storage is the one that fails — which is also the one whose container the image would refuse.
 
-"Same storage" means the same source *and* the same directory inside it. Bind-mount sources are
-compared as host paths, so `/srv/documentdb`, `/srv/documentdb/`, `/srv/documentdb/.` and
-`/srv/documentdb/../documentdb` are one directory. (Symbolic links are not followed: two resources
-aimed at one directory through different links are not detected here, and on `0.116.0` and later the
-container's own lock still refuses the overlap.) When a shared volume is mounted at a common
-ancestor, the subdirectory `DATA_PATH` names is part of the comparison: two resources on one volume
-at `/data/alpha` and `/data/beta` are two clusters and are allowed; two at `/data/cluster` are one
-and are refused.
+"Same storage" means the same directory, not the same pair of strings.
+
+For a **bind mount** that directory is one host path: the mount source with whatever part of
+`DATA_PATH` falls below the mount target appended, resolved with the host's own rules. So a resource
+that binds `/srv/documentdb` at `/data` and writes to `/data/cluster` and a resource that binds
+`/srv/documentdb/cluster` at `/data` are recognised as the one directory they share, in either
+declaration order — and `/srv/documentdb`, `/srv/documentdb/`, `/srv/documentdb/.` and
+`/srv/documentdb/../documentdb` are all that same source. Because the comparison is the host's,
+`/data/Cluster` and `/data/cluster` are one directory on macOS and Windows and two on Linux, exactly
+as they are on disk. (Symbolic links are not followed: two resources aimed at one directory through
+different links are not detected here, and on `0.116.0` and later the container's own lock still
+refuses the overlap.)
+
+For a **volume** the identity is the volume name plus the subdirectory, compared exactly — a volume
+name is not a path and cannot be combined with one, and the container reads that subdirectory on its
+own case-sensitive filesystem. Two resources on one volume at `/data/alpha` and `/data/beta` are two
+clusters and are allowed; two at `/data/cluster` are one and are refused.
 
 One narrow case is downgraded to a warning: both resources resolve to a recognised `0.116.0`-or-
 later tag **and** one of them is started manually with `WithExplicitStart()`. There the pair may
