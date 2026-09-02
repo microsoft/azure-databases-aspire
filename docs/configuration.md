@@ -218,6 +218,17 @@ where the database is written, since a database publishes nothing but the string
 The expression is kept only as a digest and never appears in a failure: it carries the resource's
 credentials.
 
+Both checkpoints — the server's and each database's — have to be the last manifest callback on their
+resource to run at all, because the publisher reads the last one and no other. Events alone cannot
+guarantee that: the app host publishes `BeforePublishEvent` to every subscriber and only then runs
+the publishing pipeline, so a subscriber registered after `AddDocumentDB` — including one a lifecycle
+hook registers — can call `WithManifestPublishingCallback(...)` after this package has taken the last
+position back, and the checkpoint would simply never run. Every checkpoint is therefore recorded on
+its resource and put back from a single publishing-pipeline configuration callback, which the app
+host runs when it resolves the pipeline's steps: after the last subscriber, and before the step that
+writes the manifest. A caller's own writer still writes the entry it would have written, and
+`ExcludeFromManifest()` still excludes the resource.
+
 The image is settled before any of this, and before the app host prepares a single container. The
 app host snapshots a container's image into the orchestrator's container spec while it prepares
 resources, which is before endpoints are allocated and before the resource-start event, and nothing
@@ -241,11 +252,31 @@ replace `USERNAME` or `PASSWORD` out from under the generated connection string,
 replaces the entry point, and a bare operand would be read as the image. All of those fail the
 resource, in every spelling the runtime accepts — `--option value`, `--option=value`, the attached
 short form `-eDATA_PATH=...`, `--env-file`, and values contributed by another callback — as does a
-token whose value is only known later sitting where the runtime reads an option name. The arguments
-are parsed with the runtime's own grammar rather than searched, so `--label -v` passes a label,
-`--memory 512m` is not a mount, and `--cap-add`, `--network`, `--pull`, `--platform`, `--dns`,
-`--ulimit`, `--sysctl`, `-it` and the rest reach the runtime untouched. No operand appears in the
-failure, which names the option and, for an environment option, the variable.
+token whose value is only known later sitting where the runtime reads an option name.
+
+The grammar is the union of the two runtimes the app host drives, because which one is behind the
+arguments is not this package's to know. Podman accepts everything Docker does and adds options with
+no Docker equivalent that reach the same places: `--secret` mounts a file (or, with `type=env`, sets
+a variable), `--image-volume` decides what becomes of the image's own `VOLUME` declarations, and
+`--init-path` bind-mounts a host binary, so all three are refused as storage; `--env-host` imports
+the entire host environment and `--unsetenv-all` clears every variable the image declares, including
+the canonical `DATA_PATH` written above, so both are refused outright, while `--env-merge` and
+`--unsetenv` name the one variable they touch and are refused only when that variable is one this
+package owns; and `--rootfs` replaces the image with a directory, so it is refused as displacing the
+sealed image. An explicit `--option=false` on a value-less option is the caller declining it, and is
+passed through.
+
+The arguments are parsed with the runtimes' own grammar rather than searched, so `--label -v` passes
+a label, `--memory 512m` is not a mount, and `--cap-add`, `--network`, `--pull`, `--platform`,
+`--dns`, `--ulimit`, `--sysctl`, `-it` — and Podman's `--pod`, `--tz`, `--systemd`, `--sdnotify`,
+`--uidmap`, `--authfile`, `--seccomp-policy` and the rest — reach the runtime untouched.
+
+No value the caller wrote appears in the failure. What is named is the option spelling this
+package's own table holds and, for an environment option, the package-owned variable name this
+package itself chose; an operand is never named, and neither is a bare positional token. An operand
+is where a mount source, a variable's value or a password lives, and a positional token is where a
+caller who resolved a connection string themselves would have put it — including as a parameter or a
+reference expression, which are read by position only and never resolved.
 
 A container built from a Dockerfile is recorded twice over, because every such build resolves to the
 same effective image and the `build` object is the first thing the writer emits. The annotation's

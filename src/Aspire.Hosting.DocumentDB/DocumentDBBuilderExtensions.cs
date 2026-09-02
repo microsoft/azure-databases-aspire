@@ -452,8 +452,56 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Marks a resource's manifest checkpoint so that one prerequisite can put every DocumentDB
+    /// checkpoint — a server's and a database's alike — back in the position the publisher reads,
+    /// without knowing what kind of resource carries it.
+    /// </summary>
+    /// <remarks>
+    /// The checkpoints are installed while the model is built and are moved back to last at each
+    /// lifecycle event, but an event is not the last word: a <see cref="BeforeStartEvent"/> or
+    /// <see cref="Publishing.BeforePublishEvent"/> subscriber registered after this package runs
+    /// after this package's own, and one that calls
+    /// <c>WithManifestPublishingCallback(...)</c> displaces the
+    /// checkpoint for good — the publisher reads the last annotation and no other, so the
+    /// checkpoint simply never runs and the entry is written unjudged. Recording the checkpoint on
+    /// the resource is what lets
+    /// <see cref="RestoreManifestCheckpoints"/> find every one of them at a phase no subscriber can
+    /// be registered after.
+    /// </remarks>
+    private sealed class DocumentDBManifestCheckpointAnnotation(ManifestPublishingCallbackAnnotation checkpoint)
+        : IResourceAnnotation
+    {
+        public ManifestPublishingCallbackAnnotation Checkpoint { get; } = checkpoint;
+    }
+
+    /// <summary>
+    /// Puts every DocumentDB manifest checkpoint in the model back in the position the publisher
+    /// reads.
+    /// </summary>
+    /// <remarks>
+    /// Servers and databases together, because both publish something this package is answerable
+    /// for and both can be displaced the same way. Exclusion and a caller's own writer are
+    /// preserved: <see cref="EstablishManifestCheckpoint"/> leaves a callback-less annotation —
+    /// Aspire's <c>ExcludeFromManifest()</c> — in place and takes the checkpoint out, and the
+    /// checkpoint hands the writing on to whatever it displaced.
+    /// </remarks>
+    private static void RestoreManifestCheckpoints(DistributedApplicationModel model)
+    {
+        foreach (var resource in model.Resources)
+        {
+            // Snapshot first: establishing a checkpoint adds to and removes from the same
+            // annotation collection this is reading.
+            foreach (var marked in resource.Annotations.OfType<DocumentDBManifestCheckpointAnnotation>().ToArray())
+            {
+                EstablishManifestCheckpoint(resource, marked.Checkpoint);
+            }
+        }
+    }
+
+    /// <summary>
     /// Seals the image every DocumentDB resource in the model will run, at the last phase that is
-    /// guaranteed to precede the orchestrator's own reading of it.
+    /// guaranteed to precede the orchestrator's own reading of it, and registers the prerequisite
+    /// that puts the manifest checkpoints back after the last subscriber can have displaced them.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -480,19 +528,24 @@ public static class DocumentDBBuilderExtensions
     /// <see cref="VerifyImageSeal"/>.
     /// </para>
     /// <para>
-    /// Run mode only. A publish never prepares a container: the manifest is written from the model
-    /// at serialization time, which is later than every lifecycle phase, so there the model is the
-    /// authority and sealing it would report ordinary publish-time configuration as a change. What
-    /// protects a publish is the manifest checkpoint, which judges the resource while it is being
-    /// serialized.
+    /// Sealing is run mode only. A publish never prepares a container: the manifest is written from
+    /// the model at serialization time, which is later than every lifecycle phase, so there the
+    /// model is the authority and sealing it would report ordinary publish-time configuration as a
+    /// change. What protects a publish is the manifest checkpoint, which judges the resource while
+    /// it is being serialized — and which the same hook keeps in the position the publisher reads,
+    /// see <see cref="RegisterManifestCheckpointPrerequisite"/>.
     /// </para>
     /// </remarks>
 #pragma warning disable CS0618 // The lifecycle-hook phase has no eventing equivalent that runs after every BeforeStartEvent subscriber.
-    private sealed class DocumentDBImageSealLifecycleHook(DistributedApplicationExecutionContext executionContext)
+    private sealed class DocumentDBImageSealLifecycleHook(
+        DistributedApplicationExecutionContext executionContext,
+        IServiceProvider services)
         : IDistributedApplicationLifecycleHook
     {
         public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
         {
+            RegisterManifestCheckpointPrerequisite(services, appModel);
+
             if (!executionContext.IsRunMode)
             {
                 return Task.CompletedTask;
@@ -507,6 +560,55 @@ public static class DocumentDBBuilderExtensions
         }
     }
 #pragma warning restore CS0618
+
+    /// <summary>
+    /// Registers the one prerequisite that runs after every event subscriber and before the
+    /// publisher serializes anything: a pipeline configuration callback that puts every DocumentDB
+    /// manifest checkpoint back in the position the publisher reads.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The events are not enough on their own. Aspire publishes
+    /// <see cref="Publishing.BeforePublishEvent"/> and only then executes the publishing pipeline,
+    /// and a subscriber registered after this package's — from an app host, or from a lifecycle
+    /// hook, both of which are ordinary — runs after this package has taken the last position
+    /// back. If that subscriber calls
+    /// <c>WithManifestPublishingCallback(...)</c> on a resource, its
+    /// annotation is appended behind the checkpoint, the publisher reads the last annotation and no
+    /// other, and the checkpoint never runs at all: the entry is written from a callback that can
+    /// change the parent's TLS settings halfway through, with nothing left to notice.
+    /// </para>
+    /// <para>
+    /// A pipeline configuration callback closes that window. Aspire resolves the pipeline's steps
+    /// once, inside the publishing pipeline and before the first step runs — the manifest is
+    /// written by a step — and configuration callbacks are the first thing that resolution does.
+    /// That is strictly after <see cref="Publishing.BeforePublishEvent"/> has been published to
+    /// every subscriber and strictly before anything is serialized, which is the whole of what the
+    /// checkpoints need. The callback is registered once per application, from the hook that
+    /// already runs once per application, and it is idempotent: it only moves annotations that are
+    /// already there.
+    /// </para>
+    /// <para>
+    /// The per-event retakes are kept as well. They are what keeps the checkpoints in place for the
+    /// resource-level rules that read them earlier, and this prerequisite is the last word rather
+    /// than a replacement for them.
+    /// </para>
+    /// </remarks>
+    private static void RegisterManifestCheckpointPrerequisite(IServiceProvider services, DistributedApplicationModel model)
+    {
+#pragma warning disable ASPIREPIPELINES001 // The publishing pipeline is the only phase after every event subscriber and before serialization.
+        if (services.GetService<Pipelines.IDistributedApplicationPipeline>() is not { } pipeline)
+        {
+            return;
+        }
+
+        pipeline.AddPipelineConfiguration(_ =>
+        {
+            RestoreManifestCheckpoints(model);
+            return Task.CompletedTask;
+        });
+#pragma warning restore ASPIREPIPELINES001
+    }
 
     private static void SealLaunchImage(DocumentDBServerResource resource)
     {
@@ -715,10 +817,13 @@ public static class DocumentDBBuilderExtensions
         });
 
         resource.Annotations.Add(checkpoint);
+        resource.Annotations.Add(new DocumentDBManifestCheckpointAnnotation(checkpoint));
 
         // ExcludeFromManifest() and WithManifestPublishingCallback() both append after this, and
         // the publisher reads only the last annotation, so the position is taken back at the two
-        // phases a publish raises before it serializes anything.
+        // phases a publish raises before it serializes anything — and, after every subscriber those
+        // phases can reach, by the publishing-pipeline prerequisite that
+        // RegisterManifestCheckpointPrerequisite installs.
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
         {
             EstablishManifestCheckpoint(resource, checkpoint);
@@ -1725,6 +1830,7 @@ public static class DocumentDBBuilderExtensions
         resource.Annotations.Add(environmentCallback);
         resource.Annotations.Add(argumentsCallback);
         resource.Annotations.Add(runtimeCheckpoint);
+        resource.Annotations.Add(new DocumentDBManifestCheckpointAnnotation(manifestCheckpoint));
         EstablishManifestCheckpoint(resource, guard.ManifestCheckpoint);
     }
 
@@ -2902,15 +3008,19 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// <para>
     /// <see cref="ContainerResourceBuilderExtensions.WithContainerRuntimeArgs{T}(IResourceBuilder{T}, string[])"/>
-    /// hands its arguments to <c>docker run</c> ahead of the image, so they are not part of the
-    /// model: <c>--mount</c>, <c>-v</c>, <c>--volume</c>, <c>--volumes-from</c> and <c>--tmpfs</c>
-    /// add storage with no <see cref="ContainerMountAnnotation"/> to read, <c>--read-only</c> makes
-    /// the data directory unwritable without one either, <c>--env</c> sets <c>DATA_PATH</c>
-    /// without an <see cref="EnvironmentCallbackAnnotation"/>, and <c>--entrypoint</c> replaces the
-    /// entry point without touching <see cref="ContainerResource.Entrypoint"/>. Every storage rule
-    /// in this package is written against the model, so each of those reaches past all of them:
-    /// a read-only mount added this way starts a container DocumentDB cannot initialise, and a
-    /// shared one puts two clusters on one directory, with nothing reported either time.
+    /// hands its arguments to <c>docker run</c> or <c>podman run</c> ahead of the image, so they
+    /// are not part of the model: <c>--mount</c>, <c>-v</c>, <c>--volume</c>,
+    /// <c>--volumes-from</c>, <c>--tmpfs</c> and Podman's <c>--secret</c>, <c>--image-volume</c>
+    /// and <c>--init-path</c> add storage with no <see cref="ContainerMountAnnotation"/> to read,
+    /// <c>--read-only</c> makes the data directory unwritable without one either, <c>--env</c>
+    /// sets <c>DATA_PATH</c> without an <see cref="EnvironmentCallbackAnnotation"/> — as do
+    /// Podman's <c>--env-host</c>, <c>--env-merge</c>, <c>--unsetenv</c> and
+    /// <c>--unsetenv-all</c> — <c>--entrypoint</c> replaces the entry point without touching
+    /// <see cref="ContainerResource.Entrypoint"/>, and Podman's <c>--rootfs</c> replaces the image
+    /// with a directory. Every storage rule in this package is written against the model, so each
+    /// of those reaches past all of them: a read-only mount added this way starts a container
+    /// DocumentDB cannot initialise, and a shared one puts two clusters on one directory, with
+    /// nothing reported either time.
     /// </para>
     /// <para>
     /// Read here rather than where the arguments are written, because only the last
@@ -2923,53 +3033,70 @@ public static class DocumentDBBuilderExtensions
     /// spellings; see <see cref="DocumentDBContainerRuntimeArguments"/>. A search would refuse
     /// <c>--label -v</c>, which passes a label, and accept <c>--mount=type=bind,...</c>, which
     /// mounts. Ordinary arguments — <c>--cap-add</c>, <c>--network</c>, <c>--memory</c>,
-    /// <c>--pull</c>, <c>--platform</c>, <c>--dns</c> — are passed through untouched.
+    /// <c>--pull</c>, <c>--platform</c>, <c>--dns</c>, and the Podman-only <c>--pod</c>,
+    /// <c>--tz</c>, <c>--systemd</c> — are passed through untouched.
     /// </para>
     /// <para>
-    /// No value ever reaches the message: an operand is where a mount source, a variable's value or
-    /// a password would be, so only the option's name — and, for an environment option, the name of
-    /// the variable it sets — is reported.
+    /// No value the caller wrote ever reaches the message, whether it is a literal or a parameter
+    /// resolved later. What is reported is the option spelling this package's own table holds and,
+    /// for an environment option, the package-owned variable name this package itself chose; an
+    /// operand is never reported at all, and neither is a positional token. An operand is where a
+    /// mount source, a variable's value or a password lives, and a positional token is where a
+    /// caller would have written a connection string — so the rule is that a diagnostic names what
+    /// this package already knew, and nothing it read.
     /// </para>
     /// </remarks>
     private static void RejectRawRuntimeArguments(IResource resource, ContainerRuntimeArgsCallbackContext context)
     {
-        var finding = DocumentDBContainerRuntimeArguments.Read(
-            context.Args,
-            s_guardOwnedEnvironmentVariables.Contains);
+        var finding = DocumentDBContainerRuntimeArguments.Read(context.Args, ResolveGuardOwnedEnvironmentVariable);
 
         if (finding.Verdict == DocumentDBRuntimeArgumentVerdict.Harmless)
         {
             return;
         }
 
+        // Only ever a spelling from this package's own tables, so the interpolation below cannot
+        // carry anything the caller wrote.
+        var option = finding.Option is { } named
+            ? finding.Variable is { } variable ? $"'{named} {variable}'" : $"'{named}'"
+            : null;
+
         var (what, recovery) = finding.Verdict switch
         {
             DocumentDBRuntimeArgumentVerdict.Storage =>
-                ($"'{finding.Option}', which changes what the container mounts",
+                ($"{option}, which changes what the container mounts",
                  "declare storage in the application model instead — WithDataVolume(), " +
                  "WithDataBindMount(...), WithVolume(...) or WithBindMount(...) — so the " +
                  "read-only, duplicate-mount and shared-data-directory rules can see it"),
 
             DocumentDBRuntimeArgumentVerdict.Environment =>
-                ($"'{finding.Option}', which sets an environment variable this package has already decided",
+                ($"{option}, which sets, imports or clears an environment variable this package " +
+                 $"has already decided",
                  $"set it through the model instead — WithDataVolume(), WithDataBindMount(...) or " +
                  $"WithEnvironment(\"{DataPathEnvVarName}\", ...) for the data directory, and the " +
                  $"userName/password parameters of AddDocumentDB(...) for the credentials"),
 
             DocumentDBRuntimeArgumentVerdict.Entrypoint =>
-                ($"'{finding.Option}', which replaces the image's entry point",
+                ($"{option}, which replaces the image's entry point",
                  "leave the entry point to the image, or set it on the resource " +
                  "(ContainerResource.Entrypoint) so the model describes what runs"),
 
             DocumentDBRuntimeArgumentVerdict.Image =>
-                ($"'{finding.Option}', which the runtime reads as the image and which would " +
-                 $"displace the one this run was sealed on",
+                (option is null
+                    ? "a positional operand, which the runtime reads as the image and which would " +
+                      "displace the one this run was sealed on"
+                    : $"{option}, which decides what the runtime runs and would displace the image " +
+                      $"this run was sealed on",
                  "choose the image with WithImage(...), WithImageTag(...), WithImageRegistry(...) " +
                  "or WithDockerfile(...) while the application model is being built"),
 
             _ =>
-                ("a value that is only known later, in a position where the runtime reads an " +
-                 "option name — so it could be any of --mount, -v, --tmpfs, --env or --entrypoint",
+                (option is null
+                    ? "a value that is only known later, in a position where the runtime reads an " +
+                      "option name or the image — so it could be any of --mount, -v, --secret, " +
+                      "--tmpfs, --env, --entrypoint or the image itself"
+                    : $"a value that is only known later as the operand of {option}, so the " +
+                      $"variable it names cannot be read without resolving it",
                  "pass option names as literal strings; a deferred value is fine as the operand of " +
                  "one, as in WithContainerRuntimeArgs(\"--network\", network)"),
         };
@@ -2982,8 +3109,21 @@ public static class DocumentDBBuilderExtensions
             $"cannot initialise, a shared one puts two clusters on one data directory, and a " +
             $"replaced entry point or data directory silently discards everything that was checked. " +
             $"The resource is failed instead of being started on storage that was never judged. " +
-            $"Recovery: {recovery}.");
+            $"No value from the argument is reported here, because that is where a credential would " +
+            $"be. Recovery: {recovery}.");
     }
+
+    /// <summary>
+    /// This package's own spelling of a guard-owned environment variable, or <see langword="null"/>
+    /// when the name is not one of them.
+    /// </summary>
+    /// <remarks>
+    /// The name that comes back is the one held in
+    /// <see cref="s_guardOwnedEnvironmentVariables"/>, never the caller's token, which is what lets
+    /// a diagnostic name the variable without naming anything that was read.
+    /// </remarks>
+    private static string? ResolveGuardOwnedEnvironmentVariable(string name) =>
+        s_guardOwnedEnvironmentVariables.TryGetValue(name, out var owned) ? owned : null;
 
     /// <summary>
     /// The container entrypoint options that consume the token after them, so that a deferred

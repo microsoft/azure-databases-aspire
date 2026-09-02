@@ -14,13 +14,16 @@ internal enum DocumentDBRuntimeArgumentVerdict
     /// <summary>An option that mounts, un-mounts or re-points storage.</summary>
     Storage,
 
-    /// <summary>An option that sets or imports an environment variable this package owns.</summary>
+    /// <summary>An option that sets, imports, rewrites or clears environment this package owns.</summary>
     Environment,
 
     /// <summary>An option that replaces the image's entry point.</summary>
     Entrypoint,
 
-    /// <summary>An operand that would be read as the image, displacing the sealed one.</summary>
+    /// <summary>
+    /// An option or operand that decides what the runtime runs, displacing the image the run was
+    /// sealed on.
+    /// </summary>
     Image,
 
     /// <summary>
@@ -34,12 +37,18 @@ internal enum DocumentDBRuntimeArgumentVerdict
 /// </summary>
 /// <param name="Verdict">What the arguments do.</param>
 /// <param name="Option">
-/// The option responsible, by name only. Never an operand: an operand is where a mount source, a
-/// variable's value or a password would be, and this string reaches diagnostics.
+/// The option responsible, or <see langword="null"/> when no option is. This is always one of the
+/// spellings held in this class's own tables, never a token the caller supplied — see the class
+/// remarks.
+/// </param>
+/// <param name="Variable">
+/// The package-owned environment variable an environment option names, or <see langword="null"/>.
+/// This is always the name the owner itself supplied, never a token the caller supplied.
 /// </param>
 internal readonly record struct DocumentDBRuntimeArgumentFinding(
     DocumentDBRuntimeArgumentVerdict Verdict,
-    string? Option)
+    string? Option,
+    string? Variable)
 {
     public static DocumentDBRuntimeArgumentFinding Harmless => default;
 }
@@ -68,7 +77,19 @@ internal readonly record struct DocumentDBRuntimeArgumentFinding(
 /// mount however the token after it reads. Only options that can actually reach storage, this
 /// package's environment or the entry point are refused; everything else the runtime accepts is
 /// passed through, which is what keeps <c>--cap-add</c>, <c>--network</c>, <c>--memory</c>,
-/// <c>--label</c>, <c>--pull</c> and the rest usable.
+/// <c>--label</c>, <c>--pull</c>, <c>--pod</c>, <c>--tz</c> and the rest usable.
+/// </para>
+/// <para>
+/// The grammar is the union of the two runtimes Aspire drives, because which one is behind the
+/// arguments is not this package's to know. Podman accepts everything Docker does and adds options
+/// with no Docker equivalent that reach exactly the same places: <c>--secret</c> mounts a file or
+/// sets a variable, <c>--image-volume</c> decides what happens to the image's own volumes,
+/// <c>--init-path</c> bind-mounts a host binary, <c>--env-host</c> imports the whole host
+/// environment, <c>--env-merge</c> rewrites a variable the image already carries,
+/// <c>--unsetenv</c> and <c>--unsetenv-all</c> remove variables the guard wrote, and
+/// <c>--rootfs</c> makes the operand a root filesystem path instead of an image. Their arities are
+/// taken from the <c>podman-run</c> option reference, so an operand of a Podman-only option is
+/// never mistaken for one of these or for the image.
 /// </para>
 /// <para>
 /// Unknown options are read as flags rather than as value-taking options. That is the fail-closed
@@ -77,14 +98,35 @@ internal readonly record struct DocumentDBRuntimeArgumentFinding(
 /// option whose <em>value</em> is spelled exactly like a mount or entry-point option, which no real
 /// configuration does.
 /// </para>
+/// <para>
+/// <strong>Nothing the caller wrote is ever reported.</strong> A finding carries an option spelling
+/// and, for an environment option, a variable name — and both are returned from this class's own
+/// tables or from the owner's own set, never from the token that was read. Operands are never
+/// carried at all. That is what keeps a mount source, a variable's value, a positional token, or a
+/// parameter or reference expression standing in for one, out of every diagnostic this produces:
+/// any of them can be a credential, and a container-runtime argument is exactly where a caller
+/// would put one.
+/// </para>
 /// </remarks>
 internal static class DocumentDBContainerRuntimeArguments
 {
     /// <summary>
-    /// Options that add, remove or re-point container storage. <c>--read-only</c> is here because
-    /// it makes every path that is not a mount unwritable, which is the same failure as mounting
-    /// the data directory read-only.
+    /// The end-of-options terminator. A literal of this class, so naming it in a diagnostic carries
+    /// nothing the caller wrote.
     /// </summary>
+    private const string OptionTerminator = "--";
+
+    /// <summary>
+    /// Options that add, remove or re-point container storage.
+    /// </summary>
+    /// <remarks>
+    /// <c>--read-only</c> is here because it makes every path that is not a mount unwritable, which
+    /// is the same failure as mounting the data directory read-only. The Podman-only three are
+    /// storage by the same test: <c>--secret</c> mounts a file into the container (and with
+    /// <c>type=env</c> sets a variable instead, which is no better), <c>--image-volume</c> decides
+    /// whether the image's own <c>VOLUME</c> declarations become volumes, a tmpfs or nothing, and
+    /// <c>--init-path</c> bind-mounts a host binary into the container.
+    /// </remarks>
     private static readonly HashSet<string> s_storageOptions = new(StringComparer.Ordinal)
     {
         "--mount",
@@ -93,18 +135,47 @@ internal static class DocumentDBContainerRuntimeArguments
         "--volumes-from",
         "--tmpfs",
         "--read-only",
+        "--secret",
+        "--image-volume",
+        "--init-path",
     };
 
     /// <summary>
-    /// Options that set or import environment variables. Whether one of them matters depends on
-    /// the variable it names, which is the caller's to decide — see
-    /// <see cref="Read(IEnumerable{object}, Func{string, bool})"/>.
+    /// Environment options whose effect is confined to the variable they name, so whether they
+    /// matter is decided by that name.
     /// </summary>
-    private static readonly HashSet<string> s_environmentOptions = new(StringComparer.Ordinal)
+    /// <remarks>
+    /// <c>--env</c>/<c>-e</c> set one variable; Podman's <c>--env-merge</c> rewrites one the image
+    /// already carries, and <c>--unsetenv</c> removes one. All three name their variable to the
+    /// left of the first <c>=</c>, so one that names a variable this package does not own is
+    /// ordinary configuration and is passed through.
+    /// </remarks>
+    private static readonly HashSet<string> s_scopedEnvironmentOptions = new(StringComparer.Ordinal)
     {
         "--env",
         "-e",
+        "--env-merge",
+        "--unsetenv",
+    };
+
+    /// <summary>
+    /// Environment options whose reach cannot be read from the token, and which are therefore
+    /// refused outright.
+    /// </summary>
+    /// <remarks>
+    /// <c>--env-file</c> names a file whose contents decide which variables are set, and reading it
+    /// here would be a second reading of a file the runtime reads at start. Podman's
+    /// <c>--env-host</c> imports the entire host environment, which is where a stray
+    /// <c>DATA_PATH</c>, <c>USERNAME</c> or <c>PASSWORD</c> would come from, and
+    /// <c>--unsetenv-all</c> clears every variable the image declares — including the canonical
+    /// <c>DATA_PATH</c> this package writes, which would drop the container back onto whatever
+    /// directory its own default names.
+    /// </remarks>
+    private static readonly HashSet<string> s_unscopedEnvironmentOptions = new(StringComparer.Ordinal)
+    {
         "--env-file",
+        "--env-host",
+        "--unsetenv-all",
     };
 
     private static readonly HashSet<string> s_entrypointOptions = new(StringComparer.Ordinal)
@@ -113,20 +184,33 @@ internal static class DocumentDBContainerRuntimeArguments
     };
 
     /// <summary>
-    /// The <c>docker run</c> options that consume the token after them, so that the token is an
-    /// operand rather than the next option.
+    /// Options that decide what the runtime runs. Podman's <c>--rootfs</c> makes the operand a path
+    /// to an exploded container rather than an image reference, so the run would not be the run
+    /// that was sealed at all.
+    /// </summary>
+    private static readonly HashSet<string> s_imageOptions = new(StringComparer.Ordinal)
+    {
+        "--rootfs",
+    };
+
+    /// <summary>
+    /// Every <c>docker run</c> and <c>podman run</c> option that consumes the token after it, so
+    /// that the token is an operand rather than the next option — and, just as importantly, not the
+    /// bare operand the runtime would read as the image.
     /// </summary>
     /// <remarks>
-    /// Taken from the <c>docker run</c> reference. Options this package refuses outright are in the
-    /// set too, because their arity still decides how the rest of the line is read when a refusal
-    /// is turned into a report rather than a throw.
+    /// The union of the two references. Options this package refuses outright are in the set too,
+    /// because their arity still decides how the rest of the line is read. Boolean options are
+    /// deliberately absent, and so is anything neither runtime documents: an unknown option is read
+    /// as a flag, which keeps a following <c>--mount</c> visible.
     /// </remarks>
     private static readonly HashSet<string> s_valueTakingOptions = new(StringComparer.Ordinal)
     {
+        // Shared by both runtimes.
         "--add-host", "--annotation", "--attach", "-a", "--blkio-weight", "--blkio-weight-device",
         "--cap-add", "--cap-drop", "--cgroup-parent", "--cgroupns", "--cidfile", "--cpu-period",
         "--cpu-quota", "--cpu-rt-period", "--cpu-rt-runtime", "--cpu-shares", "-c", "--cpus",
-        "--cpuset-cpus", "--cpuset-mems", "--device", "--device-cgroup-rule",
+        "--cpuset-cpus", "--cpuset-mems", "--detach-keys", "--device", "--device-cgroup-rule",
         "--device-read-bps", "--device-read-iops", "--device-write-bps", "--device-write-iops",
         "--dns", "--dns-option", "--dns-search", "--domainname", "--entrypoint", "--env", "-e",
         "--env-file", "--expose", "--gpus", "--group-add", "--health-cmd", "--health-interval",
@@ -140,6 +224,21 @@ internal static class DocumentDBContainerRuntimeArguments
         "--runtime", "--security-opt", "--shm-size", "--stop-signal", "--stop-timeout",
         "--storage-opt", "--sysctl", "--tmpfs", "--ulimit", "--user", "-u", "--userns", "--uts",
         "--volume", "-v", "--volume-driver", "--volumes-from", "--workdir", "-w",
+
+        // Podman only. Present so that their operands are read as operands: without them a
+        // '--pod mypod' would leave 'mypod' looking like the bare operand the runtime reads as the
+        // image, and ordinary Podman configuration would be refused.
+        "--arch", "--authfile", "--cert-dir", "--cgroup-conf", "--cgroups", "--chrootdirs",
+        "--conmon-pidfile", "--creds", "--decryption-key", "--env-merge", "--gidmap",
+        "--group-entry", "--health-log-destination", "--health-max-log-count",
+        "--health-max-log-size", "--health-on-failure", "--health-startup-cmd",
+        "--health-startup-interval", "--health-startup-retries", "--health-startup-success",
+        "--health-startup-timeout", "--hosts-file", "--hostuser", "--image-volume", "--init-path",
+        "--os", "--passwd-entry", "--personality", "--pidfile", "--pod", "--pod-id-file",
+        "--preserve-fd", "--preserve-fds", "--rdt-class", "--requires", "--retry", "--retry-delay",
+        "--sdnotify", "--seccomp-policy", "--secret", "--shm-size-systemd", "--signature-policy",
+        "--subgidname", "--subuidname", "--systemd", "--timeout", "--tz", "--uidmap", "--umask",
+        "--unsetenv", "--variant",
     };
 
     /// <summary>
@@ -153,26 +252,28 @@ internal static class DocumentDBContainerRuntimeArguments
             .Select(option => option[1])];
 
     /// <summary>
-    /// Reads <paramref name="arguments"/> and reports the first token that could change storage,
-    /// an environment variable <paramref name="ownsEnvironmentVariable"/> claims, or the entry
-    /// point.
+    /// Reads <paramref name="arguments"/> and reports the first token that could change storage, an
+    /// environment variable <paramref name="resolveOwnedVariable"/> claims, the entry point, or
+    /// what the runtime runs.
     /// </summary>
     /// <param name="arguments">
     /// The final argument list, as the runtime will receive it. Entries that are not
     /// <see cref="string"/> are values Aspire resolves afterwards; they are read by position only,
-    /// never resolved — resolving one here would duplicate Aspire's own evaluation of it and could
-    /// pull a secret into this package.
+    /// never resolved and never rendered — resolving one here would duplicate Aspire's own
+    /// evaluation of it, and rendering one would pull a parameter's value into this package.
     /// </param>
-    /// <param name="ownsEnvironmentVariable">
-    /// Whether a variable of that name is one whose value this package has already decided, and
-    /// which therefore may not be set from outside the model.
+    /// <param name="resolveOwnedVariable">
+    /// Given a variable name, the owner's own spelling of it when it is one whose value this
+    /// package has already decided, and <see langword="null"/> otherwise. The owner's spelling is
+    /// what a finding carries, so a name read from the arguments is used to look up and then
+    /// discarded.
     /// </param>
     internal static DocumentDBRuntimeArgumentFinding Read(
         IEnumerable<object> arguments,
-        Func<string, bool> ownsEnvironmentVariable)
+        Func<string, string?> resolveOwnedVariable)
     {
         ArgumentNullException.ThrowIfNull(arguments);
-        ArgumentNullException.ThrowIfNull(ownsEnvironmentVariable);
+        ArgumentNullException.ThrowIfNull(resolveOwnedVariable);
 
         var tokens = arguments as IReadOnlyList<object> ?? [.. arguments];
 
@@ -189,7 +290,8 @@ internal static class DocumentDBContainerRuntimeArguments
             {
                 expectOperand = false;
 
-                if (pendingOption is { } option && !JudgeOperand(option, argument, ownsEnvironmentVariable, out var operandFinding))
+                if (pendingOption is { } option &&
+                    !JudgeOperand(option, argument, resolveOwnedVariable, out var operandFinding))
                 {
                     return operandFinding;
                 }
@@ -201,25 +303,28 @@ internal static class DocumentDBContainerRuntimeArguments
             if (argument is not string token)
             {
                 // An option name is the one position where a value that is not yet known cannot be
-                // ruled out: it could resolve to '--mount', '-v' or '--entrypoint'.
-                return new(DocumentDBRuntimeArgumentVerdict.Undecidable, null);
+                // ruled out: it could resolve to '--mount', '-v', '--secret' or '--entrypoint'. It
+                // is also the position a bare operand occupies, so it could equally be the image.
+                return new(DocumentDBRuntimeArgumentVerdict.Undecidable, null, null);
             }
 
-            if (token == "--")
+            if (token == OptionTerminator)
             {
                 // Option parsing ends here. Everything after is positional, and the first
                 // positional is the image; on its own the terminator supplies none, so the image
                 // Aspire appends is still the image.
                 return index + 1 < tokens.Count
-                    ? new(DocumentDBRuntimeArgumentVerdict.Image, token)
+                    ? new(DocumentDBRuntimeArgumentVerdict.Image, OptionTerminator, null)
                     : DocumentDBRuntimeArgumentFinding.Harmless;
             }
 
             if (token.Length > 0 && token[0] != '-')
             {
                 // A bare operand is read as the image, and the image Aspire appends becomes the
-                // command. The run would not be the run that was sealed.
-                return new(DocumentDBRuntimeArgumentVerdict.Image, token);
+                // command. The run would not be the run that was sealed. The token itself is not
+                // reported: it is a value, and this is exactly where a caller would have written a
+                // reference that carries credentials.
+                return new(DocumentDBRuntimeArgumentVerdict.Image, null, null);
             }
 
             if (token.StartsWith("--", StringComparison.Ordinal))
@@ -228,7 +333,7 @@ internal static class DocumentDBContainerRuntimeArguments
                 var name = separator < 0 ? token : token[..separator];
                 var inlineValue = separator < 0 ? null : token[(separator + 1)..];
 
-                if (!JudgeOption(name, inlineValue, ownsEnvironmentVariable, out var finding))
+                if (!JudgeOption(name, inlineValue, resolveOwnedVariable, out var finding))
                 {
                     return finding;
                 }
@@ -242,7 +347,7 @@ internal static class DocumentDBContainerRuntimeArguments
                 continue;
             }
 
-            if (!ReadShortOptionCluster(token, ownsEnvironmentVariable, out var clusterFinding, out var clusterPending))
+            if (!ReadShortOptionCluster(token, resolveOwnedVariable, out var clusterFinding, out var clusterPending))
             {
                 return clusterFinding;
             }
@@ -264,7 +369,7 @@ internal static class DocumentDBContainerRuntimeArguments
     /// </summary>
     private static bool ReadShortOptionCluster(
         string token,
-        Func<string, bool> ownsEnvironmentVariable,
+        Func<string, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding,
         out string? pendingOption)
     {
@@ -282,7 +387,7 @@ internal static class DocumentDBContainerRuntimeArguments
                 ? (rest is not null && rest[0] == '=' ? rest[1..] : rest)
                 : null;
 
-            if (!JudgeOption(name, inlineValue, ownsEnvironmentVariable, out finding))
+            if (!JudgeOption(name, inlineValue, resolveOwnedVariable, out finding))
             {
                 return false;
             }
@@ -302,41 +407,79 @@ internal static class DocumentDBContainerRuntimeArguments
     }
 
     /// <summary>
+    /// The options this package refuses that take no value, and which the runtime therefore also
+    /// accepts as <c>--option=false</c>.
+    /// </summary>
+    /// <remarks>
+    /// An explicit <c>false</c> is the caller saying "do not do the thing", which is what this
+    /// package wants; refusing it would be a refusal of the safe spelling. Only spellings the
+    /// runtime's own boolean parser reads as false are treated that way — anything else, including
+    /// a value neither runtime would accept, is read as the option being set.
+    /// </remarks>
+    private static readonly HashSet<string> s_valuelessOptions = new(StringComparer.Ordinal)
+    {
+        "--read-only",
+        "--env-host",
+        "--unsetenv-all",
+        "--rootfs",
+    };
+
+    /// <summary>
+    /// The spellings <c>pflag</c> — the flag parser both runtimes use — reads as <see langword="false"/>.
+    /// </summary>
+    private static readonly HashSet<string> s_falseFlagValues = new(StringComparer.Ordinal)
+    {
+        "0", "f", "F", "false", "FALSE", "False",
+    };
+
+    /// <summary>
     /// Whether an option — with its value, when the token carried one — is one this package can
-    /// let through.
+    /// let through. Every refusal names the spelling held in this class's own table rather than the
+    /// one that was read, so what reaches a diagnostic is a constant of this file.
     /// </summary>
     private static bool JudgeOption(
         string name,
         string? inlineValue,
-        Func<string, bool> ownsEnvironmentVariable,
+        Func<string, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding)
     {
-        if (s_storageOptions.Contains(name))
+        if (inlineValue is not null &&
+            s_valuelessOptions.Contains(name) &&
+            s_falseFlagValues.Contains(inlineValue))
         {
-            finding = new(DocumentDBRuntimeArgumentVerdict.Storage, name);
+            finding = DocumentDBRuntimeArgumentFinding.Harmless;
+            return true;
+        }
+
+        if (s_storageOptions.TryGetValue(name, out var storage))
+        {
+            finding = new(DocumentDBRuntimeArgumentVerdict.Storage, storage, null);
             return false;
         }
 
-        if (s_entrypointOptions.Contains(name))
+        if (s_entrypointOptions.TryGetValue(name, out var entrypoint))
         {
-            finding = new(DocumentDBRuntimeArgumentVerdict.Entrypoint, name);
+            finding = new(DocumentDBRuntimeArgumentVerdict.Entrypoint, entrypoint, null);
             return false;
         }
 
-        if (s_environmentOptions.Contains(name))
+        if (s_imageOptions.TryGetValue(name, out var image))
         {
-            // '--env-file' names a file whose contents decide which variables are set, and reading
-            // it here would be a second reading of a file the runtime reads at start.
-            if (string.Equals(name, "--env-file", StringComparison.Ordinal))
-            {
-                finding = new(DocumentDBRuntimeArgumentVerdict.Environment, name);
-                return false;
-            }
+            finding = new(DocumentDBRuntimeArgumentVerdict.Image, image, null);
+            return false;
+        }
 
-            if (inlineValue is not null && !JudgeEnvironmentAssignment(name, inlineValue, ownsEnvironmentVariable, out finding))
-            {
-                return false;
-            }
+        if (s_unscopedEnvironmentOptions.TryGetValue(name, out var unscoped))
+        {
+            finding = new(DocumentDBRuntimeArgumentVerdict.Environment, unscoped, null);
+            return false;
+        }
+
+        if (s_scopedEnvironmentOptions.TryGetValue(name, out var scoped) &&
+            inlineValue is not null &&
+            !JudgeEnvironmentAssignment(scoped, inlineValue, resolveOwnedVariable, out finding))
+        {
+            return false;
         }
 
         finding = DocumentDBRuntimeArgumentFinding.Harmless;
@@ -345,16 +488,17 @@ internal static class DocumentDBContainerRuntimeArguments
 
     /// <summary>
     /// Whether the operand of a value-taking option is one this package can let through. Only the
-    /// operand of an environment option is read at all: every other operand is a port, a label, a
-    /// memory limit or a password, none of which this package has any business inspecting.
+    /// operand of a scoped environment option is read at all: every other operand is a port, a
+    /// label, a memory limit or a password, none of which this package has any business inspecting
+    /// — and none of which it reports either way.
     /// </summary>
     private static bool JudgeOperand(
         string option,
         object operand,
-        Func<string, bool> ownsEnvironmentVariable,
+        Func<string, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding)
     {
-        if (!s_environmentOptions.Contains(option))
+        if (!s_scopedEnvironmentOptions.TryGetValue(option, out var scoped))
         {
             finding = DocumentDBRuntimeArgumentFinding.Harmless;
             return true;
@@ -364,31 +508,33 @@ internal static class DocumentDBContainerRuntimeArguments
         {
             // The name of the variable is inside a value that is not known yet, so whether it is
             // one of this package's cannot be decided without resolving it.
-            finding = new(DocumentDBRuntimeArgumentVerdict.Undecidable, option);
+            finding = new(DocumentDBRuntimeArgumentVerdict.Undecidable, scoped, null);
             return false;
         }
 
-        return JudgeEnvironmentAssignment(option, assignment, ownsEnvironmentVariable, out finding);
+        return JudgeEnvironmentAssignment(scoped, assignment, resolveOwnedVariable, out finding);
     }
 
     /// <summary>
-    /// Whether an <c>--env</c> assignment names a variable this package owns. A bare name with no
-    /// <c>=</c> is the runtime's "import this one from the host environment", which sets the
-    /// variable just as surely.
+    /// Whether an environment assignment names a variable this package owns. A bare name with no
+    /// <c>=</c> is the runtime's "import this one from the host environment" for <c>--env</c>, and
+    /// the whole of the argument for <c>--unsetenv</c>; either way it sets or clears the variable
+    /// just as surely.
     /// </summary>
     private static bool JudgeEnvironmentAssignment(
         string option,
         string assignment,
-        Func<string, bool> ownsEnvironmentVariable,
+        Func<string, string?> resolveOwnedVariable,
         out DocumentDBRuntimeArgumentFinding finding)
     {
         var separator = assignment.IndexOf('=', StringComparison.Ordinal);
         var variable = separator < 0 ? assignment : assignment[..separator];
 
-        if (ownsEnvironmentVariable(variable))
+        // The owner's own spelling, not the one that was read: this is the only part of the
+        // argument that reaches a diagnostic, and it has to be a name this package chose.
+        if (resolveOwnedVariable(variable) is { } owned)
         {
-            // The variable's name, not its value: the value is what a password would be in.
-            finding = new(DocumentDBRuntimeArgumentVerdict.Environment, string.Concat(option, " ", variable));
+            finding = new(DocumentDBRuntimeArgumentVerdict.Environment, option, owned);
             return false;
         }
 

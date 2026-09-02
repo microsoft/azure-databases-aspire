@@ -19,6 +19,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// with the model" is asserted against Docker rather than assumed.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection(DocumentDBStorageGuardAppHostCollection.Name)]
 public class DocumentDBRuntimeAuthorityEndToEndTests
 {
     /// <summary>
@@ -113,8 +114,11 @@ public class DocumentDBRuntimeAuthorityEndToEndTests
     [InlineData(Scenarios.RawReadOnlyVolumeRuntimeArgumentScenario, "'--volume', which changes what the container mounts")]
     [InlineData(Scenarios.RawTmpfsRuntimeArgumentScenario, "'--tmpfs', which changes what the container mounts")]
     [InlineData(Scenarios.RawReadOnlyRootRuntimeArgumentScenario, "'--read-only', which changes what the container mounts")]
-    [InlineData(Scenarios.RawDataPathRuntimeArgumentScenario, "'--env DATA_PATH', which sets an environment variable this package has already decided")]
+    [InlineData(Scenarios.RawDataPathRuntimeArgumentScenario, "'--env DATA_PATH', which sets, imports or clears an environment variable this package has already decided")]
     [InlineData(Scenarios.RawEntrypointRuntimeArgumentScenario, "'--entrypoint', which replaces the image's entry point")]
+    [InlineData(Scenarios.RawPodmanSecretRuntimeArgumentScenario, "'--secret', which changes what the container mounts")]
+    [InlineData(Scenarios.RawPodmanEnvHostRuntimeArgumentScenario, "'--env-host', which sets, imports or clears an environment variable this package has already decided")]
+    [InlineData(Scenarios.RawPodmanRootfsRuntimeArgumentScenario, "'--rootfs', which decides what the runtime runs")]
     [InlineData(Scenarios.DeferredRuntimeArgumentScenario, "a value that is only known later, in a position where the runtime reads an option name")]
     public async Task ARawRuntimeArgumentFailsARealStart(string scenario, string expected)
     {

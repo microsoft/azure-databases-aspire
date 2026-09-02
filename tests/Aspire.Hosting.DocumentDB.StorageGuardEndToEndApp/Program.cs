@@ -81,6 +81,18 @@ public class Program
     public const string RawEntrypointRuntimeArgumentScenario = "raw-entrypoint-runtime-argument";
 
     /// <summary>
+    /// A Podman-only option that mounts a file into the container. Which runtime is behind the
+    /// arguments is not this package's to know, so the union grammar refuses it either way.
+    /// </summary>
+    public const string RawPodmanSecretRuntimeArgumentScenario = "raw-podman-secret-runtime-argument";
+
+    /// <summary>The Podman-only import of the entire host environment.</summary>
+    public const string RawPodmanEnvHostRuntimeArgumentScenario = "raw-podman-env-host-runtime-argument";
+
+    /// <summary>The Podman-only replacement of the image by a directory.</summary>
+    public const string RawPodmanRootfsRuntimeArgumentScenario = "raw-podman-rootfs-runtime-argument";
+
+    /// <summary>
     /// A container-runtime argument whose value only arrives later, where the runtime reads an
     /// option name.
     /// </summary>
@@ -216,6 +228,22 @@ public class Program
             case RawEntrypointRuntimeArgumentScenario:
                 builder.AddDocumentDB("documentdb")
                     .WithContainerRuntimeArgs("--entrypoint", "/bin/sh");
+                break;
+
+            case RawPodmanSecretRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithContainerRuntimeArgs("--secret", "documentdb-secret,type=mount,target=/data/pgdata");
+                break;
+
+            case RawPodmanEnvHostRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithDataVolume(name: "documentdb-podman-env-host-data")
+                    .WithContainerRuntimeArgs("--env-host");
+                break;
+
+            case RawPodmanRootfsRuntimeArgumentScenario:
+                builder.AddDocumentDB("documentdb")
+                    .WithContainerRuntimeArgs("--rootfs");
                 break;
 
             case DeferredRuntimeArgumentScenario:
