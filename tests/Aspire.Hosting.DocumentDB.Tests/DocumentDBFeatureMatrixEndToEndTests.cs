@@ -3,8 +3,11 @@
 
 using System.Net;
 using System.Net.Sockets;
+using System.Text.RegularExpressions;
+using System.Text.Json.Nodes;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Testing;
+using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
@@ -31,7 +34,21 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Trait("Category", "Integration")]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
-    private const string CandidateVersion = "0.116.0";
+    private const string ReleasedVersion = DocumentDBVersions.V0_116_0;
+    private const string QuietWindowControlMarker = "[ASPIRE-TEST] quiet-window-control";
+    private static readonly Regex GatewayDebugInsertRegex = new(
+        @"DEBUG[^\r\n]*documentdb_api\.insert",
+        RegexOptions.CultureInvariant);
+    private static readonly Regex GatewaySeverityLineRegex = new(
+        @"(?m)^(?:\[GATEWAY-FILE\]\s+)?\d{4}-\d{2}-\d{2}T[^\r\n]*\s(?:INFO|WARN|ERROR|DEBUG)\s",
+        RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// The container path <see cref="DocumentDBBuilderExtensions.WithDataBindMount"/> mounts the
+    /// host directory at, and the value it puts in <c>DATA_PATH</c>. PostgreSQL names it when it
+    /// rejects the directory's owner.
+    /// </summary>
+    private const string MountedDataPath = "/data";
 
     // ------------------------------------------------------------------
     // Credentials, multiple databases, database naming
@@ -144,7 +161,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
-    public async Task DataBindMountWritesToTheHostPathAndSurvivesARestart()
+    public async Task DataBindMountWritesToTheHostPathAndSurvivesARestartExceptOnDockerDesktop()
     {
         RequireDocker();
 
@@ -155,6 +172,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.DataBindMountScenario),
             (AppHost.BindMountPathEnvironmentVariable, bindMountPath));
+
+        // Asked of the daemon, not of the host OS: only Docker Desktop is allowed to fail the
+        // restart below, and a Linux host can be either.
+        var runtime = await DocumentDBContainerRuntime.DescribeAsync();
 
         try
         {
@@ -172,21 +193,44 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
             // The PostgreSQL data directory must be visible on the host side of the mount. It is
             // read back through a container because initdb leaves the directory 0700 owned by the
-            // container's uid, which locks this process out of the host path on Linux.
-            Assert.True(
-                (await ListBindMountEntriesAsync(bindMountPath)).Length > 0,
-                $"Expected the DocumentDB data directory to be materialised under '{bindMountPath}'.");
+            // container's uid, which locks this process out of the host path on Linux. Named
+            // members rather than a count: a mount that received a stray file would satisfy
+            // "not empty" while proving nothing about where DocumentDB put its data.
+            AssertIsPostgresDataDirectory(await ListBindMountEntriesAsync(bindMountPath), bindMountPath);
 
             await using (var app = await BuildAndStartAsync(cts.Token))
             {
+                var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+                var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+                var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+                var containerStartedAt = await GetContainerStartedAtAsync(containerId, cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
-                var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
 
-                var survivor = await database.GetCollection<BsonDocument>("persisted")
-                    .Find(Builders<BsonDocument>.Filter.Eq("_id", "bind-survivor"))
-                    .SingleOrDefaultAsync(cts.Token);
+                var (outcome, containerLog) = await WaitForRestartOutcomeAsync(
+                    connectionString!, containerId, containerStartedAt, cts.Token);
 
-                Assert.NotNull(survivor);
+                // Reachable is required everywhere; the refusal is tolerated only on the runtime
+                // that provably cannot avoid it. Anywhere else this throws with the diagnosis and
+                // the container's own log.
+                DocumentDBBindMountRestart.AssertOutcomeIsAllowed(outcome, runtime, containerLog);
+
+                if (outcome == BindMountRestartOutcome.Reachable)
+                {
+                    var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
+
+                    var survivor = await database.GetCollection<BsonDocument>("persisted")
+                        .Find(Builders<BsonDocument>.Filter.Eq("_id", "bind-survivor"))
+                        .SingleOrDefaultAsync(cts.Token);
+
+                    Assert.NotNull(survivor);
+                }
+                else
+                {
+                    // The data is still on the host and intact; it is the handover that failed.
+                    // Asserting that separates "this runtime cannot re-attach the directory" from
+                    // "the restart destroyed the data", which would be a different bug entirely.
+                    AssertIsPostgresDataDirectory(await ListBindMountEntriesAsync(bindMountPath), bindMountPath);
+                }
 
                 await app.StopAsync(cts.Token);
             }
@@ -195,6 +239,94 @@ public class DocumentDBFeatureMatrixEndToEndTests
         {
             await TryRelaxBindMountPermissionsAsync(bindMountPath);
             TryDeleteDirectory(bindMountPath);
+        }
+    }
+
+    /// <summary>
+    /// The restart policy above only relaxes for Docker Desktop, so the identification must come
+    /// from the daemon whenever there is one. If this ever fell back to the host OS on a machine
+    /// with a working Docker, a Linux developer box running Docker Desktop would be held to the
+    /// strict rule and a macOS host running a native-semantics runtime would not.
+    /// </summary>
+    [Fact]
+    public async Task TheContainerRuntimeIdentifiesItselfToTheRestartPolicy()
+    {
+        RequireDocker();
+
+        var runtime = await DocumentDBContainerRuntime.DescribeAsync();
+
+        Assert.True(
+            runtime.DaemonAnswered,
+            $"Docker is available, so the runtime must be identified from 'docker info' rather than " +
+            $"from the host OS, but the description fell back: {runtime}.");
+        Assert.False(string.IsNullOrWhiteSpace(runtime.OperatingSystem));
+        Assert.Equal(DocumentDBContainerRuntime.IsDockerDesktop(runtime.OperatingSystem), runtime.IsDockerDesktop);
+    }
+
+    /// <summary>
+    /// Watches a restarted DocumentDB container until it either serves the bind-mounted data
+    /// directory or shows this run refusing it over its ownership.
+    /// </summary>
+    /// <remarks>
+    /// The outcome is observed rather than predicted. Probing the runtime's <c>chown</c>
+    /// visibility ahead of time and branching on the answer was tried first and is not reliable:
+    /// the same probe reported the ownership change eagerly on some runs and lazily on others, so
+    /// which assertions ran became a coin toss. Both signals are polled here and the first to
+    /// arrive decides; the caller then holds the outcome to the standard its runtime is held to.
+    /// A container that neither serves the data nor names that failure fails the test with its own
+    /// log attached, instead of the three-minute Mongo connect timeout naming neither the data
+    /// directory nor the ownership check that this suite used to report.
+    /// </remarks>
+    private static async Task<(BindMountRestartOutcome Outcome, string ContainerLog)> WaitForRestartOutcomeAsync(
+        string connectionString,
+        string containerId,
+        DateTimeOffset containerStartedAt,
+        CancellationToken cancellationToken)
+    {
+        // Short timeouts: this polls two signals in turn, so a slow-starting server must not
+        // starve the log check.
+        var database = GetDatabase(connectionString, "appdb", TimeSpan.FromSeconds(2));
+        var logs = string.Empty;
+
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            logs = await GetContainerLogsAsync(containerId);
+
+            if (DocumentDBBindMountRestart.IndicatesStaleOwnershipRefusal(logs, MountedDataPath, containerStartedAt))
+            {
+                return (BindMountRestartOutcome.RefusedForStaleOwnership, logs);
+            }
+
+            try
+            {
+                await database.RunCommandAsync(
+                    (Command<BsonDocument>)"{ ping: 1 }",
+                    cancellationToken: cancellationToken);
+                return (BindMountRestartOutcome.Reachable, logs);
+            }
+            catch (TimeoutException)
+            {
+            }
+            catch (MongoException)
+            {
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        throw new InvalidOperationException(
+            "The restarted DocumentDB container neither served the bind-mounted data directory nor " +
+            $"reported that it could not take it over. Container log:{Environment.NewLine}{logs}");
+    }
+
+    private static void AssertIsPostgresDataDirectory(string[] entries, string hostPath)
+    {
+        foreach (var expected in new[] { "PG_VERSION", "postgresql.conf", "base" })
+        {
+            Assert.True(
+                entries.Contains(expected, StringComparer.Ordinal),
+                $"Expected the DocumentDB data directory materialised under '{hostPath}' to contain " +
+                $"'{expected}', but it held: {string.Join(", ", entries)}");
         }
     }
 
@@ -227,7 +359,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             using (var scenario = new EnvironmentScope(
                        (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
-                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17))))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
@@ -240,7 +372,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 Assert.NotNull(existing);
 
                 await collection.InsertOneAsync(
-                    new BsonDocument { ["_id"] = "post-upgrade", ["version"] = CandidateVersion },
+                    new BsonDocument { ["_id"] = "post-upgrade", ["version"] = ReleasedVersion },
                     cancellationToken: cts.Token);
                 Assert.Equal(
                     2,
@@ -277,7 +409,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                        (AppHost.ScenarioEnvironmentVariable, AppHost.InitDataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
                        (AppHost.InitDataPathEnvironmentVariable, initDataPath),
-                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17))))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
@@ -306,7 +438,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
                        (AppHost.ScenarioEnvironmentVariable, AppHost.InitDataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
                        (AppHost.InitDataPathEnvironmentVariable, initDataPath),
-                       (AppHost.ImageTagEnvironmentVariable, CandidateTag(17))))
+                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17))))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
@@ -352,19 +484,21 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Theory]
-    [InlineData(AppHost.Pg15Scenario, "pg15-")]
-    [InlineData(AppHost.Pg16Scenario, "pg16-")]
-    public async Task EveryCurrentPostgresVariantResolvesToARealImageAndServesTraffic(
+    [InlineData(AppHost.Pg15Scenario, "pg15-0.114.0")]
+    [InlineData(AppHost.Pg16Scenario, "pg16-0.114.0")]
+    public async Task Pg15AndPg16On0114RemainRunnableAsLegacyControls(
         string scenarioName,
-        string expectedTagPrefix)
+        string expectedTag)
     {
-        // Pg17 (the default) and Pg18 are covered elsewhere; together these four mean every
-        // member of DocumentDBPostgresVersion is proven to name an image that exists and runs,
-        // not merely a well-formed tag.
+        // The pinned 0.116 theory below covers the released PG15-PG18 matrix. These explicit
+        // 0.114 pins preserve the legacy controls that existed before 0.116 became the default,
+        // proving the older PG15/PG16 images still exist and serve traffic.
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
-        using var scenario = new EnvironmentScope((AppHost.ScenarioEnvironmentVariable, scenarioName));
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, scenarioName),
+            (AppHost.ImageTagEnvironmentVariable, expectedTag));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -372,7 +506,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
         var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
         var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
-        Assert.StartsWith(expectedTagPrefix, image.Tag, StringComparison.Ordinal);
+        Assert.Equal(expectedTag, image.Tag);
 
         await app.StartAsync(cts.Token);
 
@@ -393,10 +527,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
-        var candidateTag = CandidateTag(postgresVersion);
+        var releasedTag = ReleasedTag(postgresVersion);
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, scenarioName),
-            (AppHost.ImageTagEnvironmentVariable, candidateTag));
+            (AppHost.ImageTagEnvironmentVariable, releasedTag));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -404,7 +538,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
         var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
         var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
-        Assert.Equal(candidateTag, image.Tag);
+        Assert.Equal(releasedTag, image.Tag);
 
         await app.StartAsync(cts.Token);
 
@@ -447,7 +581,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachTheCurrentContainer()
+    public async Task LogLevelOwnerAndOpenTelemetryMetricsReachThe0114ControlContainer()
     {
         RequireDocker();
 
@@ -456,7 +590,8 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.ObservableConfigScenario),
-            (AppHost.OtelEndpointEnvironmentVariable, otelEndpoint));
+            (AppHost.OtelEndpointEnvironmentVariable, otelEndpoint),
+            (AppHost.ImageTagEnvironmentVariable, "pg17-0.114.0"));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -474,11 +609,111 @@ public class DocumentDBFeatureMatrixEndToEndTests
         Assert.Equal("7000", environment["OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"]);
         Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
         Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
+        Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
         Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
         Assert.Equal("aspireowner", environment["OWNER"]);
 
         var logs = await WaitForContainerLogAsync(containerId, "Using owner: aspireowner", cts.Token);
         Assert.Contains("Using owner: aspireowner", logs, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("pg17-0.114.0", "pg17-0.114.0")]
+    [InlineData(null, "pg17-0.116.0")]
+    public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var variables = new List<(string Name, string Value)>
+        {
+            (AppHost.ScenarioEnvironmentVariable, AppHost.DebugLogLevelScenario),
+        };
+        if (imageTag is not null)
+        {
+            variables.Add((AppHost.ImageTagEnvironmentVariable, imageTag));
+        }
+
+        using var scenario = new EnvironmentScope([.. variables]);
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var image = Assert.Single(Snapshot<ContainerImageAnnotation>(server.Annotations));
+        Assert.Equal(expectedImageTag, image.Tag);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+
+        Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "log-level", "debug-source", cts.Token);
+
+        // Match the gateway's Mongo insert translation, tying DEBUG output to the operation above
+        // instead of to a dependency's startup or telemetry-internal event.
+        var logs = await WaitForContainerLogAsync(
+            containerId,
+            GatewayDebugInsertRegex,
+            cts.Token);
+        Assert.Matches(GatewayDebugInsertRegex, logs);
+    }
+
+    [Fact]
+    public async Task QuietLogLevelSuppresses0116GatewayOutput()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.QuietLogLevelScenario),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+
+        Assert.Equal("quiet", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
+        Assert.Equal("quiet", environment["LOG_LEVEL"], ignoreCase: true);
+
+        var windowStart = DateTimeOffset.UtcNow;
+        var (markerExitCode, _) = await RunDockerAsync(
+            "exec",
+            containerId,
+            "/bin/sh",
+            "-c",
+            $"printf '%s\\n' '{QuietWindowControlMarker}' > /proc/1/fd/1");
+        Assert.Equal(0, markerExitCode);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "log-level", "quiet-source", cts.Token);
+        await Task.Delay(TimeSpan.FromSeconds(3), cts.Token);
+
+        var operationWindowLogs = NormalizeContainerLogs(
+            await GetContainerLogsSinceAsync(containerId, windowStart));
+
+        // Scope the absence check to tracing-formatted gateway lines. Entrypoint and PostgreSQL
+        // messages use different prefixes/formats and remain visible even when the gateway is quiet.
+        Assert.False(string.IsNullOrWhiteSpace(operationWindowLogs));
+        Assert.Contains(QuietWindowControlMarker, operationWindowLogs, StringComparison.Ordinal);
+        Assert.DoesNotMatch(GatewaySeverityLineRegex, operationWindowLogs);
     }
 
     [Fact]
@@ -492,7 +727,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.ObservableConfigScenario),
             (AppHost.OtelOutputPathEnvironmentVariable, otelOutputPath),
-            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         try
         {
@@ -519,7 +754,32 @@ public class DocumentDBFeatureMatrixEndToEndTests
             Assert.Equal("aspire-documentdb-e2e", environment["OTEL_SERVICE_NAME"]);
             Assert.Equal("1.2.3", environment["OTEL_SERVICE_VERSION"]);
             Assert.False(environment.ContainsKey("CONFIG_DIR"));
+            Assert.Equal("debug", environment["DOCUMENTDB_LOG_LEVEL"], ignoreCase: true);
             Assert.Equal("debug", environment["LOG_LEVEL"], ignoreCase: true);
+
+            // The AppHost applies WithImageTag after WithOpenTelemetryMetrics, so this also proves
+            // the compatibility wrapper is resolved against the resource's final image.
+            Assert.Equal(["/bin/bash"], await GetContainerConfigListAsync(containerId, "Entrypoint"));
+            var command = await GetContainerConfigListAsync(containerId, "Cmd");
+            Assert.Equal(3, command.Length);
+            Assert.Equal("-c", command[0]);
+            Assert.Equal("--", command[2]);
+            Assert.Contains("del(.TelemetryOptions.Metrics", command[1], StringComparison.Ordinal);
+            Assert.DoesNotContain(".TelemetryOptions.Metrics.", command[1], StringComparison.Ordinal);
+
+            // Without the wrapper the shipped SetupConfiguration.json would still pin metrics off,
+            // and the gateway would report telemetry_options carrying a Metrics section.
+            var gatewayLogs = await WaitForContainerLogAsync(
+                containerId,
+                "Starting server with configuration",
+                cts.Token);
+            // The metrics object is gone from the JSON entirely, so the OTEL_* variables decide;
+            // the identity keys go with it because the scenario supplies serviceName and
+            // serviceVersion explicitly.
+            Assert.Contains(
+                "service_name: None, service_version: None, metrics: None",
+                gatewayLogs,
+                StringComparison.Ordinal);
 
             var metrics = await WaitForFileContainingAsync(
                 Path.Combine(otelOutputPath, "metrics.json"),
@@ -533,17 +793,847 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
+    /// <summary>
+    /// The wrapper has to be the first thing <c>/bin/bash</c> reads. A caller callback registered
+    /// after <c>WithOpenTelemetryMetrics()</c> that inserts at the front used to run afterwards and
+    /// push the whole wrapper behind its own value, leaving a container that exited immediately.
+    /// This starts the real thing and requires it to become healthy.
+    /// </summary>
     [Fact]
-    public async Task WithoutUserCreationLeavesTheContainerWithoutTheConfiguredUser()
+    public async Task TelemetryWrapperStaysFirstWhenALaterCallbackPrepends()
     {
-        // The container is told not to provision the user, while the connection string still
-        // carries those credentials - so the documented effect is an authentication failure, and
-        // the health check never goes healthy.
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
         using var scenario = new EnvironmentScope(
-            (AppHost.ScenarioEnvironmentVariable, AppHost.WithoutUserCreationScenario));
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryWrapperArgumentOrderScenario),
+            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+
+        // The container only reaches this state if bash ran the wrapper script rather than being
+        // handed '--disable-extended-rum' as its own first argument.
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "argument-order", "wrapper-first", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+
+        Assert.Equal(["/bin/bash"], await GetContainerConfigListAsync(containerId, "Entrypoint"));
+
+        var command = await GetContainerConfigListAsync(containerId, "Cmd");
+        Assert.Equal(4, command.Length);
+        Assert.Equal("-c", command[0]);
+        Assert.Equal("--", command[2]);
+        Assert.Equal("--disable-extended-rum", command[3]);
+        Assert.Contains("del(.TelemetryOptions.Metrics", command[1], StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// One host directory bind-mounted twice, as the data directory and at <c>/tmp</c>. The two
+    /// container paths do not contain one another, so a wrapper that compared only container paths
+    /// created its scratch copy through the second window - straight into the fresh data directory,
+    /// which DocumentDB <c>0.116.0</c> then refused to initialise. The container reaching a healthy
+    /// state at all is the assertion.
+    /// </summary>
+    [Fact]
+    public async Task TelemetryWrapperAvoidsATemporaryRootBoundToTheDataDirectory()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var bindMountPath = Path.Combine(Path.GetTempPath(), "aspire-documentdb-e2e", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(bindMountPath);
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryAliasedTemporaryRootScenario),
+            (AppHost.BindMountPathEnvironmentVariable, bindMountPath),
+            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            await using var app = await appHost.BuildAsync(cts.Token);
+
+            await app.StartAsync(cts.Token);
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+            var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+            await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+            var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+            await AssertRoundTripAsync(connectionString!, "appdb", "aliased-tmp", "safe", cts.Token);
+
+            var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+
+            // The wrapper was told, at model-build time, that '/tmp' is the data directory's own
+            // storage, so it fell through to the next candidate.
+            var command = await GetContainerConfigListAsync(containerId, "Cmd");
+            Assert.Contains("\"/tmp|/data\"", command[1], StringComparison.Ordinal);
+
+            var (exitCode, output) = await RunDockerAsync(
+                "exec", containerId, "/bin/bash", "-c",
+                "find /data -maxdepth 1 -type d -name 'aspire-documentdb-otel.*' -print");
+            Assert.True(exitCode == 0, $"Could not inspect DATA_PATH: {output}");
+            Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
+
+            await app.StopAsync(cts.Token);
+        }
+        finally
+        {
+            await TryRelaxBindMountPermissionsAsync(bindMountPath);
+            TryDeleteDirectory(bindMountPath);
+        }
+    }
+
+    /// <summary>
+    /// Exact reproduction of the physical-alias hole: the two bind source strings differ, but the
+    /// second is a symbolic link to the first. Docker resolves that link on the publish host or
+    /// daemon, so both container mount points expose one directory.
+    /// </summary>
+    [Fact]
+    public async Task TelemetryWrapperAvoidsASymlinkAliasOfTheDataDirectory()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var root = Path.Combine(
+            AppContext.BaseDirectory,
+            "telemetry-symlink-alias",
+            Guid.NewGuid().ToString("N"));
+        var dataPath = Path.Combine(root, "data");
+        var scratchAlias = Path.Combine(root, "scratch-alias");
+        Directory.CreateDirectory(dataPath);
+        Directory.CreateSymbolicLink(scratchAlias, dataPath);
+
+        var resolvedAlias = Directory.ResolveLinkTarget(scratchAlias, returnFinalTarget: true);
+        Assert.NotNull(resolvedAlias);
+        Assert.Equal(Path.GetFullPath(dataPath), resolvedAlias!.FullName);
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetrySymlinkAliasedTemporaryRootScenario),
+            (AppHost.BindMountPathEnvironmentVariable, dataPath),
+            (AppHost.ScratchBindMountPathEnvironmentVariable, scratchAlias),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            await using var app = await appHost.BuildAsync(cts.Token);
+
+            await app.StartAsync(cts.Token);
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+            var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+            await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+            var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+            await AssertRoundTripAsync(connectionString!, "appdb", "symlink-alias", "safe", cts.Token);
+
+            var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+            var command = await GetContainerConfigListAsync(containerId, "Cmd");
+            Assert.Contains("\"/tmp|/data\"", command[1], StringComparison.Ordinal);
+
+            var (exitCode, output) = await RunDockerAsync(
+                "exec", containerId, "/bin/bash", "-c",
+                "find /data -maxdepth 1 -type d -name 'aspire-documentdb-otel.*' -print");
+            Assert.True(exitCode == 0, $"Could not inspect DATA_PATH: {output}");
+            Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
+
+            await app.StopAsync(cts.Token);
+        }
+        finally
+        {
+            await TryRelaxBindMountPermissionsAsync(dataPath);
+
+            if (Directory.Exists(scratchAlias))
+            {
+                Directory.Delete(scratchAlias);
+            }
+
+            TryDeleteDirectory(root);
+        }
+    }
+
+    /// <summary>
+    /// A raw runtime mount bypasses ContainerMountAnnotation entirely. The guard must reject it
+    /// before DCP creates a container, rather than letting the named DATA_PATH volume reappear at
+    /// <c>/tmp</c>.
+    /// </summary>
+    [Fact]
+    public async Task TelemetryWrapperRejectsARawRuntimeMountOfTheDataVolume()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var volumeName = $"aspire-documentdb-runtime-secret-{Guid.NewGuid():N}";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryRawRuntimeVolumeScenario),
+            (AppHost.VolumeNameEnvironmentVariable, volumeName),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            var hostLog = new LogSink();
+            appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+            await using var app = await appHost.BuildAsync(cts.Token);
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+            try
+            {
+                await app.StartAsync(cts.Token);
+            }
+            catch (Exception ex)
+            {
+                hostLog.Append(ex.ToString());
+            }
+
+            await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+            var diagnostics = hostLog.ToString();
+            Assert.Contains("storage-changing container runtime option '--mount'", diagnostics, StringComparison.Ordinal);
+            Assert.DoesNotContain(volumeName, diagnostics, StringComparison.Ordinal);
+
+            var (exitCode, containers) = await RunDockerAsync(
+                "ps", "--all", "--quiet", "--filter", $"volume={volumeName}");
+            Assert.Equal(0, exitCode);
+            Assert.True(string.IsNullOrWhiteSpace(containers), "The rejected runtime mount still created a container.");
+        }
+        finally
+        {
+            await RemoveVolumeAsync(volumeName);
+        }
+    }
+
+    [Fact]
+    public async Task TelemetryRuntimeDiagnosticDoesNotExposeASecretParameterOperand()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var secret = $"DcpOperandSecret{Guid.NewGuid():N}";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetrySecretRuntimeOperandScenario),
+            (AppHost.RuntimeOperandValueEnvironmentVariable, secret),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("positional container runtime operand", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("DcpOperandSecret", diagnostics, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TelemetryRuntimeDiagnosticDoesNotExposeACredentialReferenceOperand()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var password = $"DcpCredentialSecret{Guid.NewGuid():N}";
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryCredentialRuntimeOperandScenario),
+            (AppHost.RuntimeOperandValueEnvironmentVariable, password),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("positional container runtime operand", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain(password, diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("DcpCredentialSecret", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("mongodb://", diagnostics, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task TelemetryWrapperFailsClearlyWhenEveryBindCandidateIsUnprovable()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var root = Path.Combine(
+            AppContext.BaseDirectory,
+            "telemetry-unprovable-roots",
+            Guid.NewGuid().ToString("N"));
+        var dataPath = Path.Combine(root, "data");
+        var scratchRoot = Path.Combine(root, "scratch");
+        Directory.CreateDirectory(dataPath);
+        Directory.CreateDirectory(Path.Combine(scratchRoot, "tmp"));
+        Directory.CreateDirectory(Path.Combine(scratchRoot, "var-tmp"));
+        Directory.CreateDirectory(Path.Combine(scratchRoot, "dev-shm"));
+
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryUnprovableTemporaryRootsScenario),
+            (AppHost.BindMountPathEnvironmentVariable, dataPath),
+            (AppHost.ScratchBindMountPathEnvironmentVariable, scratchRoot),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        try
+        {
+            var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+            await using var app = await appHost.BuildAsync(cts.Token);
+
+            await app.StartAsync(cts.Token);
+
+            var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+            var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+            var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+            var logs = await WaitForContainerLogAsync(
+                containerId,
+                "every temporary directory aliases DATA_PATH storage or cannot be proven independent",
+                cts.Token);
+
+            Assert.Contains(
+                "telemetry configuration cannot be kept out of it",
+                logs,
+                StringComparison.Ordinal);
+            await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+        }
+        finally
+        {
+            await TryRelaxBindMountPermissionsAsync(dataPath);
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("false")]
+    public async Task TelemetryWrapperRunsWithNullOrFalseShellExecution(string shellExecution)
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryShellExecutionScenario),
+            (AppHost.ShellExecutionEnvironmentVariable, shellExecution),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        Assert.Equal(["/bin/bash"], await GetContainerConfigListAsync(containerId, "Entrypoint"));
+
+        var command = await GetContainerConfigListAsync(containerId, "Cmd");
+        Assert.Equal("-c", command[0]);
+        Assert.Equal("--", command[2]);
+    }
+
+    [Fact]
+    public async Task TelemetryWrapperRejectsShellExecutionBeforeContainerCreation()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryShellExecutionScenario),
+            (AppHost.ShellExecutionEnvironmentVariable, "true"),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("ShellExecution", diagnostics, StringComparison.Ordinal);
+        Assert.Contains("Set ShellExecution to false or null", diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("-c set -e", diagnostics, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TelemetryWrapperRejectsShellExecutionEnabledAfterCommandCaching()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryShellExecutionMutationScenario),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        var hostLog = new LogSink();
+        appHost.Services.AddLogging(logging => logging.AddProvider(new LogSinkProvider(hostLog)));
+
+        await using var app = await appHost.BuildAsync(cts.Token);
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+
+        try
+        {
+            await app.StartAsync(cts.Token);
+        }
+        catch (Exception ex)
+        {
+            hostLog.Append(ex.ToString());
+        }
+
+        await WaitForResourceFailureAsync(app, server.Name, cts.Token);
+
+        var diagnostics = hostLog.ToString();
+        Assert.Contains("ShellExecution", diagnostics, StringComparison.Ordinal);
+        Assert.Contains("rewrites the already verified wrapper arguments", diagnostics, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TelemetryWrapperDoesNotContaminateTmpDataPath(bool enabled)
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryTemporaryDataPathScenario),
+            (AppHost.OtelEnabledEnvironmentVariable, enabled.ToString()),
+            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
+        await AssertRoundTripAsync(connectionString!, "appdb", "tmp-data", enabled.ToString(), cts.Token);
+
+        var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+        var environment = await GetContainerEnvironmentAsync(containerId);
+        Assert.Equal("/tmp", environment["DATA_PATH"]);
+        Assert.Equal(enabled.ToString().ToLowerInvariant(), environment["OTEL_METRICS_ENABLED"]);
+
+        var command = await GetContainerConfigListAsync(containerId, "Cmd");
+        Assert.Contains("mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\"", command[1], StringComparison.Ordinal);
+
+        var (exitCode, output) = await RunDockerAsync(
+            "exec", containerId, "/bin/bash", "-c",
+            "find /tmp -maxdepth 1 -type d -name 'aspire-documentdb-otel.*' -print");
+        Assert.True(exitCode == 0, $"Could not inspect DATA_PATH: {output}");
+        Assert.True(string.IsNullOrWhiteSpace(output), $"Telemetry wrapper contaminated DATA_PATH: {output}");
+    }
+
+    [Theory]
+    // No serviceName override: the shipped TelemetryOptions.ServiceName must survive.
+    [InlineData(null, "documentdb_gateway")]
+    // Explicit serviceName override: the shared JSON identity is removed so the variable wins.
+    [InlineData("aspire-documentdb-publish", "aspire-documentdb-publish")]
+    public async Task ThePublishedManifestForOpenTelemetryMetricsExportsMetricsFromTheCandidateImage(
+        string? serviceName,
+        string expectedServiceName)
+    {
+        // The manifest is what azd deploys. Running exactly what it names - image, entrypoint,
+        // args and environment - against a real collector is the only assertion that proves the
+        // published artifact is deployable and that metrics actually leave the gateway. If the
+        // wrapper were dropped, the shipped SetupConfiguration.json would keep metrics off and no
+        // metric would ever arrive, so this fails rather than passing vacuously.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var networkName = $"aspire-documentdb-otel-{suffix}";
+        var collectorName = $"otel-collector-{suffix}";
+        var containerName = $"aspire-documentdb-publish-{suffix}";
+        var outputPath = Path.Combine(AppContext.BaseDirectory, "published-otel", suffix);
+        var metricsPath = Path.Combine(outputPath, "metrics.json");
+        var password = "Aspire-Publish-Pass1";
+
+        // The collector is addressed by container name on a user-defined network, so the endpoint
+        // baked into the manifest is the one the deployed container actually resolves.
+        var collectorEndpoint = $"http://{collectorName}:4317";
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("documentdb");
+
+            if (serviceName is null)
+            {
+                // No typed endpoint either: this half also proves the generic
+                // OTEL_EXPORTER_OTLP_ENDPOINT fallback still reaches the gateway, which it cannot
+                // if the shipped Metrics.OtlpEndpoint survives in the configuration file.
+                documentDB
+                    .WithEnvironment("OTEL_EXPORTER_OTLP_ENDPOINT", collectorEndpoint)
+                    .WithEnvironment("OTEL_METRIC_EXPORT_INTERVAL", "1000")
+                    .WithOpenTelemetryMetrics();
+            }
+            else
+            {
+                documentDB.WithOpenTelemetryMetrics(
+                    endpoint: collectorEndpoint,
+                    exportInterval: TimeSpan.FromSeconds(1),
+                    serviceName: serviceName);
+            }
+
+            documentDB.WithImageTag(ReleasedTag(17));
+        });
+
+        var resource = manifest["resources"]?["documentdb"];
+        Assert.NotNull(resource);
+
+        var image = resource!["image"]?.GetValue<string>();
+        Assert.Equal($"ghcr.io/documentdb/documentdb/documentdb-local:{ReleasedTag(17)}", image);
+
+        var entrypoint = resource["entrypoint"]?.GetValue<string>();
+        Assert.False(string.IsNullOrEmpty(entrypoint));
+
+        var environment = Assert.IsType<JsonObject>(resource["env"]);
+        Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal(
+            collectorEndpoint,
+            environment[serviceName is null ? "OTEL_EXPORTER_OTLP_ENDPOINT" : "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]
+                ?.GetValue<string>());
+
+        var dockerArguments = new List<string>
+        {
+            "run", "--detach", "--name", containerName, "--network", networkName,
+            "--entrypoint", entrypoint!,
+        };
+
+        foreach (var (name, value) in environment)
+        {
+            var text = value?.GetValue<string>() ?? string.Empty;
+
+            if (string.Equals(name, "PASSWORD", StringComparison.Ordinal))
+            {
+                text = password;
+            }
+
+            Assert.DoesNotContain('{', text);
+            dockerArguments.Add("--env");
+            dockerArguments.Add($"{name}={text}");
+        }
+
+        dockerArguments.Add(image!);
+
+        foreach (var argument in Assert.IsType<JsonArray>(resource["args"]))
+        {
+            dockerArguments.Add(argument!.GetValue<string>());
+        }
+
+        var collectorConfigPath = CreateOtelCollectorConfigurationFile(outputPath);
+
+        // Pull explicitly: 'docker run' would pull implicitly, but these images are large and the
+        // default per-command budget is sized for fast control-plane calls.
+        await PullImageAsync(image!);
+        await PullImageAsync(OtelCollectorImage);
+
+        var (networkExitCode, networkOutput) = await RunDockerAsync("network", "create", networkName);
+        Assert.True(networkExitCode == 0, $"docker network create failed: {networkOutput}");
+
+        string[] documentDBVolumes = [];
+        var removed = false;
+
+        try
+        {
+            var (collectorExitCode, collectorOutput) = await RunDockerAsync(
+                "run", "--detach", "--name", collectorName, "--network", networkName,
+                "--user", "0:0",
+                "--volume", $"{collectorConfigPath}:/etc/otelcol-contrib/config.yaml:ro",
+                "--volume", $"{outputPath}:/var/lib/otel",
+                OtelCollectorImage,
+                "--config=/etc/otelcol-contrib/config.yaml");
+            Assert.True(collectorExitCode == 0, $"docker run (collector) failed: {collectorOutput}");
+
+            var (exitCode, output) = await RunDockerAsync([.. dockerArguments]);
+            Assert.True(exitCode == 0, $"docker run failed with exit code {exitCode}: {output}");
+
+            documentDBVolumes = await GetContainerVolumeNamesAsync(containerName);
+
+            var logs = await WaitForContainerLogAsync(containerName, "Starting server with configuration", cts.Token);
+
+            // The published entrypoint has to leave the gateway with no JSON metrics pin, while
+            // the tracing block this package does not manage stays exactly as shipped.
+            Assert.Contains("metrics: None", logs, StringComparison.Ordinal);
+            Assert.Contains("tracing: Some(TracingOptions { enabled: Some(false)", logs, StringComparison.Ordinal);
+
+            // Identity is only taken from the caller when the caller asked for it; otherwise the
+            // configuration file keeps the value it shipped with.
+            Assert.Contains(
+                serviceName is null
+                    ? "service_name: Some(\"documentdb_gateway\")"
+                    : "service_name: None",
+                logs,
+                StringComparison.Ordinal);
+
+            // gateway.starts is emitted once the gateway is ready, so it needs no database
+            // traffic and cannot be produced by anything other than a live metrics pipeline.
+            var metrics = await WaitForFileContainingAsync(metricsPath, "gateway.starts", cts.Token);
+            Assert.Contains(expectedServiceName, metrics, StringComparison.Ordinal);
+
+            if (serviceName is null)
+            {
+                Assert.DoesNotContain("aspire-documentdb-publish", metrics, StringComparison.Ordinal);
+            }
+
+            // Teardown is asserted on the success path only: an assertion inside finally would
+            // replace whatever the test was actually diagnosing.
+            await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+            removed = true;
+            await AssertVolumesRemovedAsync(documentDBVolumes);
+        }
+        finally
+        {
+            try
+            {
+                if (!removed)
+                {
+                    await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+                }
+            }
+            finally
+            {
+                TryDeleteDirectory(outputPath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task DisabledOpenTelemetryMetricsBeatAConfigurationFileThatEnablesThem()
+    {
+        // The gateway resolves telemetry as JSON > environment, so a configuration file the caller
+        // points CONFIG_DIR at can switch metrics on and OTEL_METRICS_ENABLED=false alone would
+        // lose. The wrapper therefore has to be installed for the disabled case too.
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var networkName = $"aspire-documentdb-otel-{suffix}";
+        var collectorName = $"otel-collector-{suffix}";
+        var containerName = $"aspire-documentdb-disabled-{suffix}";
+        var outputPath = Path.Combine(AppContext.BaseDirectory, "published-otel", suffix);
+        var configPath = Path.Combine(outputPath, "config");
+        var metricsPath = Path.Combine(outputPath, "metrics.json");
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("documentdb")
+                .WithEnvironment("CONFIG_DIR", "/custom-config")
+                .WithOpenTelemetryMetrics(enabled: false)
+                .WithImageTag(ReleasedTag(17)));
+
+        var resource = manifest["resources"]?["documentdb"];
+        Assert.NotNull(resource);
+
+        var image = resource!["image"]?.GetValue<string>();
+        var entrypoint = resource["entrypoint"]?.GetValue<string>();
+        Assert.False(string.IsNullOrEmpty(entrypoint));
+
+        var environment = Assert.IsType<JsonObject>(resource["env"]);
+        Assert.Equal("false", environment["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal("/custom-config", environment["CONFIG_DIR"]?.GetValue<string>());
+
+        var collectorConfigPath = CreateOtelCollectorConfigurationFile(outputPath);
+        Directory.CreateDirectory(configPath);
+        await File.WriteAllTextAsync(
+            Path.Combine(configPath, "SetupConfiguration.json"),
+            $$"""
+            {
+              "NodeHostName": "localhost",
+              "BlockedRolePrefixes": ["documentdb", "citus", "pg", "internal_role"],
+              "PostgresPort": 9712,
+              "GatewayListenPort": 10260,
+              "HostConfigurationWatchIntervalMs": 1000,
+              "CertificateOptions": { "CertType": "PemAutoGenerated" },
+              "UseLocalHost": false,
+              "TelemetryOptions": {
+                "ServiceName": "aspire-custom-config",
+                "Metrics": {
+                  "Enabled": true,
+                  "OtlpEndpoint": "http://{{collectorName}}:4317",
+                  "ExportIntervalMs": 1000
+                },
+                "Tracing": {
+                  "Enabled": false,
+                  "OtlpEndpoint": "http://localhost:4317",
+                  "SamplerRatio": 1.0,
+                  "ExportTimeoutMs": 10000
+                }
+              }
+            }
+            """,
+            cts.Token);
+
+        var dockerArguments = new List<string>
+        {
+            "run", "--detach", "--name", containerName, "--network", networkName,
+            "--volume", $"{configPath}:/custom-config:ro",
+            "--entrypoint", entrypoint!,
+        };
+
+        foreach (var (name, value) in environment)
+        {
+            var text = value?.GetValue<string>() ?? string.Empty;
+
+            if (string.Equals(name, "PASSWORD", StringComparison.Ordinal))
+            {
+                text = "Aspire-Disabled-Pass1";
+            }
+
+            Assert.DoesNotContain('{', text);
+            dockerArguments.Add("--env");
+            dockerArguments.Add($"{name}={text}");
+        }
+
+        dockerArguments.Add(image!);
+
+        foreach (var argument in Assert.IsType<JsonArray>(resource["args"]))
+        {
+            dockerArguments.Add(argument!.GetValue<string>());
+        }
+
+        await PullImageAsync(image!);
+        await PullImageAsync(OtelCollectorImage);
+
+        var (networkExitCode, networkOutput) = await RunDockerAsync("network", "create", networkName);
+        Assert.True(networkExitCode == 0, $"docker network create failed: {networkOutput}");
+
+        string[] documentDBVolumes = [];
+        var removed = false;
+
+        try
+        {
+            var (collectorExitCode, collectorOutput) = await RunDockerAsync(
+                "run", "--detach", "--name", collectorName, "--network", networkName,
+                "--user", "0:0",
+                "--volume", $"{collectorConfigPath}:/etc/otelcol-contrib/config.yaml:ro",
+                "--volume", $"{outputPath}:/var/lib/otel",
+                OtelCollectorImage,
+                "--config=/etc/otelcol-contrib/config.yaml");
+            Assert.True(collectorExitCode == 0, $"docker run (collector) failed: {collectorOutput}");
+
+            var (exitCode, output) = await RunDockerAsync([.. dockerArguments]);
+            Assert.True(exitCode == 0, $"docker run failed with exit code {exitCode}: {output}");
+
+            documentDBVolumes = await GetContainerVolumeNamesAsync(containerName);
+
+            var logs = await WaitForContainerLogAsync(containerName, "Starting server with configuration", cts.Token);
+
+            // The caller's file really is the source the wrapper derived from: its service name
+            // survives because no serviceName override was supplied.
+            Assert.Contains("service_name: Some(\"aspire-custom-config\")", logs, StringComparison.Ordinal);
+
+            // ...and the Metrics object that declared Enabled: true is gone, so the environment
+            // decides.
+            Assert.Contains("metrics: None", logs, StringComparison.Ordinal);
+
+            await WaitForContainerLogAsync(containerName, "Gateway is ready", cts.Token);
+
+            // Well past the 1s export interval the file exporter has still written nothing:
+            // metrics really are off.
+            await Task.Delay(TimeSpan.FromSeconds(20), cts.Token);
+            Assert.False(
+                File.Exists(metricsPath) &&
+                (await File.ReadAllTextAsync(metricsPath, cts.Token)).Contains("gateway.starts", StringComparison.Ordinal),
+                "Metrics were exported even though WithOpenTelemetryMetrics(enabled: false) was configured.");
+
+            // Teardown is asserted on the success path only: an assertion inside finally would
+            // replace whatever the test was actually diagnosing.
+            await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+            removed = true;
+            await AssertVolumesRemovedAsync(documentDBVolumes);
+        }
+        finally
+        {
+            try
+            {
+                if (!removed)
+                {
+                    await RemoveDockerResourcesAsync(networkName, containerName, collectorName);
+                }
+            }
+            finally
+            {
+                TryDeleteDirectory(outputPath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task WithoutUserCreationKeepsFreshCandidateContainerRunningWhenInitializationIsDisabled()
+    {
+        RequireDocker();
+
+        using var cts = CreateEndToEndTimeoutSource();
+        using var scenario = new EnvironmentScope(
+            (AppHost.ScenarioEnvironmentVariable, AppHost.WithoutUserCreationScenario),
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -556,11 +1646,20 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
         var environment = await GetContainerEnvironmentAsync(containerId);
         Assert.Equal("false", environment["CREATE_USER"]);
+        Assert.Equal("false", environment["INIT_DATA"]);
+        Assert.Equal("true", environment["SKIP_INIT_DATA"]);
+
+        var logs = await WaitForContainerLogAsync(containerId, "No initialization data loaded.", cts.Token);
+        Assert.Contains("Gateway is ready on localhost:", logs, StringComparison.Ordinal);
+        Assert.Contains("Skipping user creation and starting the gateway...", logs, StringComparison.Ordinal);
+
+        var (inspectExitCode, running) = await RunDockerAsync(
+            "inspect", containerId, "--format", "{{.State.Running}}");
+        Assert.Equal(0, inspectExitCode);
+        Assert.Equal("true", running.Trim(), ignoreCase: true);
 
         var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
 
-        // Not the end-to-end token: a cancelled run would throw OperationCanceledException and
-        // make this assertion pass without the container having refused anything.
         var failure = await Record.ExceptionAsync(
             () => PingOnceAsync(connectionString!, "appdb", CancellationToken.None));
 
@@ -614,15 +1713,15 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task CurrentPostgresEndpointHonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
+    public async Task PostgresEndpointOn0114HonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
     {
-        await AssertPostgresExtrasAsync(imageTag: null, assertLz4: false);
+        await AssertPostgresExtrasAsync("pg17-0.114.0", assertLz4: false);
     }
 
     [Fact]
     public async Task PostgresEndpointOn0116UsesLz4ToastCompression()
     {
-        await AssertPostgresExtrasAsync(CandidateTag(17), assertLz4: true);
+        await AssertPostgresExtrasAsync(ReleasedTag(17), assertLz4: true);
     }
 
     private static async Task AssertPostgresExtrasAsync(string? imageTag, bool assertLz4)
@@ -692,7 +1791,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var cts = CreateEndToEndTimeoutSource();
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.ReservedUserNameScenario),
-            (AppHost.ImageTagEnvironmentVariable, CandidateTag(17)));
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -755,18 +1854,125 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // Helpers
     // ------------------------------------------------------------------
 
+    private const string OtelCollectorImage = "otel/opentelemetry-collector-contrib:0.130.1";
+
+    /// <summary>
+    /// Removes the containers and the user-defined network a collector-backed scenario created.
+    /// <c>--volumes</c> matters: the DocumentDB image declares <c>/data</c> as a <c>VOLUME</c>, so
+    /// a plain <c>rm</c> strands one anonymous volume per run.
+    /// </summary>
+    private static async Task RemoveDockerResourcesAsync(string networkName, params string[] containerNames)
+    {
+        foreach (var containerName in containerNames)
+        {
+            await RunDockerAsync("rm", "--force", "--volumes", containerName);
+        }
+
+        await RunDockerAsync("network", "rm", networkName);
+    }
+
+    private static async Task AssertVolumesRemovedAsync(string[] volumes)
+    {
+        foreach (var volume in volumes)
+        {
+            var (exitCode, _) = await RunDockerAsync("volume", "inspect", volume);
+            Assert.True(
+                exitCode != 0,
+                $"Anonymous volume '{volume}' outlived the container it was created for.");
+        }
+    }
+
+    private static async Task PullImageAsync(string image)
+    {
+        var (exitCode, output) = await RunDockerAsync(TimeSpan.FromMinutes(10), "pull", image);
+        Assert.True(exitCode == 0, $"docker pull {image} failed with exit code {exitCode}: {output}");
+    }
+
+    /// <summary>
+    /// Names of the volumes Docker created for a container, which for this image is the anonymous
+    /// volume backing the declared <c>/data</c> mount point.
+    /// </summary>
+    private static async Task<string[]> GetContainerVolumeNamesAsync(string containerId)
+    {
+        var (exitCode, output) = await RunDockerAsync(
+            "inspect", containerId, "--format", "{{range .Mounts}}{{println .Name}}{{end}}");
+
+        Assert.Equal(0, exitCode);
+
+        return [.. output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
+    }
+
+    private static string CreateOtelCollectorConfigurationFile(string outputPath)
+    {
+        Directory.CreateDirectory(outputPath);
+
+        var configPath = Path.Combine(outputPath, "otel-collector.yaml");
+        File.WriteAllText(configPath, """
+            receivers:
+              otlp:
+                protocols:
+                  grpc:
+                    endpoint: 0.0.0.0:4317
+            exporters:
+              file:
+                path: /var/lib/otel/metrics.json
+            service:
+              pipelines:
+                metrics:
+                  receivers: [otlp]
+                  exporters: [file]
+            """);
+
+        return configPath;
+    }
+
+    private static async Task<string[]> GetContainerConfigListAsync(string containerId, string field)
+    {
+        var (exitCode, output) = await RunDockerAsync(
+            "inspect", containerId, "--format", $"{{{{json .Config.{field}}}}}");
+
+        Assert.Equal(0, exitCode);
+
+        var parsed = JsonNode.Parse(output.Trim());
+
+        return parsed is JsonArray array
+            ? [.. array.Select(item => item!.GetValue<string>())]
+            : [];
+    }
+
     private static async Task<string> WaitForContainerLogAsync(
         string containerId,
         string expectedSubstring,
+        CancellationToken cancellationToken) =>
+        await WaitForContainerLogAsync(
+            containerId,
+            logs => logs.Contains(expectedSubstring, StringComparison.Ordinal),
+            $"'{expectedSubstring}'",
+            cancellationToken);
+
+    private static async Task<string> WaitForContainerLogAsync(
+        string containerId,
+        Regex expectedPattern,
+        CancellationToken cancellationToken) =>
+        await WaitForContainerLogAsync(
+            containerId,
+            expectedPattern.IsMatch,
+            $"pattern '{expectedPattern}'",
+            cancellationToken);
+
+    private static async Task<string> WaitForContainerLogAsync(
+        string containerId,
+        Func<string, bool> predicate,
+        string expectation,
         CancellationToken cancellationToken)
     {
         var logs = string.Empty;
 
         for (var attempt = 0; attempt < 60; attempt++)
         {
-            logs = await GetContainerLogsAsync(containerId);
+            logs = NormalizeContainerLogs(await GetContainerLogsAsync(containerId));
 
-            if (logs.Contains(expectedSubstring, StringComparison.Ordinal))
+            if (predicate(logs))
             {
                 return logs;
             }
@@ -775,7 +1981,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
 
         throw new InvalidOperationException(
-            $"Container '{containerId}' did not log '{expectedSubstring}' before the timeout. " +
+            $"Container '{containerId}' did not log {expectation} before the timeout. " +
             $"Last logs:{Environment.NewLine}{logs}");
     }
 
@@ -787,7 +1993,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         return app;
     }
 
-    private static string CandidateTag(int postgresVersion) => $"pg{postgresVersion}-{CandidateVersion}";
+    private static string ReleasedTag(int postgresVersion) => $"pg{postgresVersion}-{ReleasedVersion}";
 
     private static async Task WaitForDocumentAsync(
         IMongoDatabase database,

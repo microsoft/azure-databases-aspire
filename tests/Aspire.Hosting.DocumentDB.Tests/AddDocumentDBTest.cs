@@ -1,13 +1,20 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+#pragma warning disable ASPIRECONTAINERSHELLEXECUTION001
+
+using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Net.Sockets;
+using System.Text.Json.Nodes;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Eventing;
+using Aspire.Hosting.Lifecycle;
 using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
 
@@ -16,6 +23,26 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Trait("Category", "Unit")]
 public class AddDocumentDBTests
 {
+    // The first curated tag whose image declares /data as a container VOLUME and whose entrypoint
+    // claims the data directory with an exclusive lock. Pinned explicitly so these tests describe
+    // that image's behaviour regardless of which version the package currently defaults to.
+    private const string InterlockedTag = "pg17-0.116.0";
+    // The official image with the registry folded into the image annotation instead of kept
+    // beside it. Aspire joins the two and never re-splits them, so this resolves to exactly the
+    // reference the default spelling resolves to.
+    private const string QualifiedOfficialImage =
+        DocumentDBContainerImageTags.Registry + "/" + DocumentDBContainerImageTags.Image;
+    private const string GatewayConfigurationShell = "/bin/bash";
+    private const string GatewayConfigurationShellArgumentZero = "--";
+    private const string GatewayEntrypointScriptPath = "/home/documentdb/gateway/scripts/emulator_entrypoint.sh";
+
+    /// <summary>
+    /// The metrics object the wrapper always removes whole: this package owns the metrics signal,
+    /// and any surviving key - including one a later gateway release adds - would re-pin a setting
+    /// ahead of the documented environment precedence.
+    /// </summary>
+    private const string MetricsBlockFilter = "del(.TelemetryOptions.Metrics";
+
     [Fact]
     public void CombineStandardOutputAndErrorPreservesStreamBoundary()
     {
@@ -31,6 +58,16 @@ public class AddDocumentDBTests
         Assert.Equal(
             "stderr",
             DocumentDBEndToEndSupport.CombineStandardOutputAndError(string.Empty, "stderr"));
+    }
+
+    [Fact]
+    public void NormalizeContainerLogsRemovesAnsiEscapeSequences()
+    {
+        var logs = "\u001B[2m2026-09-01T20:00:00Z\u001B[0m \u001B[34mDEBUG\u001B[0m documentdb_api.insert";
+
+        Assert.Equal(
+            "2026-09-01T20:00:00Z DEBUG documentdb_api.insert",
+            DocumentDBEndToEndSupport.NormalizeContainerLogs(logs));
     }
 
     [Fact]
@@ -215,14 +252,18 @@ public class AddDocumentDBTests
         var DocumentDBManifest = await ManifestUtils.GetManifest(DocumentDB.Resource);
         var dbManifest = await ManifestUtils.GetManifest(db.Resource);
 
+        // Credentials are percent-encoded for the URI, so the published connection string points at
+        // the "-uri-encoded" companion that Aspire derives from the password parameter. The
+        // container's PASSWORD environment variable keeps referencing the raw parameter.
         var expectedManifest = $$"""
             {
               "type": "container.v0",
-              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true",
+              "connectionString": "mongodb://admin:{DocumentDB-password-uri-encoded.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true",
               "image": "{{DocumentDBContainerImageTags.Registry}}/{{DocumentDBContainerImageTags.Image}}:{{DocumentDBContainerImageTags.Tag}}",
               "env": {
                 "USERNAME": "admin",
-                "PASSWORD": "{DocumentDB-password.value}"
+                "PASSWORD": "{DocumentDB-password.value}",
+                "DATA_PATH": "/data"
               },
               "bindings": {
                 "tcp": {
@@ -239,7 +280,7 @@ public class AddDocumentDBTests
         expectedManifest = """
             {
               "type": "value.v0",
-              "connectionString": "mongodb://admin:{DocumentDB-password.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true"
+              "connectionString": "mongodb://admin:{DocumentDB-password-uri-encoded.value}@{DocumentDB.bindings.tcp.host}:{DocumentDB.bindings.tcp.port}/mydb?authSource=admin\u0026authMechanism=SCRAM-SHA-256\u0026tls=true\u0026tlsInsecure=true"
             }
             """;
         Assert.Equal(expectedManifest, dbManifest.ToString());
@@ -460,25 +501,3612 @@ public class AddDocumentDBTests
         Assert.Equal("/custom/data/path", dataPath.Value);
     }
 
+    // ---------------------------------------------------------------------
+    // Data-directory storage safeguards (DocumentDB 0.116.0)
+    //
+    // 0.116.0 declares /data as an image VOLUME, claims the data directory
+    // with an exclusive flock, and lets initdb take ownership of it. Each of
+    // those makes a previously "accepted but broken" configuration fail late
+    // and confusingly, so the package rejects them up front.
+    // ---------------------------------------------------------------------
+
     [Fact]
-    public async Task WithDataVolumeSupportsReadOnlyVolumes()
+    public async Task WithDataVolumeNormalizesTrailingSlashInTargetPath()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder
             .AddDocumentDB("DocumentDB")
-            .WithDataVolume(isReadOnly: true);
+            .WithDataVolume(targetPath: "/custom/data/");
 
         using var app = appBuilder.Build();
         var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
 
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.Volume));
-        Assert.Equal("/data", volumeAnnotation.Target);
-        Assert.True(volumeAnnotation.IsReadOnly);
+        var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+        Assert.Equal("/custom/data", volumeAnnotation.Target);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
-        var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/data", dataPath.Value);
+        Assert.Equal("/custom/data", Assert.Single(env.Where(entry => entry.Key == "DATA_PATH")).Value);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("data")]
+    [InlineData("./data")]
+    [InlineData("C:\\data")]
+    [InlineData("/")]
+    [InlineData("///")]
+    // The container runtime resolves dot segments before mounting, so these are the container
+    // root spelled differently, or a path that reaches above it. Neither can hold a cluster.
+    [InlineData("/data/..")]
+    [InlineData("/data/./..")]
+    [InlineData("/..")]
+    [InlineData("/../data")]
+    [InlineData("/data/../..")]
+    public void WithDataVolumeRejectsInvalidTargetPaths(string targetPath)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(() => documentDB.WithDataVolume(targetPath: targetPath));
+
+        Assert.Equal("targetPath", exception.ParamName);
+        Assert.Contains("/data", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A target path is canonicalized the way the container runtime resolves one, so the mount and
+    /// <c>DATA_PATH</c> agree with each other and with what Docker will really do.
+    /// </summary>
+    [Theory]
+    [InlineData("//custom///data", "/custom/data")]
+    [InlineData("/custom/./data/", "/custom/data")]
+    [InlineData("/custom/tmp/../data", "/custom/data")]
+    [InlineData("/foo/../data", "/data")]
+    public async Task WithDataVolumeCanonicalizesDotSegmentsInTargetPath(string targetPath, string expected)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder
+            .AddDocumentDB("DocumentDB")
+            .WithDataVolume(targetPath: targetPath);
+
+        using var app = appBuilder.Build();
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var volumeAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+        Assert.Equal(expected, volumeAnnotation.Target);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal(expected, Assert.Single(env.Where(entry => entry.Key == "DATA_PATH")).Value);
+    }
+
+    [Fact]
+    public void WithDataVolumeRejectsReadOnlyVolumes()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(() => documentDB.WithDataVolume(isReadOnly: true));
+
+        Assert.Equal("isReadOnly", exception.ParamName);
+        Assert.Contains("WithDataVolume(isReadOnly: true) is not supported", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("writable data directory", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("PostgreSQL failed to start within 60 seconds", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithInitData", exception.Message, StringComparison.Ordinal);
+
+        // The rejected call must not leave a half-configured resource behind.
+        using var app = appBuilder.Build();
+        var containerResource = Assert.Single(
+            app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+        Assert.Empty(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+    }
+
+    [Fact]
+    public void WithDataBindMountRejectsReadOnlyBindMounts()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(() => documentDB.WithDataBindMount("/host/data", isReadOnly: true));
+
+        Assert.Equal("isReadOnly", exception.ParamName);
+        Assert.Contains("WithDataBindMount(isReadOnly: true) is not supported", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Read-only file system", exception.Message, StringComparison.Ordinal);
+
+        using var app = appBuilder.Build();
+        var containerResource = Assert.Single(
+            app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+        Assert.Empty(containerResource.Annotations.OfType<ContainerMountAnnotation>());
+    }
+
+    /// <summary>
+    /// A builder whose DCP paths are stubbed. Tests that drive the real configuration pipeline
+    /// publish <see cref="BeforeStartEvent"/> — the event a real start publishes, and the one that
+    /// installs the storage guard's callbacks — which also runs Aspire's own DCP subscriber, and
+    /// that one insists on a DCP installation no unit test has.
+    /// </summary>
+    private static IDistributedApplicationBuilder CreateAppBuilder(CapturingLoggerSink? sink = null)
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Configuration["DcpPublisher:CliPath"] = "/aspire-unit-tests/dcp";
+        appBuilder.Configuration["DcpPublisher:DashboardPath"] = "/aspire-unit-tests/dashboard";
+
+        if (sink is not null)
+        {
+            // The guard's advisory warnings go to the AppHost's own logging, not to the callback
+            // context, because the context's logger is not wired up during the pass that actually
+            // evaluates the callback.
+            appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+        }
+
+        return appBuilder;
+    }
+
+    // ---------------------------------------------------------------------
+    // Data storage rules
+    //
+    // Every test below drives the resource's real configuration pipeline —
+    // the same ExecutionConfigurationBuilder Aspire's container creator uses —
+    // rather than invoking the guard's callbacks by hand. That is the point of
+    // the guard: it is part of the pipeline, so what it judged and what the
+    // container receives cannot be two different things.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ReadOnlyVolumeOnDefaultDataPathThrowsAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'raw-data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Read-only file system", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadOnlyBindMountOnCustomDataPathThrowsAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "writable", targetPath: "/pgdata")
+            .WithBindMount("/host/data", "/pgdata", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WritableDataMountStartsWithoutStorageWarnings()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task DuplicateDataMountsThrowAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "first")
+            .WithDataVolume(name: "second");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("2 mounts on '/data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("duplicate mount targets", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The second resource to reach the shared directory is the one that fails, because it is the
+    /// one whose container the image would refuse (or, without an interlock, the one that would
+    /// corrupt the cluster). The first is left alone: its configuration is fine on its own.
+    /// </summary>
+    [Fact]
+    public async Task DataVolumeSharedWithAnotherDocumentDBResourceThrowsAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("'secondary' and DocumentDB resource 'primary'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("exclusive lock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("another DocumentDB container is already using the data directory", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DataVolumeSharedOnTheDefaultImageDescribesThatImagesActualBehaviour()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        // Promising that the container refuses the second start is only honest on an image that
+        // actually holds the lock, so the expectation follows the default's own version.
+        var interlocked = Version.Parse(DocumentDBVersions.Latest) >=
+            DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion;
+
+        if (interlocked)
+        {
+            Assert.Contains("another DocumentDB container is already using the data directory", exception.Message, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("another DocumentDB container is already using the data directory", exception.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task DataBindMountSharedWithAnotherDocumentDBResourceThrowsAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithDataBindMount("./shared");
+        appBuilder.AddDocumentDB("secondary").WithDataBindMount("./shared/");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("host directory", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("give each resource its own storage", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Aspire records a rooted bind source exactly as written, so two spellings of one host
+    /// directory reach the model unequal. They are still one directory to the host, and on an
+    /// image with no interlock nothing at runtime would notice.
+    /// </summary>
+    [Theory]
+    [InlineData("/srv/documentdb", "/srv/documentdb/.")]
+    [InlineData("/srv/documentdb", "/srv/documentdb/../documentdb")]
+    [InlineData("/srv/documentdb", "/srv/./documentdb//")]
+    [InlineData("/srv/documentdb/.", "/srv/documentdb/../documentdb/")]
+    public async Task SharedBindMountIsDetectedThroughHostPathAliases(string first, string second)
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0").WithDataBindMount(first);
+        appBuilder.AddDocumentDB("secondary").WithImageTag("pg17-0.114.0").WithDataBindMount(second);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("host directory", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DistinctBindMountsUnderACommonParentAreNotShared()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("primary").WithDataBindMount("/srv/documentdb/primary");
+        appBuilder.AddDocumentDB("secondary").WithDataBindMount("/srv/documentdb/./secondary");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "secondary", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task DataBindMountSharedWithANonDocumentDBResourceStartsWithoutWarnings()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithDataBindMount("./shared");
+        appBuilder.AddContainer("backup", "alpine").WithBindMount("./shared", "/backup", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task DistinctDataVolumesStartWithoutStorageWarnings()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "primary-data");
+        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "secondary-data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "secondary", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SharedDataVolumeWithExplicitlyStartedResourceWarnsInsteadOfThrowing()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data").WithExplicitStart();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "standby", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("'standby' and DocumentDB resource 'primary'", message, StringComparison.Ordinal);
+        Assert.Contains("volume 'shared-data'", message, StringComparison.Ordinal);
+        Assert.Contains("exclusive lock", message, StringComparison.Ordinal);
+        Assert.Contains("WithExplicitStart()", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathWarnsAboutTheDeclaredImageVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(InterlockedTag).WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("/pgdata", message, StringComparison.Ordinal);
+        Assert.Contains("anonymous volume", message, StringComparison.Ordinal);
+        Assert.Contains("/data", message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Aspire discovers a container's dependencies before it builds its configuration, and that
+    /// pass evaluates the environment callbacks — through the same one-shot cache — with no logger
+    /// attached. A guard that wrote its advisory warnings to the callback context's logger would
+    /// have them silently discarded on every real run. The harness reproduces that pass, so this
+    /// asserts the warning survives it.
+    /// </summary>
+    [Fact]
+    public async Task TheDeclaredImageVolumeWarningSurvivesTheDependencyDiscoveryPass()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(InterlockedTag).WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "DocumentDB");
+
+        await PublishBeforeStartAsync(app);
+
+        // The discovery pass, with no logger, exactly as Aspire runs it first.
+        await ExecutionConfigurationBuilder.Create(resource)
+            .WithEnvironmentVariablesConfig()
+            .BuildAsync(new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run), NullLogger.Instance, CancellationToken.None);
+
+        var (_, category, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Equal("Aspire.Hosting.DocumentDB.Storage", category);
+        Assert.Contains("anonymous volume", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathDoesNotWarnWhenTheImageVolumeIsAlsoMounted()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "pgdata", targetPath: "/pgdata")
+            .WithVolume("declared-image-volume", "/data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task TheDefaultImageWarnsAboutADeclaredVolumeOnlyIfItDeclaresOne()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        // Asserted against the default's own version rather than a hard-coded expectation, so this
+        // keeps holding when DocumentDBVersions.Latest crosses the floor.
+        var declaresVolume = Version.Parse(DocumentDBVersions.Latest) >=
+            DocumentDBContainerImageTags.MinimumDeclaredDataVolumeVersion;
+
+        Assert.Equal(declaresVolume, sink.LogEntries.Any(e => e.Level == LogLevel.Warning));
+    }
+
+    [Theory]
+    [InlineData("pg17-0.114.0")]
+    [InlineData("pg17-0.113.0")]
+    public async Task CustomDataTargetPathDoesNotWarnOnPre116Tags(string tag)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag(tag).WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathDoesNotWarnOnACustomImage()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("contoso/documentdb-fork", "pg17-0.116.0")
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task CustomDataTargetPathDoesNotWarnOnAnUnrecognisedTag()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB").WithImageTag("latest").WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SharedDataVolumeOnPre116ImagesThrowsEvenWithExplicitStart()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        // 0.114.0 has no data-directory lock, so an explicitly started peer is not a safety net:
+        // if both ever run, nothing refuses the second one.
+        appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby").WithImageTag("pg17-0.114.0").WithDataVolume(name: "shared-data").WithExplicitStart();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "standby"));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("corrupt it silently", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SharedDataVolumeWithACustomImagePeerThrowsEvenWithExplicitStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("fork")
+            .WithImage("contoso/documentdb-fork", "pg17-0.116.0")
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "fork"));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The warning downgrade is a promise about the official image's <c>flock</c>: the pair may
+    /// share a directory because whichever container starts second refuses to start. A resource
+    /// built from the caller's Dockerfile carries the official image annotation and even builds
+    /// <c>FROM</c> the official image, but what starts is the build output, and nothing has
+    /// established that it still takes the lock. So the pair stays a hard failure.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SharedDataVolumeWithADockerfileBuiltPeerThrowsEvenWithExplicitStart(bool buildIsTheHolder)
+    {
+        var contextPath = CreateOfficialLookingDockerfileContext();
+
+        var appBuilder = CreateAppBuilder();
+
+        var primary = appBuilder.AddDocumentDB("primary")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "shared-data");
+
+        var standby = appBuilder.AddDocumentDB("standby")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        (buildIsTheHolder ? primary : standby).WithDockerfile(contextPath);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "standby"));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Dockerfile build", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The declared-volume warning is advice about the official image's <c>VOLUME /data</c>
+    /// declaration. A caller's Dockerfile decides its own volumes, so repeating that advice would
+    /// be a guess.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildDoesNotWarnAboutTheDeclaredImageVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+
+        // Control: the identical configuration without the Dockerfile build does warn, so the
+        // silence above is the classification and not some unrelated difference.
+        var controlSink = new CapturingLoggerSink();
+        var controlBuilder = CreateAppBuilder(controlSink);
+        controlBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var controlApp = controlBuilder.Build();
+
+        await ConfigureResourceAsync(controlApp, "DocumentDB", controlSink);
+
+        Assert.Contains(controlSink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// The published manifest is where the image annotation stops being what runs: a Dockerfile
+    /// build ships a <c>build</c> instruction and no <c>image</c> at all. The storage guard still
+    /// applies — only the version-dependent half of it is withheld.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildPublishesItsBuildRatherThanTheOfficialImage()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Null(manifest["image"]);
+        Assert.NotNull(manifest["build"]);
+        Assert.Equal("/pgdata", manifest["env"]?["DATA_PATH"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// Only the version-dependent half of the storage guard is withheld. The image-independent
+    /// rules — here, a read-only data directory PostgreSQL cannot initialise — still apply to a
+    /// Dockerfile build.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildIsStillSubjectToTheImageIndependentStorageRules()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithVolume("built-data", "/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The review reproduction, on the capability that is most visible: the declared-volume
+    /// warning is raised only for images known to declare <c>/data</c>, and this resource runs one.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedOfficialImageStillDeclaresItsDataVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("declares '/data' as a container volume", message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And on the capability that is a safety decision: the pair may share a directory only
+    /// because this image refuses the second start.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedOfficialImagePairIsStillInterlocked()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("primary")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "standby", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("exclusive lock", message, StringComparison.Ordinal);
+        Assert.Contains("WithExplicitStart()", message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A private mirror spelled the same way keeps the same treatment: only the registry differs.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedPrivateMirrorStillDeclaresItsDataVolume()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage($"contoso.azurecr.io/{DocumentDBContainerImageTags.Image}", InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.Contains(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A path in front of the repository that is not a registry is part of the repository, so it
+    /// is a different image and keeps the custom-image treatment.
+    /// </summary>
+    [Theory]
+    // Inline, and split across the two annotation fields: the composed reference is the same.
+    [InlineData(null, "evil/documentdb/documentdb-local")]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    [InlineData(null, "harbor.corp.local/library/documentdb/documentdb-local")]
+    [InlineData("harbor.corp.local/library", "documentdb/documentdb-local")]
+    public async Task AnExtraPathSegmentIsNotTheOfficialImage(string? registry, string image)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// Writing the registry into the image without clearing the registry annotation composes
+    /// <c>ghcr.io/documentdb/ghcr.io/...</c>, which resolves to nothing. It is not the official
+    /// image and must not be treated as one.
+    /// </summary>
+    [Fact]
+    public async Task ADoubledRegistryPrefixIsNotTheOfficialImage()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        Assert.Equal(
+            $"{DocumentDBContainerImageTags.Registry}/{QualifiedOfficialImage}:{InterlockedTag}",
+            manifest["image"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// What the manifest ships is the point: the rearranged spelling publishes the same reference
+    /// as the default one, which is why it has to classify the same way.
+    /// </summary>
+    [Fact]
+    public async Task AQualifiedOfficialImagePublishesTheOfficialReference()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!);
+
+        var defaultBuilder = CreateAppBuilder();
+        var byDefault = defaultBuilder.AddDocumentDB("DocumentDB").WithImageTag(InterlockedTag);
+
+        Assert.Equal(
+            (await ManifestUtils.GetManifest(byDefault.Resource))["image"]?.GetValue<string>(),
+            (await ManifestUtils.GetManifest(documentDB.Resource))["image"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// A namespace in front of the repository names a different image, so the pair keeps the
+    /// hard failure: nothing establishes that whatever runs there claims the directory.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    public async Task AnExtraPathSegmentDoesNotDowngradeASharedDataDirectory(string? registry, string image)
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("standby")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithDataVolume(name: "shared-data")
+            .WithExplicitStart();
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "standby"));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the manifest shows why: what ships is the reference the caller actually composed, not
+    /// the official one.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local", "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("harbor.corp.local/library", "documentdb/documentdb-local", "harbor.corp.local/library/documentdb/documentdb-local")]
+    public async Task AnExtraPathSegmentPublishesItsOwnReference(string? registry, string image, string expected)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal($"{expected}:{InterlockedTag}", manifest["image"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// A true private mirror is a registry host and the exact repository beneath it, however the
+    /// caller splits the two fields.
+    /// </summary>
+    [Theory]
+    [InlineData("contoso.azurecr.io", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/documentdb/documentdb-local")]
+    [InlineData("localhost:5000", "documentdb/documentdb-local")]
+    [InlineData(null, "localhost:5000/documentdb/documentdb-local")]
+    public async Task ATrueMirrorIsAHostAndTheExactRepository(string? registry, string image)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithDataVolume(targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.Contains(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A digest resolves to one image and a tag beside it to whatever the caller last typed. The
+    /// declared-volume advice is a property of the release the digest names, which is not knowable,
+    /// so it is withheld — even though the tag reads <c>pg17-0.116.0</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task ADigestBehindACuratedTagDoesNotDeclareADataVolume(string image, string? tag, string? sha256)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(targetPath: "/pgdata");
+        SetImageAnnotation(documentDB, image, tag, sha256);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// And the interlock is the same promise: the digest may name a release that never took the
+    /// lock, so the pair stays a hard failure instead of being downgraded by
+    /// <c>WithExplicitStart()</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task ADigestBehindACuratedTagDoesNotDowngradeASharedDataDirectory(
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        var appBuilder = CreateAppBuilder();
+        var primary = appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
+        var standby = appBuilder.AddDocumentDB("standby").WithDataVolume(name: "shared-data").WithExplicitStart();
+        SetImageAnnotation(primary, image, tag, sha256);
+        SetImageAnnotation(standby, image, tag, sha256);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "standby"));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("an image pinned by digest", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("WithExplicitStart()", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The manifest shows why: what ships is resolved by digest, whatever tag rides along.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task ADigestBehindACuratedTagPublishesTheDigest(string image, string? tag, string? sha256)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        SetImageAnnotation(documentDB, image, tag, sha256);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Contains(
+            $"@sha256:{OlderReleaseDigest}",
+            manifest["image"]?.GetValue<string>(),
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A pair that only warrants a warning must not consume the storage registration: a third
+    /// resource on the same volume still has to fail.
+    /// </summary>
+    [Fact]
+    public async Task AnExplicitlyStartedPeerDoesNotHideALaterHardConflict()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("manual").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data").WithExplicitStart();
+        appBuilder.AddDocumentDB("always-on").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "manual", sink);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "always-on", sink));
+
+        Assert.Contains("'always-on' and DocumentDB resource 'primary'", exception.Message, StringComparison.Ordinal);
+        Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+    }
+
+    /// <summary>
+    /// The same three resources, with the explicitly started one reaching the volume first. Which
+    /// pipeline runs first is not the caller's choice — in publish mode it follows declaration
+    /// order — so the verdict must not depend on it: two always-on resources on one data directory
+    /// are a failure either way.
+    /// </summary>
+    [Fact]
+    public async Task AnExplicitlyStartedPeerThatRegistersFirstStillDoesNotHideAHardConflict()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("manual").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data").WithExplicitStart();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("always-on").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "manual", sink);
+
+        // 'primary' pairs only with the explicitly started 'manual', so it is a warning.
+        await ConfigureResourceAsync(app, "primary", sink);
+
+        // 'always-on' pairs with 'primary' as well, and neither of those two is started by hand.
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "always-on", sink));
+
+        Assert.Contains("'always-on' and DocumentDB resource 'primary'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The warning downgrade itself must stay order-independent: an explicitly started peer that
+    /// registers before the always-on one is still only a warning.
+    /// </summary>
+    [Fact]
+    public async Task SharedDataVolumeWithAnExplicitlyStartedResourceWarnsInEitherOrder()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("standby").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data").WithExplicitStart();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "standby", sink);
+        await ConfigureResourceAsync(app, "primary", sink);
+
+        var (_, _, message) = Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("'primary' and DocumentDB resource 'standby'", message, StringComparison.Ordinal);
+        Assert.Contains("WithExplicitStart()", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StorageSharedWithAPeersInitDataIsNotADataDirectoryConflict()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+
+        // The peer reads the same host directory as seed scripts and TLS material. That is a
+        // read-only input mount on a different container path, not a second cluster on the files.
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataBindMount("./shared");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "secondary-data")
+            .WithInitData("./shared")
+            .WithTlsCertificate("./shared/tls.crt", "./shared/tls.key");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "secondary", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SharedStorageOnDifferentDataPathsIsStillADataDirectoryConflict()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "shared-data", targetPath: "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WithDataVolumeReadOnlyMessageNamesTheRequestedTargetPath()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(
+            () => documentDB.WithDataVolume(isReadOnly: true, targetPath: "/pgdata/"));
+
+        Assert.Equal("isReadOnly", exception.ParamName);
+        Assert.Contains("ownership of '/pgdata'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("permissions of directory \"/pgdata\"", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("/data\"", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WithDataVolumeRejectsAnInvalidTargetPathBeforeComplainingAboutReadOnly()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        var exception = Assert.Throws<ArgumentException>(
+            () => documentDB.WithDataVolume(isReadOnly: true, targetPath: "relative/path"));
+
+        Assert.Equal("targetPath", exception.ParamName);
+    }
+
+    // ---------------------------------------------------------------------
+    // Effective DATA_PATH and container-path canonicalization
+    //
+    // Docker resolves '.', '..' and repeated separators before it mounts, and
+    // DATA_PATH is an ordinary environment variable whose last writer wins.
+    // The guard has to model both, or an alias of the data directory — or an
+    // override that moves it — slips past every rule below.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ReadOnlyRawMountOnADotSegmentAliasOfTheDataPathThrowsAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/tmp/../data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'raw-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DuplicateDataMountsAreDetectedThroughDotSegmentAliases()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "first")
+            .WithVolume("second", "//data/./");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("2 mounts on '/data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The case the aliasing bug made reachable: two resources on images with no data-directory
+    /// interlock, mounting one volume at two spellings of the same container path. Nothing in the
+    /// container would refuse the second start, so the model has to.
+    /// </summary>
+    [Fact]
+    public async Task SharedStorageIsDetectedThroughDotSegmentAliasesOnUninterlockedImages()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag("pg17-0.114.0")
+            .WithVolume("shared-data", "/foo/../data")
+            .WithEnvironment("DATA_PATH", "/foo/../data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // Above-root mount targets
+    //
+    // Docker does not refuse '/../data'; it clamps the destination to '/data'
+    // and mounts there. Verified against the daemon in
+    // DocumentDBStorageBehaviorTests. Treating the mount as "somewhere else"
+    // would let it take over — or collide with — the data directory unseen.
+    // ---------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("/../data")]
+    [InlineData("/../../data")]
+    [InlineData("/../data/../data")]
+    public async Task RawMountTargetsThatEscapeTheContainerRootAreRejected(string target)
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithVolume("raw-data", target);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains($"at '{target}'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("reaches above the container root", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("clamps the target and mounts on '/data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadOnlyRawMountAboveTheContainerRootIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithVolume("raw-data", "/../data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("reaches above the container root", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'raw-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DuplicateRawMountAboveTheContainerRootIsRejected()
+    {
+        // Docker's own answer to this pair is 'Duplicate mount point: /data'; the spelling that
+        // caused it is refused first, because it is the one that is not what it looks like.
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "first")
+            .WithVolume("second", "/../data");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("reaches above the container root", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("volume 'second'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SharedSourceMountedAboveTheContainerRootIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag("pg17-0.114.0")
+            .WithVolume("shared-data", "/../data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("reaches above the container root", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BindMountTargetThatEscapesTheContainerRootIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithBindMount("/host/data", "/../data");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("bind mount of '/host/data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("reaches above the container root", exception.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // A mount on an ancestor of DATA_PATH still backs it
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ReadOnlyAncestorMountOfTheDataPathThrowsAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/data", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts '/data', the directory that backs its data directory ('/data/cluster') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadOnlyAncestorBindMountOfTheDataPathThrowsAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithBindMount("/srv/documentdb", "/data", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", "/data/cluster/./");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("backs its data directory ('/data/cluster')", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("'/srv/documentdb'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DuplicateAncestorMountsOfTheDataPathThrowAtStart()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("first", "/data")
+            .WithVolume("second", "//data/.")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("2 mounts on '/data'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("data directory ('/data/cluster')", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The most specific mount is the one the kernel resolves the path through, so it — and not
+    /// the ancestor — is the mount the rules apply to.
+    /// </summary>
+    [Fact]
+    public async Task TheMostSpecificMountBacksTheDataPath()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("outer", "/data", isReadOnly: true)
+            .WithVolume("inner", "/data/cluster")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.Equal("/data/cluster", environment["DATA_PATH"]);
+    }
+
+    /// <summary>
+    /// Two resources sharing one volume conflict only when their data directories land on the same
+    /// place inside it.
+    /// </summary>
+    [Fact]
+    public async Task SharedVolumeWithTheSameSubdirectoryIsADataDirectoryConflict()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary")
+            .WithImageTag(InterlockedTag)
+            .WithVolume("shared-data", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithVolume("shared-data", "/data")
+            .WithEnvironment("DATA_PATH", "/data/./cluster");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("volume 'shared-data' (subdirectory 'cluster')", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SharedVolumeWithDistinctSubdirectoriesIsNotAConflict()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("primary")
+            .WithImageTag(InterlockedTag)
+            .WithVolume("shared-data", "/data")
+            .WithEnvironment("DATA_PATH", "/data/alpha");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithVolume("shared-data", "/data")
+            .WithEnvironment("DATA_PATH", "/data/beta");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", sink);
+        await ConfigureResourceAsync(app, "secondary", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SharedBindMountWithTheSameSubdirectoryIsADataDirectoryConflict()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb/.", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        // The message names the host directory the cluster really occupies, not the pair of strings
+        // it was spelled with.
+        Assert.Contains(Path.GetFullPath("/srv/documentdb/cluster"), exception.Message, StringComparison.Ordinal);
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ASiblingDirectoryIsNotBackedByTheDataMount()
+    {
+        // '/database' starts with '/data' as a string, but is not below it as a path.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/data", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", "/database");
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.Equal("/database", environment["DATA_PATH"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // DATA_PATH participates in every rule, once
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task RawDataPathEnvironmentOverrideParticipatesInTheReadOnlyCheck()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RawDataPathEnvironmentOverrideParticipatesInTheDuplicateCheck()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("first", "/pgdata")
+            .WithVolume("second", "/pgdata/")
+            .WithEnvironment("DATA_PATH", "/var/../pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("2 mounts on '/pgdata'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RawDataPathEnvironmentOverrideParticipatesInTheSharedStorageCheck()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithImageTag(InterlockedTag).WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary")
+            .WithImageTag(InterlockedTag)
+            .WithVolume("shared-data", "/pgdata")
+            .WithEnvironment("DATA_PATH", "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary"));
+
+        Assert.Contains("volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Ordering matters and is the container's, not the package's: the environment callback that
+    /// runs last decides where DocumentDB writes.
+    /// </summary>
+    [Fact]
+    public async Task DataPathEnvironmentOverrideAfterTheStorageHelperWins()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithBindMount("/host/read-only", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DataPathEnvironmentOverrideBeforeTheStorageHelperLoses()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("DATA_PATH", "/pgdata")
+            .WithDataVolume()
+            .WithBindMount("/host/read-only", "/pgdata", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        // The read-only mount is not on the effective data directory, so it is somebody else's
+        // read-only input and no concern of this guard.
+        var environment = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal("/data", environment["DATA_PATH"]);
+    }
+
+    [Fact]
+    public async Task CallbackSuppliedDataPathParticipatesInStorageChecks()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment(context => context.EnvironmentVariables["DATA_PATH"] = "/var/../pgdata/");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The guard has to see the same <c>DATA_PATH</c> the container gets, and there is only one way
+    /// to be sure of that: read it from the pipeline that produces it. A callback that answers
+    /// differently every time it runs makes any second evaluation visible — Aspire evaluates each
+    /// callback once per run, so the guard, the environment and the container all read
+    /// <c>/pgdata-1</c>, and the read-only mount there is found.
+    /// </summary>
+    [Fact]
+    public async Task AStatefulDataPathCallbackIsEvaluatedOnceAndGuardedOnThatValue()
+    {
+        var evaluations = 0;
+
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("first", "/pgdata-1", isReadOnly: true)
+            .WithVolume("second", "/pgdata-2")
+            .WithEnvironment(context =>
+                context.EnvironmentVariables["DATA_PATH"] =
+                    string.Create(CultureInfo.InvariantCulture, $"/pgdata-{Interlocked.Increment(ref evaluations)}"));
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Equal(1, evaluations);
+        Assert.Contains("mounts its data directory ('/pgdata-1') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same callback, without a rule to break: the value the guard canonicalized is the value
+    /// the pipeline hands the container, and repeating the build does not re-run the callback.
+    /// </summary>
+    [Fact]
+    public async Task AStatefulDataPathCallbackProducesOneValueForBothTheGuardAndTheContainer()
+    {
+        var evaluations = 0;
+
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context =>
+                context.EnvironmentVariables["DATA_PATH"] =
+                    string.Create(CultureInfo.InvariantCulture, $"/srv/./pgdata-{Interlocked.Increment(ref evaluations)}"));
+
+        using var app = appBuilder.Build();
+
+        var first = await ConfigureResourceAsync(app, "DocumentDB");
+        var second = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal(1, evaluations);
+        Assert.Equal("/srv/pgdata-1", first["DATA_PATH"]);
+        Assert.Equal("/srv/pgdata-1", second["DATA_PATH"]);
+    }
+
+    /// <summary>
+    /// A <c>DATA_PATH</c> supplied as a parameter is a value provider, not a string, so it is
+    /// resolved once — here, with the context Aspire's own environment resolution uses — and
+    /// replaced by the canonical result, which is then what the container is given.
+    /// </summary>
+    [Fact]
+    public async Task ParameterSuppliedDataPathParticipatesInStorageChecks()
+    {
+        var appBuilder = CreateAppBuilder();
+        var dataPath = appBuilder.AddParameter("datapath", "/pgdata");
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", dataPath);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ParameterSuppliedDataPathIsResolvedExactlyOnceAndCanonicalized()
+    {
+        var provider = new RecordingValueProvider("/srv/../srv/pgdata/");
+
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context => context.EnvironmentVariables["DATA_PATH"] = provider);
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal("/srv/pgdata", environment["DATA_PATH"]);
+        Assert.Equal(1, provider.ResolutionCount);
+
+        // The value was replaced by the canonical string, so the provider is never consulted again.
+        Assert.Equal("/srv/pgdata", (await ConfigureResourceAsync(app, "DocumentDB"))["DATA_PATH"]);
+        Assert.Equal(1, provider.ResolutionCount);
+    }
+
+    /// <summary>
+    /// Aspire resolves an environment value with a <see cref="ValueProviderContext"/> naming the
+    /// resource that wants it; the guard's single resolution has to carry the same context, or a
+    /// context-sensitive provider would answer the guard and the container differently.
+    /// </summary>
+    [Fact]
+    public async Task ADataPathValueProviderSeesTheResourceThatAsksForIt()
+    {
+        var provider = new RecordingValueProvider("/unused");
+
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context => context.EnvironmentVariables["DATA_PATH"] = provider);
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "DocumentDB");
+
+        await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Same(resource, provider.LastContext?.Caller);
+        Assert.Equal(DistributedApplicationOperation.Run, provider.LastContext?.ExecutionContext?.Operation);
+    }
+
+    /// <summary>
+    /// Running the guard must not turn a question about a filesystem path into a secret lookup.
+    /// Aspire resolves the password because the container needs it; the guard adds no resolution
+    /// of its own, so the count is exactly one.
+    /// </summary>
+    [Fact]
+    public async Task StorageGuardResolvesOnlyTheDataPathValue()
+    {
+        var recordingProvider = new RecordingValueProvider("unused");
+
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithEnvironment(context => context.EnvironmentVariables["SOME_SECRET"] = recordingProvider);
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB");
+
+        // Twice, and both from Aspire: it resolves a container's values once while discovering its
+        // dependencies and once while building its configuration, and the harness reproduces both.
+        // The guard adds nothing — it never looks at a value other than DATA_PATH.
+        Assert.Equal(2, recordingProvider.ResolutionCount);
+    }
+
+    [Theory]
+    [InlineData("/data/..", "resolves to the container root")]
+    [InlineData("//", "resolves to the container root")]
+    [InlineData("/data/../..", "resolves to the container root")]
+    [InlineData("/../data", "reaches above the container root")]
+    [InlineData("/../../pgdata", "reaches above the container root")]
+    [InlineData("pgdata", "is not an absolute path inside the container")]
+    [InlineData("   ", "is not an absolute path inside the container")]
+    public async Task UnusableDataPathIsRejectedAtStart(string dataPath, string expected)
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("DATA_PATH", dataPath);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains($"sets DATA_PATH to '{dataPath}'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expected, exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The entrypoint applies <c>DATA_PATH=${DATA_PATH:-/data}</c>, which treats an empty value
+    /// exactly like an unset one. The guard follows the image rather than inventing a failure, and
+    /// writes the path the container will really use so the dashboard shows it too. Whitespace is
+    /// not empty to the shell — it would be a relative directory name — and is rejected instead.
+    /// </summary>
+    [Fact]
+    public async Task AnEmptyDataPathFollowsTheImageDefault()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/data", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", string.Empty);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnEmptyDataPathIsReplacedByTheImageDefault()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithEnvironment("DATA_PATH", string.Empty);
+
+        using var app = appBuilder.Build();
+
+        Assert.Equal("/data", (await ConfigureResourceAsync(app, "DocumentDB"))["DATA_PATH"]);
+    }
+
+    /// <summary>
+    /// The declared image volume is covered by any mount the runtime resolves onto <c>/data</c>,
+    /// however it was spelled, so an alias suppresses the anonymous-volume warning.
+    /// </summary>
+    [Fact]
+    public async Task ADotSegmentAliasOfTheDeclaredImageVolumeSuppressesTheWarning()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = CreateAppBuilder(sink);
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "pgdata", targetPath: "/pgdata")
+            .WithVolume("declared-image-volume", "/tmp/../data/");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "DocumentDB", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// The read-only input mounts the package adds itself sit on their own container paths and
+    /// must stay unaffected by the data-directory rules, including when the data directory is
+    /// reached through an alias.
+    /// </summary>
+    [Fact]
+    public async Task ReadOnlyInitDataAndTlsMountsAreNotTreatedAsDataMounts()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(targetPath: "/var/lib/../lib/documentdb")
+            .WithInitData("./seed")
+            .WithTlsCertificate("./certs/server.crt", "./certs/server.key");
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "DocumentDB");
+
+        Assert.Equal("/var/lib/documentdb", (await ConfigureResourceAsync(app, "DocumentDB"))["DATA_PATH"]);
+        Assert.All(
+            resource.Annotations.OfType<ContainerMountAnnotation>().Where(mount => mount.IsReadOnly),
+            mount => Assert.NotEqual("/var/lib/documentdb", mount.Target));
+    }
+
+    // ---------------------------------------------------------------------
+    // The entrypoint's own data-path argument
+    //
+    // '--data-path' is documented by the image as "Overrides DATA_PATH
+    // environment variable", and the entrypoint exports it while parsing
+    // arguments. A resource that passes it would move its data directory past
+    // every rule above.
+    // ---------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("--data-path")]
+    [InlineData("-d")]
+    [InlineData("--data-path=/pgdata")]
+    [InlineData("-d=/pgdata")]
+    public async Task ReservedDataPathArgumentsAreRejected(string argument)
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs(argument, "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains($"passes the command-line argument '{argument}'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithDataVolume()", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithDataBindMount(...)", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithEnvironment(\"DATA_PATH\", ...)", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AReservedDataPathArgumentAddedByACallbackIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithArgs(context =>
+            {
+                context.Args.Add("--data-path");
+                context.Args.Add("/pgdata");
+            });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("passes the command-line argument '--data-path'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The guard's callback is appended when the application starts, so it is last whatever order
+    /// the arguments were configured in — including a callback that removes the storage helpers'
+    /// own configuration and adds the argument afterwards.
+    /// </summary>
+    [Fact]
+    public async Task AReservedDataPathArgumentIsRejectedWhicheverOrderItWasAddedIn()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithArgs("--data-path", "/pgdata")
+            .WithDataVolume()
+            .WithArgs("--log-level", "debug");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("passes the command-line argument '--data-path'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ADataPathArgumentRemovedBeforeStartIsNotRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithArgs("--data-path", "/pgdata")
+            .WithArgs(context =>
+            {
+                context.Args.Remove("--data-path");
+                context.Args.Remove("/pgdata");
+            });
+
+        using var app = appBuilder.Build();
+
+        var arguments = await ConfigureArgumentsAsync(app, "DocumentDB");
+
+        Assert.Empty(arguments);
+    }
+
+    [Fact]
+    public async Task UnrelatedArgumentsThatLookSimilarAreNotRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithArgs("--init-data-path", "/seed", "--data-paths", "-dd", "--log-level", "debug");
+
+        using var app = appBuilder.Build();
+
+        var arguments = await ConfigureArgumentsAsync(app, "DocumentDB");
+
+        Assert.Contains("--init-data-path", arguments);
+        Assert.Contains("--data-paths", arguments);
+    }
+
+    // ---------------------------------------------------------------------
+    // Publish mode
+    //
+    // The same rules apply while a manifest is produced, where no container
+    // is started at all: a configuration that would corrupt a data directory
+    // is refused before it can be deployed. A deferred DATA_PATH is the one
+    // exception — in publish mode it stays a manifest expression, and there
+    // is no path to compare with a mount target.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task AReadOnlyDataMountIsRejectedInPublishMode()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithVolume("raw-data", "/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB", operation: DistributedApplicationOperation.Publish));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ASharedDataDirectoryIsRejectedInPublishMode()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "primary", operation: DistributedApplicationOperation.Publish);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "secondary", operation: DistributedApplicationOperation.Publish));
+
+        Assert.Contains("both use the same volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AReservedDataPathArgumentIsRejectedInPublishMode()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume().WithArgs("--data-path", "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB", operation: DistributedApplicationOperation.Publish));
+
+        Assert.Contains("passes the command-line argument '--data-path'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A parameter is a manifest expression in publish mode, not a path. Resolving it is not an
+    /// option — the value belongs to the deployment, and a parameter may be a secret — so a
+    /// resource that also mounts storage is refused rather than published with every storage rule
+    /// silently skipped.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredDataPathWithStorageIsRejectedInPublishMode()
+    {
+        var appBuilder = CreateAppBuilder();
+        var dataPath = appBuilder.AddParameter("datapath", "/pgdata/");
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", dataPath);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB", operation: DistributedApplicationOperation.Publish));
+
+        Assert.Contains("only known at deployment time", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("also mounts storage", exception.Message, StringComparison.Ordinal);
+
+        // The parameter's value is never read, so it cannot reach the message.
+        Assert.DoesNotContain("/pgdata", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same value on a resource that mounts nothing is harmless: there is no storage for it to
+    /// be wrong about, so the manifest keeps the expression.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredDataPathWithoutStorageIsLeftAloneInPublishMode()
+    {
+        var appBuilder = CreateAppBuilder();
+        var dataPath = appBuilder.AddParameter("datapath", "/pgdata/");
+        appBuilder.AddDocumentDB("DocumentDB").WithEnvironment("DATA_PATH", dataPath);
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB", operation: DistributedApplicationOperation.Publish);
+
+        Assert.Equal("{datapath.value}", environment["DATA_PATH"]);
+    }
+
+    /// <summary>
+    /// In run mode the same configuration is checked properly: the value is resolved once, here,
+    /// and the read-only mount underneath it is found.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredDataPathWithStorageIsCheckedInRunMode()
+    {
+        var appBuilder = CreateAppBuilder();
+        var dataPath = appBuilder.AddParameter("datapath", "/pgdata/");
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithVolume("raw-data", "/pgdata", isReadOnly: true)
+            .WithEnvironment("DATA_PATH", dataPath);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // The guard has to be the last word
+    //
+    // Being appended at BeforeStartEvent is not enough: lifecycle hooks and
+    // later BeforeStartEvent subscribers both run afterwards, and either can
+    // append another environment or command-line callback. The guard retakes
+    // the last position at BeforeResourceStartedEvent, and refuses to answer
+    // at all if something got in after that.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// A <see cref="BeforeStartEvent"/> subscriber registered after <c>AddDocumentDB</c> runs after
+    /// the guard installs itself. The guard retakes the last position before the resource starts,
+    /// so the override is seen and judged rather than missed.
+    /// </summary>
+    [Fact]
+    public async Task ADataPathSetByALaterBeforeStartSubscriberIsStillJudged()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithVolume("late", "/pgdata", isReadOnly: true);
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            documentDB.WithEnvironment("DATA_PATH", "/pgdata");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Lifecycle hooks run after <see cref="BeforeStartEvent"/> too, and are the documented way to
+    /// mutate the model late. The same must hold for them.
+    /// </summary>
+    [Fact]
+    public async Task ADataPathSetByALifecycleHookIsStillJudged()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithVolume("late", "/pgdata", isReadOnly: true);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+        appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+            new DataPathLifecycleHook("DocumentDB", "/pgdata"));
+#pragma warning restore CS0618
+
+        using var app = appBuilder.Build();
+
+        // The hook runs between BeforeStartEvent and the orchestrator, exactly as Aspire runs it.
+        await PublishBeforeStartAsync(app);
+#pragma warning disable CS0618 // Type or member is obsolete
+        foreach (var hook in app.Services.GetServices<IDistributedApplicationLifecycleHook>())
+        {
+            await hook.BeforeStartAsync(app.Services.GetRequiredService<DistributedApplicationModel>(), CancellationToken.None);
+        }
+#pragma warning restore CS0618
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ArgumentsAddedByALifecycleHookAreStillJudged()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+        appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+            new DataPathArgumentLifecycleHook("DocumentDB"));
+#pragma warning restore CS0618
+
+        using var app = appBuilder.Build();
+
+        await PublishBeforeStartAsync(app);
+#pragma warning disable CS0618 // Type or member is obsolete
+        foreach (var hook in app.Services.GetServices<IDistributedApplicationLifecycleHook>())
+        {
+            await hook.BeforeStartAsync(app.Services.GetRequiredService<DistributedApplicationModel>(), CancellationToken.None);
+        }
+#pragma warning restore CS0618
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+
+        Assert.Contains("passes the command-line argument '--data-path'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Nothing runs between <see cref="BeforeResourceStartedEvent"/> and the container's
+    /// configuration except another subscriber to that same event. One registered after
+    /// <c>AddDocumentDB</c> can still append a callback, and the guard would then be validating a
+    /// configuration something else had already changed. It fails the resource instead.
+    /// </summary>
+    [Fact]
+    public async Task AnEnvironmentCallbackAddedAfterTheGuardFailsClosed()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithEnvironment("DATA_PATH", "/pgdata");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains("has a later environment callback registered after", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("unchecked data directory", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ACommandLineCallbackAddedAfterTheGuardFailsClosed()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithArgs("--data-path", "/pgdata");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+
+        Assert.Contains("has a later command-line callback registered after", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Publish mode publishes no per-resource event, so a lifecycle hook is already "after the
+    /// guard" there. The fail-closed check is what carries the same safety across.
+    /// </summary>
+    [Fact]
+    public async Task AnEnvironmentCallbackAddedAfterTheGuardFailsClosedInPublishMode()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        using var app = appBuilder.Build();
+
+        await PublishBeforeStartAsync(app);
+        documentDB.WithEnvironment("DATA_PATH", "/pgdata");
+
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "DocumentDB");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildExecutionConfigurationAsync(resource, null, DistributedApplicationOperation.Publish, includeArguments: true, throwOnResolutionFailure: true));
+
+        Assert.Contains("has a later environment callback registered after", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The failure has to describe the shape of the configuration and nothing else: the callback
+    /// that displaced the guard may well be the one carrying a secret.
+    /// </summary>
+    [Fact]
+    public async Task TheFailClosedMessageDoesNotRepeatTheValueThatDisplacedTheGuard()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithEnvironment("SOME_SECRET", "hunter2-should-not-appear");
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.DoesNotContain("hunter2", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("SOME_SECRET", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Retaking the last position must not cost a second evaluation: the annotation is moved, not
+    /// rebuilt, so Aspire's cached result for it survives.
+    /// </summary>
+    [Fact]
+    public async Task RetakingTheLastPositionKeepsTheGuardsSingleEvaluation()
+    {
+        var evaluations = 0;
+
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context =>
+                context.EnvironmentVariables["DATA_PATH"] =
+                    string.Create(CultureInfo.InvariantCulture, $"/srv/pgdata-{Interlocked.Increment(ref evaluations)}"));
+
+        using var app = appBuilder.Build();
+
+        var first = await ConfigureResourceAsync(app, "DocumentDB");
+
+        // A second start attempt re-publishes both events and rebuilds the configuration.
+        var second = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal(1, evaluations);
+        Assert.Equal("/srv/pgdata-1", first["DATA_PATH"]);
+        Assert.Equal("/srv/pgdata-1", second["DATA_PATH"]);
+    }
+
+    // The lifecycle-hook interface is obsolete in favour of eventing subscribers, but Aspire still
+    // runs registered hooks — after BeforeStartEvent — so it remains a way to mutate the model late
+    // and the guard has to hold against it.
+#pragma warning disable CS0618 // Type or member is obsolete
+    private sealed class DataPathLifecycleHook(string resourceName, string dataPath) : IDistributedApplicationLifecycleHook
+    {
+        public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            var resource = appModel.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
+            resource.Annotations.Add(new EnvironmentCallbackAnnotation((Func<EnvironmentCallbackContext, Task>)(context =>
+            {
+                context.EnvironmentVariables["DATA_PATH"] = dataPath;
+                return Task.CompletedTask;
+            })));
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class DataPathArgumentLifecycleHook(string resourceName) : IDistributedApplicationLifecycleHook
+    {
+        public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            var resource = appModel.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
+            resource.Annotations.Add(new CommandLineArgsCallbackAnnotation((Func<CommandLineArgsCallbackContext, Task>)(context =>
+            {
+                context.Args.Add("--data-path");
+                context.Args.Add("/pgdata");
+                return Task.CompletedTask;
+            })));
+            return Task.CompletedTask;
+        }
+    }
+#pragma warning restore CS0618
+
+    // ---------------------------------------------------------------------
+    // Bind identity is the host directory, not the pair of strings
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// One resource binds the parent and writes to a subdirectory; the other binds that
+    /// subdirectory and writes to the mount target. Two spellings, one host directory, two
+    /// PostgreSQL clusters — and on a pre-<c>0.116.0</c> image nothing at runtime would notice.
+    /// </summary>
+    [Fact]
+    public async Task ABindParentAndItsNestedSourceAreTheSameDataDirectory()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("parent")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+        appBuilder.AddDocumentDB("nested")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb/cluster", "/data");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "parent");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "nested"));
+
+        Assert.Contains(Path.GetFullPath("/srv/documentdb/cluster"), exception.Message, StringComparison.Ordinal);
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>The same pair in the other registration order.</summary>
+    [Fact]
+    public async Task ANestedBindSourceAndItsParentAreTheSameDataDirectory()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("nested")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb/cluster", "/data");
+        appBuilder.AddDocumentDB("parent")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/./cluster");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "nested");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "parent"));
+
+        Assert.Contains(Path.GetFullPath("/srv/documentdb/cluster"), exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A deeper nesting, and one where the subdirectory itself has several segments.
+    /// </summary>
+    [Fact]
+    public async Task ABindSourceIsCombinedWithTheWholeDataPathSubdirectory()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("parent")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv", "/data")
+            .WithEnvironment("DATA_PATH", "/data/documentdb/cluster");
+        appBuilder.AddDocumentDB("nested")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+
+        using var app = appBuilder.Build();
+
+        await ConfigureResourceAsync(app, "parent");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "nested"));
+
+        Assert.Contains(Path.GetFullPath("/srv/documentdb/cluster"), exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Sibling subdirectories of one bind source are still two directories.
+    /// </summary>
+    [Fact]
+    public async Task DistinctSubdirectoriesOfOneBindSourceAreNotShared()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("alpha")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/alpha");
+        appBuilder.AddDocumentDB("beta")
+            .WithBindMount("/srv/documentdb/beta", "/data");
+
+        using var app = appBuilder.Build();
+        var sink = new CapturingLoggerSink();
+
+        await ConfigureResourceAsync(app, "alpha", sink);
+        await ConfigureResourceAsync(app, "beta", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// The subdirectory of a bind mount is a host path segment once the container writes through
+    /// the mount, so whether <c>Cluster</c> and <c>cluster</c> are one directory is the host's
+    /// answer, not Linux's. The assertion follows the platform the test runs on, which is the same
+    /// rule the guard applies to bind sources themselves.
+    /// </summary>
+    [Fact]
+    public async Task ABindSubdirectoryFollowsTheHostsCaseRules()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("lower")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+        appBuilder.AddDocumentDB("upper")
+            .WithImageTag("pg17-0.114.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/Cluster");
+
+        using var app = appBuilder.Build();
+        var sink = new CapturingLoggerSink();
+
+        await ConfigureResourceAsync(app, "lower", sink);
+
+        if (OperatingSystem.IsLinux())
+        {
+            // Case-sensitive host: two directories.
+            await ConfigureResourceAsync(app, "upper", sink);
+            Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+            return;
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "upper", sink));
+
+        Assert.Contains("no data-directory interlock", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A volume name is not a host path, so its subdirectory is read by the container on its own
+    /// case-sensitive filesystem. That answer is the same on every host.
+    /// </summary>
+    [Fact]
+    public async Task AVolumeSubdirectoryIsAlwaysCaseSensitive()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("lower")
+            .WithVolume("shared-data", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+        appBuilder.AddDocumentDB("upper")
+            .WithVolume("shared-data", "/data")
+            .WithEnvironment("DATA_PATH", "/data/Cluster");
+
+        using var app = appBuilder.Build();
+        var sink = new CapturingLoggerSink();
+
+        await ConfigureResourceAsync(app, "lower", sink);
+        await ConfigureResourceAsync(app, "upper", sink);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    // ---------------------------------------------------------------------
+    // Deferred command-line tokens
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// A token whose value arrives later sits where the entrypoint reads an option name. It could
+    /// resolve to <c>--data-path</c>, and the only way to know would be to resolve it a second
+    /// time, so the resource is failed instead.
+    /// </summary>
+    [Theory]
+    [InlineData(DistributedApplicationOperation.Run)]
+    [InlineData(DistributedApplicationOperation.Publish)]
+    public async Task AParameterInAnOptionNamePositionIsRejected(DistributedApplicationOperation operation)
+    {
+        var appBuilder = CreateAppBuilder();
+        // The value is what makes this dangerous, and it is deliberately distinctive so the
+        // assertion below can prove the guard never read it.
+        var flag = appBuilder.AddParameter("flag", "--data-path=/secret-cluster-location");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs(flag, "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB", operation: operation));
+
+        Assert.Contains("only known later", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("reads an option name", exception.Message, StringComparison.Ordinal);
+
+        // The token is never resolved, so nothing it holds can reach the message.
+        Assert.DoesNotContain("secret-cluster-location", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(DistributedApplicationOperation.Run)]
+    [InlineData(DistributedApplicationOperation.Publish)]
+    public async Task AReferenceExpressionInAnOptionNamePositionIsRejected(DistributedApplicationOperation operation)
+    {
+        var appBuilder = CreateAppBuilder();
+        var prefix = appBuilder.AddParameter("prefix", "--data");
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithArgs(ReferenceExpression.Create($"{prefix}-path"), "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB", operation: operation));
+
+        Assert.Contains("reads an option name", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ADeferredTokenAsTheFirstArgumentIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        var flag = appBuilder.AddParameter("flag", "--log-level");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs(flag);
+
+        using var app = appBuilder.Build();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+    }
+
+    /// <summary>
+    /// The entrypoint's grammar is <c>--option value</c>, so a token directly after an option that
+    /// takes a value is that option's operand and can never be read as an option name. Those are
+    /// left alone — a deferred value is the normal way to pass a password or a port.
+    /// </summary>
+    [Theory]
+    [InlineData(DistributedApplicationOperation.Run)]
+    [InlineData(DistributedApplicationOperation.Publish)]
+    public async Task ADeferredTokenInAnOperandPositionIsAllowed(DistributedApplicationOperation operation)
+    {
+        var appBuilder = CreateAppBuilder();
+        var level = appBuilder.AddParameter("level", "debug");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--log-level", level);
+
+        using var app = appBuilder.Build();
+
+        var arguments = await ConfigureArgumentsAsync(app, "DocumentDB", operation: operation);
+
+        Assert.Equal("--log-level", arguments[0]);
+        Assert.Equal(2, arguments.Length);
+    }
+
+    /// <summary>
+    /// The entrypoint consumes exactly one token after a value-taking option, whatever that token
+    /// looks like. <c>--username --owner X</c> therefore feeds <c>--owner</c> to <c>--username</c>
+    /// and reads <c>X</c> as an option name — verified against the image, which answers
+    /// <c>Using username: --owner</c> and then honours <c>--data-path</c>. A model that only
+    /// tracked operands for deferred tokens would think <c>X</c> was sheltered by <c>--owner</c>.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredTokenAfterAnOptionThatWasItselfAnOperandIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        var flag = appBuilder.AddParameter("flag", "--data-path");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--username", "--owner", flag, "/pwned");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+
+        Assert.Contains("reads an option name", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same rule the other way round: a literal <c>--data-path</c> sitting in an operand
+    /// position is a value, not an option, and the entrypoint treats it as one
+    /// (<c>LOG_LEVEL=--data-path</c>). Failing it would be a false positive.
+    /// </summary>
+    [Fact]
+    public async Task AReservedNameInAnOperandPositionIsNotAnOption()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--log-level", "--data-path");
+
+        using var app = appBuilder.Build();
+
+        var arguments = await ConfigureArgumentsAsync(app, "DocumentDB");
+
+        Assert.Equal(["--log-level", "--data-path"], arguments);
+    }
+
+    /// <summary>
+    /// A deferred token as the operand of an option that itself sat in an operand position is back
+    /// in an option-name slot.
+    /// </summary>
+    [Fact]
+    public async Task OperandTrackingResumesAfterEachConsumedToken()
+    {
+        var appBuilder = CreateAppBuilder();
+        var level = appBuilder.AddParameter("level", "debug");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--log-level", level, "--owner", "documentdb");
+
+        using var app = appBuilder.Build();
+
+        var arguments = await ConfigureArgumentsAsync(app, "DocumentDB");
+
+        Assert.Equal(4, arguments.Length);
+    }
+
+    /// <summary>
+    /// An option that takes no operand does not shelter the token after it: the entrypoint reads
+    /// that one as the next option name.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredTokenAfterAValuelessOptionIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        var flag = appBuilder.AddParameter("flag", "--data-path");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--skip-init-data", flag, "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+
+        Assert.Contains("reads an option name", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An option that carries its own operand (<c>--option=value</c>) does not shelter the next
+    /// token either.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredTokenAfterAJoinedOptionIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        var flag = appBuilder.AddParameter("flag", "--data-path");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--log-level=debug", flag);
+
+        using var app = appBuilder.Build();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+    }
+
+    /// <summary>
+    /// Two operands in a row: the second is not sheltered by the first.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredTokenAfterAnOperandIsRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        var flag = appBuilder.AddParameter("flag", "--data-path");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--log-level", "debug", flag);
+
+        using var app = appBuilder.Build();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Manifest publishing
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The manifest writer builds environment and arguments through the same pipeline the container
+    /// creator uses, so the guard applies to <c>aspire publish</c> as well: a manifest that would
+    /// deploy two DocumentDB resources onto one data directory is refused rather than written.
+    /// </summary>
+    [Fact]
+    public async Task PublishingAManifestRefusesTwoResourcesOnOneDataDirectory()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("primary").WithDataVolume(name: "shared-data");
+        appBuilder.AddDocumentDB("secondary").WithDataVolume(name: "shared-data");
+
+        using var app = appBuilder.Build();
+
+        var primary = await PublishManifestAsync(app, "primary");
+        Assert.Equal("/data", primary["env"]?["DATA_PATH"]?.ToString());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "secondary"));
+
+        Assert.Contains("both use the same volume 'shared-data'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PublishingAManifestRefusesTwoResourcesOnOneHostDirectory()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("parent")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithEnvironment("DATA_PATH", "/data/cluster");
+        appBuilder.AddDocumentDB("nested").WithBindMount("/srv/documentdb/cluster", "/data");
+
+        using var app = appBuilder.Build();
+
+        await PublishManifestAsync(app, "parent");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "nested"));
+
+        Assert.Contains(Path.GetFullPath("/srv/documentdb/cluster"), exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PublishingAManifestRefusesTheEntrypointsDataPathArgument()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume().WithArgs("--data-path", "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("passes the command-line argument '--data-path'", exception.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // The guard is part of the model before anything can read it
+    //
+    // Aspire records each callback's result the first time a pipeline is
+    // gathered and then takes the last annotation's recording as the answer
+    // for the rest of the run. A callback that appears after a gather does not
+    // add to that answer, it replaces it - so a guard installed by a lifecycle
+    // event would drop every value produced before that event.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The guard participates in the very first gather, before any event is published. This is the
+    /// negative control for eager installation: with the guard introduced by a lifecycle event
+    /// instead, this gather produces no <c>DATA_PATH</c> at all.
+    /// </summary>
+    [Fact]
+    public async Task TheStorageGuardIsPartOfTheEnvironmentPipelineBeforeAnyEventIsPublished()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithDataVolume();
+
+        using var app = appBuilder.Build();
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single();
+
+        var environment = await BuildEnvironmentVariablesAsync(resource);
+
+        Assert.Equal("/data", environment["DATA_PATH"]);
+        Assert.True(environment.ContainsKey("USERNAME"));
+        Assert.True(environment.ContainsKey("PASSWORD"));
+    }
+
+    /// <summary>
+    /// A subscriber registered before <c>AddDocumentDB</c> runs before this package's own
+    /// <see cref="BeforeStartEvent"/> subscriber, and building the configuration through the public
+    /// <see cref="ExecutionConfigurationBuilder"/> is exactly what Aspire itself does. Every value
+    /// the resource had already produced has to survive that.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherFromASubscriberRegisteredBeforeAddDocumentDBKeepsEveryValue()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        var gathered = 0;
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var early = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(early)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+            Interlocked.Increment(ref gathered);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(targetPath: "/pgdata")
+            .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithOwner("contoso");
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal(1, gathered);
+        Assert.Equal("admin", environment["USERNAME"]);
+        Assert.False(string.IsNullOrEmpty(environment["PASSWORD"]));
+        Assert.Equal("debug", environment["LOG_LEVEL"]);
+        Assert.Equal("contoso", environment["OWNER"]);
+        Assert.Equal("/pgdata", environment["DATA_PATH"]);
+    }
+
+    /// <summary>
+    /// The publish side of the same thing, through Aspire's own manifest writer.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherFromASubscriberRegisteredBeforeAddDocumentDBKeepsEveryValueInTheManifest()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var early = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(early)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithoutSampleData();
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Equal("admin", manifest["env"]?["USERNAME"]?.ToString());
+        Assert.Equal("{DocumentDB-password.value}", manifest["env"]?["PASSWORD"]?.ToString());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.ToString());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
+    }
+
+    /// <summary>
+    /// Installing the guard before <c>AddDocumentDB</c> returns has to leave the storage rules
+    /// exactly as sharp: this is the same read-only mount the guard rejects on a later phase.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherStillAppliesTheStorageRules()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var resource = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB").WithVolume("raw-data", "/data", isReadOnly: true);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => PublishBeforeStartAsync(app));
+
+        Assert.Contains("mounts its data directory ('/data') read-only", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The one shape an early gather cannot be made to work for: a raw Aspire
+    /// <c>WithEnvironment(...)</c> added after <c>AddDocumentDB</c> sits behind the guard until the
+    /// first lifecycle phase moves the guard back, and a subscriber registered before
+    /// <c>AddDocumentDB</c> reads the configuration before that phase. Aspire would then answer with
+    /// a recording made in the wrong position, so the resource is failed instead of being started on
+    /// an environment nobody checked.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherBehindACallerCallbackAddedAfterAddDocumentDBIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var resource = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithEnvironment("CONTOSO", "value");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => PublishBeforeStartAsync(app));
+
+        Assert.Contains("has a later environment callback registered after its data-storage guard", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("register a subscriber that does read it after AddDocumentDB", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the recovery the message names actually works: registering the same subscriber after
+    /// <c>AddDocumentDB</c> lets this package take the last position first.
+    /// </summary>
+    [Fact]
+    public async Task AnEarlyGatherFromASubscriberRegisteredAfterAddDocumentDBKeepsCallerValues()
+    {
+        var appBuilder = CreateAppBuilder();
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithEnvironment("CONTOSO", "value");
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>(async (evt, ct) =>
+        {
+            var resource = evt.Model.Resources.OfType<DocumentDBServerResource>().Single();
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    ct);
+        });
+
+        using var app = appBuilder.Build();
+
+        var environment = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal("admin", environment["USERNAME"]);
+        Assert.Equal("value", environment["CONTOSO"]);
+        Assert.Equal("/data", environment["DATA_PATH"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // The manifest entry and the model it was checked against
+    //
+    // Aspire writes a container's image, entrypoint and mounts before it
+    // evaluates the environment callbacks and its bindings after them, so a
+    // supported WithEnvironment(...) callback can change the resource while it
+    // is being serialized. Every test below drives the real
+    // ManifestPublishingContext.WriteResourceAsync.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task AMountAddedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context => context.Resource.Annotations.Add(
+                new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: false)));
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("while its manifest entry was being written", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("a volume or bind mount was added, removed or changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AMountRemovedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "documentdb-data")
+            .WithEnvironment(context =>
+            {
+                var mount = context.Resource.Annotations.OfType<ContainerMountAnnotation>().Single();
+                context.Resource.Annotations.Remove(mount);
+            });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("a volume or bind mount was added, removed or changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnEndpointChangedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context =>
+            {
+                var endpoint = context.Resource.Annotations.OfType<EndpointAnnotation>().First();
+                endpoint.TargetPort = 15000;
+            });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("an endpoint was added, removed, reordered or re-pointed", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnImageChangedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithEnvironment(_ => documentDB.WithImageTag("pg17-0.114.0"));
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("the image it will run changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A registry swapped from inside the environment evaluation names the same release, so
+    /// nothing this package knows about the image changes: the repository is still the curated
+    /// one, the tag is still the same version, and every floor still answers the same. What does
+    /// change is the reference the entry carries — and Aspire wrote that reference before the
+    /// callback ran, so the published manifest would send every deployment to the registry the
+    /// resource was configured with rather than the one it ended up naming.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryChangedWhileTheManifestIsWrittenIsRefusedAfterTheOldOneWasAlreadyEmitted()
+    {
+        const string Mirror = "mirror.example";
+
+        var written = $"{QualifiedOfficialImage}:{DocumentDBContainerImageTags.Tag}";
+        var modelled = $"{Mirror}/{DocumentDBContainerImageTags.Image}:{DocumentDBContainerImageTags.Tag}";
+
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithEnvironment(_ => documentDB.WithImageRegistry(Mirror));
+
+        using var app = appBuilder.Build();
+
+        var (failure, entry) = await WriteManifestExpectingFailureAsync(app, "DocumentDB");
+
+        // The writer had already emitted the registry the resource was configured with.
+        Assert.Contains($"\"image\":\"{written}\"", entry, StringComparison.Ordinal);
+        Assert.DoesNotContain(Mirror, entry, StringComparison.Ordinal);
+
+        // The model, by then, names the mirror instead.
+        Assert.True(documentDB.Resource.TryGetContainerImageName(out var reference));
+        Assert.Equal(modelled, reference);
+
+        // And the checkpoint refuses the publish rather than shipping the entry that disagrees.
+        Assert.Contains("while its manifest entry was being written", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("the exact image reference it publishes changed", failure.Message, StringComparison.Ordinal);
+
+        // The reference is configuration, not a credential, but neither reference is needed to say
+        // what went wrong and neither is put in the message.
+        Assert.DoesNotContain(written, failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(modelled, failure.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The refusal is a refusal of the whole publish, exactly as it is for every other structural
+    /// change: <c>aspire publish</c> exits non-zero and leaves no usable manifest behind.
+    /// </summary>
+    [Fact]
+    public async Task APublishThatChangesTheRegistryWhileWritingFailsClosed()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+            documentDB.WithEnvironment(_ => documentDB.WithImageRegistry("mirror.example"));
+        });
+
+        Assert.Contains("while its manifest entry was being written", log, StringComparison.Ordinal);
+        Assert.Contains("the exact image reference it publishes changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A caller's own writer is delegated to rather than displaced, so it is just as able to change
+    /// the model between the field it wrote and the checkpoint that judges it — and it is judged
+    /// the same way.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryChangedByADelegatedCustomWriterIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithManifestPublishingCallback(async context =>
+        {
+            await context.WriteContainerAsync(documentDB.Resource);
+            documentDB.WithImageRegistry("mirror.example");
+        });
+
+        using var app = appBuilder.Build();
+
+        var (failure, entry) = await WriteManifestExpectingFailureAsync(app, "DocumentDB");
+
+        Assert.Contains(
+            $"\"image\":\"{QualifiedOfficialImage}:{DocumentDBContainerImageTags.Tag}\"",
+            entry,
+            StringComparison.Ordinal);
+        Assert.Contains("the exact image reference it publishes changed", failure.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Negative control: a registry re-declared as the one it already was changes no byte of the
+    /// entry, so the publish is the one an unmutated model produces.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryReDeclaredIdenticallyWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+
+        var reDeclared = await PublishOnceAsync(documentDB => documentDB.WithEnvironment(
+            _ => documentDB.WithImageRegistry(DocumentDBContainerImageTags.Registry)));
+
+        Assert.Equal(
+            $"{QualifiedOfficialImage}:{DocumentDBContainerImageTags.Tag}",
+            expected["image"]?.ToString());
+        Assert.Equal(expected.ToJsonString(), reDeclared.ToJsonString());
+
+        static async Task<JsonNode> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(name: "documentdb-data");
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return await PublishManifestAsync(app, "DocumentDB");
+        }
+    }
+
+    /// <summary>
+    /// Negative control: a container build the caller owns publishes <c>build</c> and no
+    /// <c>image</c> at all, so the composed reference is not what the entry carries and a registry
+    /// set on the annotation beside the build falsifies nothing that was written. What protects
+    /// such a resource is the build-definition snapshot, which records the whole <c>build</c>
+    /// object — and which the other tests in this section drive.
+    /// </summary>
+    [Fact]
+    public async Task ARegistryChangedOnADockerfileBuildWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+
+        var mutated = await PublishOnceAsync(documentDB => documentDB.WithEnvironment(
+            _ => documentDB.WithImageRegistry("mirror.example")));
+
+        Assert.Null(expected["image"]);
+        Assert.Equal("final", expected["build"]?["stage"]?.ToString());
+        Assert.Equal(expected.ToJsonString(), mutated.ToJsonString());
+
+        static async Task<JsonNode> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+            documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final"));
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return await PublishManifestAsync(app, "DocumentDB");
+        }
+    }
+
+    [Fact]
+    public async Task AnEntrypointChangedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment(context =>
+            {
+                if (context.Resource is ContainerResource container)
+                {
+                    container.Entrypoint = "/bin/sh";
+                }
+            });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("its container entrypoint changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The refusal has to be a refusal of the whole operation, not just of one entry: the fields
+    /// already handed to the writer cannot be taken back, so the only safe outcome is a publish
+    /// that fails and leaves no usable manifest.
+    /// </summary>
+    [Fact]
+    public async Task APublishThatMutatesTheModelWhileWritingFailsClosed()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithEnvironment(context => context.Resource.Annotations.Add(
+                    new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: false))));
+
+        Assert.Contains("while its manifest entry was being written", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Writing environment values is what environment callbacks are for, and a callback that only
+    /// does that changes nothing structural.
+    /// </summary>
+    [Fact]
+    public async Task EnvironmentValuesWrittenWhileTheManifestIsWrittenArePublishedUnchanged()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume(name: "documentdb-data")
+            .WithEnvironment(context => context.EnvironmentVariables["CONTOSO"] = "value");
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Equal("value", manifest["env"]?["CONTOSO"]?.ToString());
+        Assert.Equal("documentdb-data", manifest["volumes"]?[0]?["name"]?.ToString());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
+    }
+
+    /// <summary>
+    /// Re-declaring the same storage, or merely reordering it, is a no-op: the mounts were written
+    /// before the callback ran, so the entry is the one an unmutated model produces, byte for byte.
+    /// </summary>
+    [Fact]
+    public async Task AMountReorderedOrReDeclaredIdenticallyWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+
+        var reordered = await PublishOnceAsync(builder => builder.WithEnvironment(context =>
+        {
+            var mounts = context.Resource.Annotations.OfType<ContainerMountAnnotation>().ToList();
+            foreach (var mount in mounts)
+            {
+                context.Resource.Annotations.Remove(mount);
+            }
+
+            foreach (var mount in Enumerable.Reverse(mounts))
+            {
+                context.Resource.Annotations.Add(mount);
+            }
+        }));
+
+        var reDeclared = await PublishOnceAsync(builder => builder.WithEnvironment(context =>
+        {
+            var mount = context.Resource.Annotations.OfType<ContainerMountAnnotation>()
+                .Single(annotation => annotation.Target == "/data");
+            context.Resource.Annotations.Remove(mount);
+            context.Resource.Annotations.Add(
+                new ContainerMountAnnotation(mount.Source, mount.Target, mount.Type, mount.IsReadOnly));
+        }));
+
+        Assert.Equal(expected, reordered);
+        Assert.Equal(expected, reDeclared);
+
+        static async Task<string> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithDataVolume(name: "documentdb-data")
+                .WithInitData("./seed");
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return (await PublishManifestAsync(app, "DocumentDB")).ToString();
+        }
+    }
+
+    /// <summary>
+    /// Every build definition resolves to the same effective image — "this image is built from a
+    /// Dockerfile the caller owns" — so the image alone cannot tell one from another. Aspire writes
+    /// the whole <c>build</c> object before it evaluates a single environment callback, which is
+    /// what makes swapping the definition from inside one invisible in the entry that was written.
+    /// </summary>
+    [Fact]
+    public async Task ABuildDefinitionReplacedWhileTheManifestIsWrittenIsRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final"));
+        documentDB.WithEnvironment(context =>
+        {
+            var build = context.Resource.Annotations.OfType<DockerfileBuildAnnotation>().Single();
+            context.Resource.Annotations.Remove(build);
+            context.Resource.Annotations.Add(
+                new DockerfileBuildAnnotation("/elsewhere", "/elsewhere/Dockerfile", "release"));
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("while its manifest entry was being written", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            "the container build definition it publishes was added, removed or replaced",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Replacement is judged by identity even when the replacement carries the same values, because
+    /// <see cref="DockerfileBuildAnnotation.DockerfileFactory"/> generates the Dockerfile's content
+    /// and cannot be compared by value: "the same values" does not mean "the same build".
+    /// </summary>
+    [Fact]
+    public async Task ABuildDefinitionReplacedByAnIdenticallyValuedOneIsStillRefused()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final"));
+        documentDB.WithEnvironment(context =>
+        {
+            var build = context.Resource.Annotations.OfType<DockerfileBuildAnnotation>().Single();
+            context.Resource.Annotations.Remove(build);
+            context.Resource.Annotations.Add(
+                new DockerfileBuildAnnotation(build.ContextPath, build.DockerfilePath, build.Stage));
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains(
+            "the container build definition it publishes was added, removed or replaced",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The build arguments, the image name and tag, the entry-point flag and the generated
+    /// <c>.dockerignore</c> are settable on the annotation that is already there, so replacing it
+    /// is not the only way to change what the entry should have said.
+    /// </summary>
+    [Theory]
+    [InlineData("argument")]
+    [InlineData("image-name")]
+    [InlineData("build-only")]
+    public async Task ABuildDefinitionMutatedInPlaceWhileTheManifestIsWrittenIsRefused(string mutation)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        var build = new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null);
+        build.BuildArguments["ARG_ONE"] = "one";
+        documentDB.WithAnnotation(build);
+
+        documentDB.WithEnvironment(_ =>
+        {
+            switch (mutation)
+            {
+                case "argument":
+                    build.BuildArguments["ARG_TWO"] = "two";
+                    break;
+                case "image-name":
+                    build.ImageName = "contoso/documentdb-fork";
+                    break;
+                default:
+                    build.HasEntrypoint = false;
+                    break;
+            }
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains(
+            "the container build definition it publishes changed",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A build secret changed during serialization is caught like any other part of the definition,
+    /// and neither the value that was recorded nor the one that replaced it appears anywhere in the
+    /// diagnostic.
+    /// </summary>
+    [Fact]
+    public async Task ABuildSecretChangedWhileTheManifestIsWrittenIsRefusedWithoutNamingIt()
+    {
+        const string RecordedSecret = "recorded-build-secret-value";
+        const string ReplacementSecret = "replacement-build-secret-value";
+
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        var build = new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null);
+        build.BuildSecrets["REGISTRY_TOKEN"] = RecordedSecret;
+        documentDB.WithAnnotation(build);
+        documentDB.WithEnvironment(_ => build.BuildSecrets["REGISTRY_TOKEN"] = ReplacementSecret);
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains(
+            "the container build definition it publishes changed",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(RecordedSecret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ReplacementSecret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("REGISTRY_TOKEN", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ABuildDefinitionAddedOrRemovedWhileTheManifestIsWrittenIsRefused(bool startsWithBuild)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        if (startsWithBuild)
+        {
+            documentDB.WithAnnotation(new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null));
+        }
+
+        documentDB.WithEnvironment(context =>
+        {
+            if (context.Resource.Annotations.OfType<DockerfileBuildAnnotation>().SingleOrDefault() is { } build)
+            {
+                context.Resource.Annotations.Remove(build);
+                return;
+            }
+
+            context.Resource.Annotations.Add(
+                new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", stage: null));
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishManifestAsync(app, "DocumentDB"));
+
+        Assert.Contains("while its manifest entry was being written", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A build definition nothing touches is published exactly as it would be with no callback at
+    /// all — including its arguments and secrets — and writing environment values alongside it is
+    /// not a structural change.
+    /// </summary>
+    [Fact]
+    public async Task ABuildDefinitionLeftAloneWhileTheManifestIsWrittenIsPublishedUnchanged()
+    {
+        var expected = await PublishOnceAsync(_ => { });
+        var withEnvironmentValues = await PublishOnceAsync(builder =>
+            builder.WithEnvironment(context => context.EnvironmentVariables["CONTOSO"] = "value"));
+
+        Assert.Equal("final", expected["build"]?["stage"]?.ToString());
+        Assert.Equal("one", expected["build"]?["args"]?["ARG_ONE"]?.ToString());
+        Assert.Equal("env", expected["build"]?["secrets"]?["REGISTRY_TOKEN"]?["type"]?.ToString());
+        Assert.Equal(expected["build"]?.ToJsonString(), withEnvironmentValues["build"]?.ToJsonString());
+        Assert.Equal("value", withEnvironmentValues["env"]?["CONTOSO"]?.ToString());
+
+        static async Task<JsonNode> PublishOnceAsync(Action<IResourceBuilder<DocumentDBServerResource>> configure)
+        {
+            var appBuilder = CreateAppBuilder();
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(name: "documentdb-data");
+            var build = new DockerfileBuildAnnotation("/src/context", "/src/context/Dockerfile", "final");
+            build.BuildArguments["ARG_ONE"] = "one";
+            build.BuildSecrets["REGISTRY_TOKEN"] = "recorded-build-secret-value";
+            documentDB.WithAnnotation(build);
+            configure(documentDB);
+
+            using var app = appBuilder.Build();
+            return await PublishManifestAsync(app, "DocumentDB");
+        }
+    }
+
+    /// <summary>
+    /// A resource taken out of the manifest has no published entry to check, and a caller's own
+    /// writer still writes the entry it would have written.
+    /// </summary>
+    [Fact]
+    public async Task ManifestExclusionsAndCustomWritersAreLeftAlone()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("excluded")
+            .WithDataVolume()
+            .ExcludeFromManifest();
+        appBuilder.AddDocumentDB("custom")
+            .WithDataVolume(name: "custom-data")
+            .WithManifestPublishingCallback(context =>
+            {
+                context.Writer.WriteString("type", "custom.v0");
+                return Task.CompletedTask;
+            });
+
+        using var app = appBuilder.Build();
+        await PublishBeforeStartAsync(app);
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        Assert.Null(await ManifestUtils.GetManifestOrNull(
+            model.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "excluded")));
+
+        var custom = await ManifestUtils.GetManifest(
+            model.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == "custom"));
+
+        Assert.Equal("custom.v0", custom["type"]?.ToString());
+        Assert.Null(custom["volumes"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // DATA_PATH is always stated
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The rules above are about <c>/data</c> whenever nothing else names a directory, so
+    /// <c>/data</c> is what the container is told to use. Leaving it unset would let an image whose
+    /// own default is somewhere else write to a directory the guard never looked at.
+    /// </summary>
+    [Fact]
+    public async Task AnAbsentDataPathIsWrittenAsTheCanonicalDefault()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB");
+
+        using var app = appBuilder.Build();
+
+        Assert.Equal("/data", (await ConfigureResourceAsync(app, "DocumentDB"))["DATA_PATH"]);
+    }
+
+    [Fact]
+    public async Task AnAbsentDataPathIsWrittenOnACustomImageToo()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB").WithImage("contoso/documentdb-fork", "pg17-0.116.0");
+
+        using var app = appBuilder.Build();
+
+        Assert.Equal("/data", (await ConfigureResourceAsync(app, "DocumentDB"))["DATA_PATH"]);
+    }
+
+    [Fact]
+    public async Task AnAbsentDataPathIsWrittenIntoTheManifest()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB");
+
+        using var app = appBuilder.Build();
+
+        var manifest = await PublishManifestAsync(app, "DocumentDB");
+
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
+    }
+
+    /// <summary>
+    /// A callback that removes <c>DATA_PATH</c> after a storage helper set it does not leave the
+    /// container to its image default either.
+    /// </summary>
+    [Fact]
+    public async Task ADataPathRemovedByALaterCallbackFallsBackToTheCanonicalDefault()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithEnvironment(context => context.EnvironmentVariables.Remove("DATA_PATH"));
+
+        using var app = appBuilder.Build();
+
+        Assert.Equal("/data", (await ConfigureResourceAsync(app, "DocumentDB"))["DATA_PATH"]);
+    }
+
+    /// <summary>
+    /// An <see cref="IValueProvider"/> that records what asked it for its value, so a test can
+    /// assert how many times — and with what context — the pipeline resolved it.
+    /// </summary>
+    private sealed class RecordingValueProvider(string value) : IValueProvider
+    {
+        private int _resolutionCount;
+
+        public int ResolutionCount => Volatile.Read(ref _resolutionCount);
+
+        public ValueProviderContext? LastContext { get; private set; }
+
+        public ValueTask<string?> GetValueAsync(CancellationToken cancellationToken = default) =>
+            GetValueAsync(new ValueProviderContext(), cancellationToken);
+
+        public ValueTask<string?> GetValueAsync(ValueProviderContext context, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _resolutionCount);
+            LastContext = context;
+            return ValueTask.FromResult<string?>(value);
+        }
+    }
+
+    [Fact]
+    public async Task WithInitDataReadOnlyMountIsNotTreatedAsADataMount()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDataVolume()
+            .WithInitData("./seed");
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var initDataMount = Assert.Single(resource.Annotations.OfType<ContainerMountAnnotation>().Where(m => m.Target == "/init_doc_db.d"));
+        Assert.True(initDataMount.IsReadOnly);
+
+        await PublishBeforeResourceStartedAsync(app, resource);
+    }
+
+    [Fact]
+    public async Task WithDataVolumeIsRepresentedInTheManifest()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataVolume(name: "documentdb-data");
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("documentdb-data", manifest["volumes"]?[0]?["name"]?.ToString());
+        Assert.Equal("/data", manifest["volumes"]?[0]?["target"]?.ToString());
+        Assert.Equal("false", manifest["volumes"]?[0]?["readOnly"]?.ToString().ToLowerInvariant());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
+    }
+
+    [Fact]
+    public async Task WithDataBindMountIsRepresentedInTheManifest()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithDataBindMount("./documentdb-data");
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+
+        Assert.Equal("/data", manifest["bindMounts"]?[0]?["target"]?.ToString());
+        Assert.Equal("false", manifest["bindMounts"]?[0]?["readOnly"]?.ToString().ToLowerInvariant());
+        Assert.Equal("/data", manifest["env"]?["DATA_PATH"]?.ToString());
     }
 
     [Fact]
@@ -504,33 +4132,22 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithDataBindMountSupportsReadOnlyBindMounts()
+    public void WithDataBindMountRejectsReadOnlyBindMountsAtTheApiBoundary()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder
-            .AddDocumentDB("DocumentDB")
-            .WithDataBindMount("/host/data", isReadOnly: true);
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
 
-        using var app = appBuilder.Build();
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var bindMountAnnotation = Assert.Single(containerResource.Annotations.OfType<ContainerMountAnnotation>().Where(a => a.Type == ContainerMountType.BindMount));
-        Assert.Equal("/host/data", bindMountAnnotation.Source);
-        Assert.Equal("/data", bindMountAnnotation.Target);
-        Assert.True(bindMountAnnotation.IsReadOnly);
-
-        var env = await BuildEnvironmentVariablesAsync(containerResource);
-        var dataPath = Assert.Single(env.Where(entry => entry.Key == "DATA_PATH"));
-        Assert.Equal("/data", dataPath.Value);
+        Assert.Throws<ArgumentException>(() => documentDB.WithDataBindMount("/host/data", isReadOnly: true));
     }
 
     [Fact]
     public async Task AddDocumentDBWithCustomUserNameAndPassword()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
-        var userName = appBuilder.AddParameter("user", secret: false);
-        var password = appBuilder.AddParameter("pass", secret: true);
+        // Given values so the real pipeline can resolve them; the assertions below are about the
+        // unresolved objects the callbacks placed in the environment, which the values do not change.
+        var userName = appBuilder.AddParameter("user", "documentdb-user", secret: false);
+        var password = appBuilder.AddParameter("pass", "documentdb-password", secret: true);
         appBuilder
             .AddDocumentDB("DocumentDB", userName: userName, password: password)
             .WithEndpoint("tcp", e => e.AllocatedEndpoint = new AllocatedEndpoint(e, "localhost", 10260));
@@ -601,7 +4218,7 @@ public class AddDocumentDBTests
     [InlineData(DocumentDBLogLevel.Info, "info")]
     [InlineData(DocumentDBLogLevel.Debug, "debug")]
     [InlineData(DocumentDBLogLevel.Trace, "trace")]
-    public async Task WithLogLevelAddsEnvironmentVariable(DocumentDBLogLevel logLevel, string expectedValue)
+    public async Task WithLogLevelAddsCanonicalAndLegacyEnvironmentVariables(DocumentDBLogLevel logLevel, string expectedValue)
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
@@ -614,16 +4231,56 @@ public class AddDocumentDBTests
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
 
+        Assert.Equal(expectedValue, env["DOCUMENTDB_LOG_LEVEL"]);
         Assert.Equal(expectedValue, env["LOG_LEVEL"]);
     }
 
     [Fact]
-    public async Task WithInitDataAddsReadOnlyBindMountAndDisablesSampleData()
+    public async Task WithLogLevelOverridesEarlierEnvironmentValues()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("DOCUMENTDB_LOG_LEVEL", "warn")
+            .WithEnvironment("LOG_LEVEL", "error")
+            .WithLogLevel(DocumentDBLogLevel.Debug);
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+
+        Assert.Equal("debug", env["DOCUMENTDB_LOG_LEVEL"]);
+        Assert.Equal("debug", env["LOG_LEVEL"]);
+    }
+
+    [Fact]
+    public async Task LaterEnvironmentValuesOverrideWithLogLevel()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithEnvironment("DOCUMENTDB_LOG_LEVEL", "warn")
+            .WithEnvironment("LOG_LEVEL", "error");
+
+        using var app = appBuilder.Build();
+
+        // Through the phases a real run publishes: a raw WithEnvironment(...) added after
+        // AddDocumentDB sits behind the storage guard until the first of them moves the guard back.
+        var env = await ConfigureResourceAsync(app, "DocumentDB");
+
+        Assert.Equal("warn", env["DOCUMENTDB_LOG_LEVEL"]);
+        Assert.Equal("error", env["LOG_LEVEL"]);
+    }
+
+    [Fact]
+    public async Task WithInitDataOverridesPreExistingInitDataAndAddsReadOnlyBindMount()
     {
         var source = Path.GetFullPath(Path.Combine("TestData", "init"));
 
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder.AddDocumentDB("DocumentDB")
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("INIT_DATA", "true")
             .WithInitData(source);
 
         using var app = appBuilder.Build();
@@ -639,15 +4296,21 @@ public class AddDocumentDBTests
         Assert.True(mount.IsReadOnly);
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["INIT_DATA"]);
         Assert.Equal("/init_doc_db.d", env["INIT_DATA_PATH"]);
         Assert.Equal("true", env["SKIP_INIT_DATA"]);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        Assert.Equal("false", manifest["env"]?["INIT_DATA"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
     }
 
     [Fact]
-    public async Task WithoutSampleDataAddsEnvironmentVariable()
+    public async Task WithoutSampleDataOverridesPreExistingInitData()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
-        appBuilder.AddDocumentDB("DocumentDB")
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithEnvironment("INIT_DATA", "true")
             .WithoutSampleData();
 
         using var app = appBuilder.Build();
@@ -656,7 +4319,12 @@ public class AddDocumentDBTests
         var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["INIT_DATA"]);
         Assert.Equal("true", env["SKIP_INIT_DATA"]);
+
+        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        Assert.Equal("false", manifest["env"]?["INIT_DATA"]?.GetValue<string>());
+        Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
     }
 
     [Fact]
@@ -745,10 +4413,11 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsSetsEnabledEnvironmentVariable()
+    public async Task WithOpenTelemetryMetricsSetsEnabledEnvironmentVariableFor0114ControlImage()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
             .WithOpenTelemetryMetrics();
 
         using var app = appBuilder.Build();
@@ -766,148 +4435,3768 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsInjectsEnvironmentAuthoritativeConfigurationOnce()
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForGatewayTelemetryImages()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics(endpoint: "http://first:4317")
             .WithOpenTelemetryMetrics(serviceName: "documentdb-local");
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(
-            containerResource.Annotations
-                .OfType<ContainerFileSystemCallbackAnnotation>()
-                .Where(annotation =>
-                    annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-        var file = Assert.IsType<ContainerFile>(Assert.Single(entries));
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
 
+        var args = await BuildContainerArgsAsync(containerResource);
+        Assert.Equal(3, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+
+        var script = Assert.IsType<string>(args[1]);
+        Assert.Contains($"exec {GatewayEntrypointScriptPath} \"$@\"", script, StringComparison.Ordinal);
+
+        // The caller-visible CONFIG_DIR contract is unchanged: the wrapper reads it, it is not
+        // written into the resource environment.
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         Assert.False(env.ContainsKey("CONFIG_DIR"));
-        Assert.Equal("SetupConfiguration.json", file.Name);
-        Assert.Contains("\"BlockedRolePrefixes\"", file.Contents, StringComparison.Ordinal);
-        Assert.DoesNotContain("\"TelemetryOptions\"", file.Contents, StringComparison.Ordinal);
-        Assert.Equal(
-            UnixFileMode.UserRead |
-            UnixFileMode.UserWrite |
-            UnixFileMode.GroupRead |
-            UnixFileMode.OtherRead,
-            file.Mode);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsDoesNotReplaceCustomConfigDirectory()
+    public async Task WithOpenTelemetryMetricsResolvesTheConfigurationDirectoryLikeTheImageEntrypoint()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
             .WithEnvironment("CONFIG_DIR", "/custom/documentdb/config")
+            .WithEnvironment("GATEWAY_HOME", "/opt/documentdb/gateway")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var containerResource = SingleServerResource(app);
+
+        // Caller-supplied values reach the container untouched; the wrapper consumes them at
+        // runtime rather than second-guessing them at build time.
         var env = await BuildEnvironmentVariablesAsync(containerResource);
-
         Assert.Equal("/custom/documentdb/config", env["CONFIG_DIR"]);
+        Assert.Equal("/opt/documentdb/gateway", env["GATEWAY_HOME"]);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+
+        // 1. An explicit CONFIG_DIR wins.
+        Assert.Contains("c=\"$CONFIG_DIR\"", script, StringComparison.Ordinal);
+
+        // 2. Otherwise the packaged layout, detected exactly the way the image entrypoint detects
+        //    it (both scripts present, not merely the directory).
+        Assert.Contains(
+            "if [ -f \"/usr/share/documentdb/scripts/start_oss_server.sh\" ] && " +
+            "[ -f \"/usr/share/documentdb/scripts/utils.sh\" ]; then c=\"/etc/documentdb/gateway\";",
+            script,
+            StringComparison.Ordinal);
+
+        // 3. Otherwise $GATEWAY_HOME/pg_documentdb_gw, with the upstream GATEWAY_HOME default.
+        Assert.Contains("g=\"$GATEWAY_HOME\"", script, StringComparison.Ordinal);
+        Assert.Contains("if [ -z \"$g\" ]; then g=\"/home/documentdb/gateway\"; fi;", script, StringComparison.Ordinal);
+        Assert.Contains("c=\"$g/pg_documentdb_gw\"", script, StringComparison.Ordinal);
+
+        Assert.Contains("s=\"$c/SetupConfiguration.json\"", script, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsAppliesCompatibilityConfigurationToPrivateMirrors()
+    public async Task WithOpenTelemetryMetricsKeepsItsTemporaryConfigurationOutsideDataPath()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("DATA_PATH", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("d=\"$DATA_PATH\"", script, StringComparison.Ordinal);
+        Assert.Contains("for a in \"$@\"", script, StringComparison.Ordinal);
+        Assert.Contains("-d|--data-path) q=\"d\"", script, StringComparison.Ordinal);
+        Assert.Contains("--username) q=\"v\"", script, StringComparison.Ordinal);
+        Assert.Contains("realpath -m -- \"$d\"", script, StringComparison.Ordinal);
+        Assert.Contains("if [ \"$d\" = \"/\" ]", script, StringComparison.Ordinal);
+        Assert.Contains("for y in /tmp /var/tmp /dev/shm", script, StringComparison.Ordinal);
+        Assert.Contains("realpath -m -- \"$y\"", script, StringComparison.Ordinal);
+        Assert.Contains("case \"$x\" in \"$d\"|\"$d\"/*) continue;; esac", script, StringComparison.Ordinal);
+        Assert.Contains("case \"$d\" in \"$x\"|\"$x\"/*) continue;; esac", script, StringComparison.Ordinal);
+        Assert.Contains("mktemp -d \"$r/aspire-documentdb-otel.XXXXXX\"", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("o=\"$(mktemp -d)\"", script, StringComparison.Ordinal);
+
+        // Nothing here can alias the data directory, so nothing about the backing storage is
+        // emitted: this is the script every resource without mounts gets.
+        Assert.DoesNotContain("$y|$d", script, StringComparison.Ordinal);
+        Assert.Contains(
+            "if [ -z \"$r\" ]; then echo \"aspire-documentdb -- no writable temporary directory is safely separated from DATA_PATH\" >&2; exit 1; fi",
+            script,
+            StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // The scratch root and the storage that backs it
+    //
+    // Two container paths that do not contain one another can still be one
+    // directory: a bind mount of the same host directory at /tmp and at /data,
+    // or one named volume mounted twice. A scratch directory created through
+    // the second window appears inside DATA_PATH, and DocumentDB 0.116.0
+    // refuses to initialise a data directory that is not empty.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ATemporaryRootBoundToTheSameHostDirectoryAsDataPathIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/documentdb", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("case \"$y|$d\" in ", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+
+        // The other two candidates are in the container's own filesystem, so they are left alone
+        // and one of them is what the wrapper falls back to.
+        Assert.DoesNotContain("\"/var/tmp|", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"/dev/shm|", script, StringComparison.Ordinal);
+        Assert.Contains("aliases DATA_PATH storage or cannot be proven independent", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ATemporaryRootOnTheSameNamedVolumeAsDataPathIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataVolume(name: "documentdb-data")
+            .WithVolume("documentdb-data", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A mount target that is an ancestor of the data directory's host directory backs it just as
+    /// surely as one that is exactly it.
+    /// </summary>
+    [Fact]
+    public async Task ATemporaryRootBoundToAnAncestorOfTheDataDirectoryIsNotUsed()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// DATA_PATH can be above the mount that exposes the candidate's physical alias. Writing
+    /// through the candidate still creates an entry inside the data directory.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ATemporaryRootAliasedBelowDataPathRejectsTheContainingDirectory(bool useBindMounts)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("DATA_PATH", "/data");
+
+        if (useBindMounts)
+        {
+            documentDB
+                .WithBindMount("/srv/documentdb/cluster", "/data/cluster")
+                .WithBindMount("/srv/scratch", "/tmp");
+        }
+        else
+        {
+            documentDB
+                .WithVolume("shared", "/data/cluster")
+                .WithVolume("shared", "/tmp");
+        }
+
+        documentDB.WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other direction: the scratch root is a subdirectory of the data directory's host tree.
+    /// Because both paths are bind-backed, every DATA_PATH under that bind target is conservatively
+    /// incompatible; a daemon-side symbolic link could make even a sibling spelling an alias.
+    /// </summary>
+    [Fact]
+    public async Task ATemporaryRootBoundBelowTheDataDirectoryAliasesOnlyTheDirectoriesThatContainIt()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithBindMount("/srv/documentdb", "/data")
+            .WithBindMount("/srv/documentdb/scratch", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // The whole bind-backed data region is rejected, which includes both '/data' and every
+        // descendant such as '/data/scratch'.
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Two lexically different bind sources may resolve through daemon-side symbolic links to one
+    /// directory. The model cannot prove otherwise without depending on the local filesystem, so a
+    /// bind-backed candidate is conservatively skipped whenever DATA_PATH may also be bind-backed.
+    /// </summary>
+    [Fact]
+    public async Task ATemporaryRootOnAnotherBindIsConservativelySkipped()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/scratch", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/tmp|/data\"/*", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A bind mount and a named volume are distinct storage types, so no daemon-side path alias can
+    /// make them the same backing region.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DifferentStorageTypesLeaveTheTemporaryRootUsable(bool dataIsBind)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0");
+
+        if (dataIsBind)
+        {
+            documentDB
+                .WithDataBindMount("/srv/documentdb")
+                .WithVolume("scratch-volume", "/tmp");
+        }
+        else
+        {
+            documentDB
+                .WithDataVolume("documentdb-data")
+                .WithBindMount("/srv/scratch", "/tmp");
+        }
+
+        documentDB.WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.DoesNotContain("\"/tmp|/data\"", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DifferentNamedVolumesLeaveTheTemporaryRootUsable()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataVolume("documentdb-data")
+            .WithVolume("scratch-volume", "/tmp")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.DoesNotContain("\"/tmp|/data\"", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// With every candidate on the data directory's storage there is nowhere safe left, and the
+    /// wrapper says so rather than writing into the data directory.
+    /// </summary>
+    [Fact]
+    public async Task EveryTemporaryRootAliasingTheDataDirectoryIsReportedByTheWrapper()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/documentdb", "/tmp")
+            .WithBindMount("/srv/documentdb", "/var/tmp")
+            .WithBindMount("/srv/documentdb", "/dev/shm")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/var/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/dev/shm|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains(
+            "if [ -n \"$w\" ]; then echo \"aspire-documentdb -- every temporary directory aliases DATA_PATH storage or cannot be proven independent of it, so the telemetry configuration cannot be kept out of it\" >&2; ",
+            script,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Even three unrelated-looking bind source strings cannot prove physical independence from a
+    /// bind-backed DATA_PATH on a remote daemon. Every candidate is therefore rejected.
+    /// </summary>
+    [Fact]
+    public async Task EveryBindBackedTemporaryRootIsRejectedWhenDataPathIsBindBacked()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithDataBindMount("/srv/documentdb")
+            .WithBindMount("/srv/scratch-one", "/tmp")
+            .WithBindMount("/srv/scratch-two", "/var/tmp")
+            .WithBindMount("/srv/scratch-three", "/dev/shm")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/var/tmp|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("\"/dev/shm|/data\"", script, StringComparison.Ordinal);
+        Assert.Contains("cannot be proven independent", script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The wrapper is part of the container command, so the aliasing decision has to survive the
+    /// manifest exactly as it survives a run.
+    /// </summary>
+    [Fact]
+    public async Task TheScratchRootAliasingDecisionIsPublishedInTheManifest()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithDataBindMount("/srv/documentdb")
+                .WithBindMount("/srv/possibly-linked-scratch", "/tmp")
+                .WithOpenTelemetryMetrics());
+
+        var script = manifest["resources"]?["DocumentDB"]?["args"]?[1]?.ToString();
+
+        Assert.NotNull(script);
+        Assert.Contains("\"/tmp|/data\"", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRemovesTheWholeMetricsBlockButKeepsTheSharedIdentity()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // The metrics object goes whole, so the shipped OtlpEndpoint cannot beat
+        // OTEL_EXPORTER_OTLP_ENDPOINT and quietly export into the container itself, and no
+        // individual key is enumerated that a future gateway field could slip past.
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Metrics.", script, StringComparison.Ordinal);
+
+        // The shared identity and the shipped (disabled) tracing block survive untouched.
+        Assert.DoesNotContain(".TelemetryOptions.ServiceName", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.ServiceVersion", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Tracing", script, StringComparison.Ordinal);
+
+        // The caller did not ask for an identity, so none is invented for them either.
+        var env = await BuildEnvironmentVariablesAsync(SingleServerResource(app));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_NAME"));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_VERSION"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsLeavesTheGenericEndpointFallbackReachable()
+    {
+        // The stock file ships Metrics.OtlpEndpoint = http://localhost:4317. Keeping it would beat
+        // both OTEL_EXPORTER_OTLP_METRICS_ENDPOINT and OTEL_EXPORTER_OTLP_ENDPOINT and export
+        // metrics into the DocumentDB container itself, which is the silent loss this wrapper
+        // exists to prevent.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        var script = await GetWrapperScriptAsync(containerResource);
+
+        // The object goes whole, so no key inside it - present or future - can survive to beat
+        // the environment.
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.Metrics.", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("http://otel-collector:4317", env["OTEL_EXPORTER_OTLP_ENDPOINT"]);
+        Assert.False(env.ContainsKey("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRemovesTheSharedIdentityOnlyWhenItsOverrideIsSupplied()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(
+                endpoint: "http://otel-collector:4317",
+                exportInterval: TimeSpan.FromSeconds(5),
+                timeout: TimeSpan.FromSeconds(7),
+                serviceName: "custom-service",
+                serviceVersion: "9.9.9");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        Assert.Contains(
+            $"jq '{MetricsBlockFilter}, .TelemetryOptions.ServiceName, .TelemetryOptions.ServiceVersion)'",
+            script,
+            StringComparison.Ordinal);
+
+        // Tracing is never this package's to configure, even when the identity is overridden.
+        Assert.DoesNotContain(".TelemetryOptions.Tracing", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAccumulatesSuppliedOverridesAcrossCalls()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(serviceName: "custom-service")
+            .WithOpenTelemetryMetrics(endpoint: "http://otel-collector:4317");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // The environment variables merge across calls, so the identity keys they have to beat do
+        // too - and only those the caller actually supplied.
+        Assert.Contains(
+            $"jq '{MetricsBlockFilter}, .TelemetryOptions.ServiceName)'",
+            script,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(".TelemetryOptions.ServiceVersion", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForPrivateMirrors()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithImageRegistry("registry.example.com")
-            .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(
-            containerResource.Annotations
-                .OfType<ContainerFileSystemCallbackAnnotation>()
-                .Where(annotation =>
-                    annotation.DestinationPath == "/home/documentdb/gateway/pg_documentdb_gw"));
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-        Assert.IsType<ContainerFile>(Assert.Single(entries));
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsDoesNotInjectCompatibilityConfigurationFor0114()
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForVersionsAfterTheAffectedFloor()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.114.0")
+            .WithImageTag("pg17-0.117.0")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-
-        Assert.Empty(entries);
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsDoesNotInjectCompatibilityConfigurationForCustomImages()
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenTheTagIsSelectedAfterTheCall()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        // WithOpenTelemetryMetrics() cannot see the final image, so the decision has to be
+        // deferred; the alternative silently drops the override for this ordering.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics()
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
+            .WithImageTag("pg17-0.116.0");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointFor0114()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForTheDefaultImage()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForCustomImages()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithImage("contoso/documentdb-local", "pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-
-        Assert.Empty(entries);
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsPreserves0116DefaultServiceName()
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForUnrecognizedTags()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("latest")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// The wrapper is built entirely out of official-image facts: the entrypoint script path, the
+    /// packaged configuration layout, bash and jq. A resource built from the caller's Dockerfile
+    /// keeps the official image annotation and even builds <c>FROM</c> the official image, but
+    /// none of those facts has been established for the build output, so it keeps the stock
+    /// entrypoint.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForDockerfileBuilds()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+
+        // The environment half of the API is unconditional and still applies.
+        var environment = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", environment["OTEL_METRICS_ENABLED"]);
+    }
+
+    /// <summary>
+    /// The same, for a caller who re-points the image annotation at the official repository and
+    /// tag explicitly after adding the build — the shape in which an annotation is most
+    /// convincingly official and least informative.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointWhenABuildIsAnnotatedAsOfficial()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithImage(DocumentDBContainerImageTags.Image, InterlockedTag)
+            .WithImageRegistry(DocumentDBContainerImageTags.Registry)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// A digest pin throws for the official image because the digest makes the version opaque and
+    /// guessing is silently wrong either way. On a Dockerfile build there is nothing to guess: the
+    /// digest is no more what runs than the tag is, so the resource is simply left alone.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsADigestPinnedDockerfileBuild()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// <c>WithDockerfileBaseImage()</c> selects base images for a <em>generated</em> Dockerfile.
+    /// With no build to generate one it changes nothing about the image this resource pulls, so it
+    /// must not be mistaken for a caller-owned build and suppress the wrapper.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenOnlyTheBaseImageIsOverridden()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+
+#pragma warning disable ASPIREDOCKERFILEBUILDER001
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDockerfileBaseImage("contoso/documentdb-local:pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+#pragma warning restore ASPIREDOCKERFILEBUILDER001
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    /// <summary>
+    /// Once the wrapper owns the entrypoint it cannot be uninstalled, so a build introduced after
+    /// it took over is reported rather than silently left with a <c>/bin/bash</c> that starts
+    /// nothing.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsADockerfileBuildAddedAfterTheWrapperWasInstalled()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+
+        documentDB.WithDockerfile(CreateOfficialLookingDockerfileContext());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains("Dockerfile build", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The review reproduction: the official image with its registry folded into the image
+    /// annotation resolves to exactly the reference the default spelling resolves to, so it needs
+    /// the same wrapper.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForAQualifiedOfficialImage()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, InterlockedTag)
+            .WithImageRegistry(null!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Theory]
+    // A registry host and the exact repository beneath it, in every spelling of the boundary.
+    [InlineData("contoso.azurecr.io/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "contoso.azurecr.io")]
+    [InlineData("localhost:5000/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "localhost:5000")]
+    [InlineData("[::1]:5000/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb/documentdb-local", "ghcr.io")]
+    [InlineData("documentdb-local", "ghcr.io/documentdb/documentdb")]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointForQualifiedPrivateMirrors(
+        string image,
+        string? registry)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+    }
+
+    [Theory]
+    // A namespace, project or mirror path in front of the repository is part of the repository,
+    // whether the caller writes it inline or into the registry field.
+    [InlineData("evil/documentdb/documentdb-local", null)]
+    [InlineData("ghcr.io/evil/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "ghcr.io/evil")]
+    [InlineData("contoso.azurecr.io/mirrors/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "contoso.azurecr.io/mirrors")]
+    [InlineData("harbor.corp.local/library/documentdb/documentdb-local", null)]
+    [InlineData("documentdb/documentdb-local", "harbor.corp.local/library")]
+    // A bare name is a host only when it carries a port.
+    [InlineData("documentdb/documentdb-local", "myregistry")]
+    // Leaving the registry annotation in place composes a doubled, unresolvable reference.
+    [InlineData("ghcr.io/documentdb/documentdb/documentdb-local", "ghcr.io/documentdb")]
+    public async Task WithOpenTelemetryMetricsKeepsTheStockEntrypointForLookalikeReferences(
+        string image,
+        string? registry)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, InterlockedTag)
+            .WithImageRegistry(registry!)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    /// <summary>
+    /// A digest pin makes the version opaque whichever way the reference is spelled, and whether
+    /// the digest arrives through <c>WithImageSHA256</c> or inside the reference itself.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedQualifiedOfficialImage(bool digestInline)
+    {
+        const string Digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+
+        if (digestInline)
+        {
+            documentDB.WithImage($"{QualifiedOfficialImage}@sha256:{Digest}");
+        }
+        else
+        {
+            documentDB.WithImage(QualifiedOfficialImage, InterlockedTag).WithImageSHA256(Digest);
+        }
+
+        documentDB.WithImageRegistry(null!).WithOpenTelemetryMetrics();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(Digest, exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The digest rejection has to survive a tag standing next to the digest: the repository is
+    /// still the curated one, so this is the case the message exists for.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task WithOpenTelemetryMetricsRejectsADigestBehindACuratedTag(
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithOpenTelemetryMetrics();
+        SetImageAnnotation(documentDB, image, tag, sha256);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(OlderReleaseDigest, exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A digest on a repository this package does not publish stays untouched, tag or no tag:
+    /// there is nothing to reject, because the wrapper was never going to be applied.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsADigestBehindACuratedTagOnACustomRepository()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage($"contoso/documentdb-local:{InterlockedTag}")
+            .WithImageSHA256(OlderReleaseDigest)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenDisabled()
+    {
+        // A caller-supplied configuration file can enable metrics from JSON, which would beat
+        // OTEL_METRICS_ENABLED=false. Explicitly disabling metrics has to win.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDisabledStillSanitizesACallerSuppliedConfiguration()
+    {
+        // The scenario the disabled-case wrapper exists for: the caller points CONFIG_DIR at a
+        // file that could enable metrics from JSON, and enabled: false has to beat it.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEnvironment("CONFIG_DIR", "/custom/documentdb/config")
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.Contains("c=\"$CONFIG_DIR\"", script, StringComparison.Ordinal);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+        Assert.Equal("/custom/documentdb/config", env["CONFIG_DIR"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenTheLastCallDisablesMetrics()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics()
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script, StringComparison.Ordinal);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["OTEL_METRICS_ENABLED"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapsTheEntrypointWhenTheLastCallEnablesMetrics()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(enabled: false)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("true", env["OTEL_METRICS_ENABLED"]);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsKeepsCallerSuppliedContainerArgumentsBehindTheWrapper(bool argumentsFirst)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithImageTag("pg17-0.116.0");
+
+        if (argumentsFirst)
+        {
+            documentDB.WithArgs("--log-level", "trace").WithOpenTelemetryMetrics();
+        }
+        else
+        {
+            documentDB.WithOpenTelemetryMetrics().WithArgs("--log-level", "trace");
+        }
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(5, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--log-level", args[3]);
+        Assert.Equal("trace", args[4]);
+    }
+
+    // ---------------------------------------------------------------------
+    // The wrapper has to be the last word on the command line
+    //
+    // Aspire evaluates command-line callbacks in annotation order over one
+    // shared list, so a callback registered after WithOpenTelemetryMetrics()
+    // used to run after the wrapper and could put anything in front of it.
+    // /bin/bash reads its command from the first arguments, so one value
+    // inserted at the front turns '-c <script> --' into operands and the
+    // container starts nothing. The wrapper's callback retakes the last
+    // position at every phase a run offers, and refuses to answer at all if
+    // something got in after that.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The reported case: a callback registered after <c>WithOpenTelemetryMetrics()</c> that
+    /// prepends to the argument list. It now runs before the wrapper, so what it prepends becomes
+    /// an argument of the image entrypoint - which is what it was asking for - instead of
+    /// displacing the shell command.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALaterCallbackPrepends()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs(context => context.Args.Insert(0, "--help"));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+        Assert.Equal(4, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--help", args[3]);
+    }
+
+    /// <summary>
+    /// A callback that rewrites the list wholesale - clearing it, or reordering what is already
+    /// there - cannot take the wrapper apart either, because it runs before the wrapper is
+    /// written.
+    /// </summary>
+    [Theory]
+    [InlineData("clear")]
+    [InlineData("reverse")]
+    [InlineData("replace")]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALaterCallbackRewritesTheList(string mutation)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithArgs("--log-level", "trace")
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithArgs(context =>
+        {
+            switch (mutation)
+            {
+                case "clear":
+                    context.Args.Clear();
+                    break;
+                case "reverse":
+                    var reversed = context.Args.Reverse().ToList();
+                    context.Args.Clear();
+                    foreach (var argument in reversed)
+                    {
+                        context.Args.Add(argument);
+                    }
+
+                    break;
+                default:
+                    context.Args.Clear();
+                    context.Args.Add("--owner");
+                    context.Args.Add("documentdb");
+                    break;
+            }
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+
+        var expectedTail = mutation switch
+        {
+            "clear" => Array.Empty<string>(),
+            "reverse" => ["trace", "--log-level"],
+            _ => new[] { "--owner", "documentdb" },
+        };
+
+        Assert.Equal(expectedTail, args.Skip(3).Cast<string>());
+    }
+
+    /// <summary>
+    /// The control: a callback that only appends is exactly what <c>WithArgs</c> is for, and its
+    /// arguments still reach the image entrypoint in the order they were written.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsAnAppendOnlyCallbackValid()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs(context =>
+            {
+                context.Args.Add("--owner");
+                context.Args.Add("documentdb");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(5, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--owner", args[3]);
+        Assert.Equal("documentdb", args[4]);
+    }
+
+    /// <summary>
+    /// A <see cref="BeforeStartEvent"/> subscriber registered after the DocumentDB APIs runs after
+    /// the wrapper retakes the last position there. The per-resource phases a run publishes
+    /// afterwards are what put the wrapper back in front of it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALaterBeforeStartSubscriberPrepends()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            documentDB.WithArgs(context => context.Args.Insert(0, "--help"));
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(4, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--help", args[3]);
+    }
+
+    /// <summary>
+    /// Lifecycle hooks run after <see cref="BeforeStartEvent"/> too, and are the documented way to
+    /// mutate the model late. In a run the per-resource phases still come after them.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsTheWrapperFirstWhenALifecycleHookPrepends()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+        appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+            new PrependArgumentLifecycleHook("DocumentDB", "--help"));
+#pragma warning restore CS0618
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RunLifecycleHooksAsync(app);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var args = await BuildContainerArgsAsync(SingleServerResource(app));
+
+        Assert.Equal(4, args.Count);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--help", args[3]);
+    }
+
+    /// <summary>
+    /// Nothing runs between <see cref="BeforeResourceStartedEvent"/> and the container's
+    /// configuration except another subscriber to that same event. One registered after the
+    /// DocumentDB APIs can still append a callback, and the wrapper would then be building a
+    /// command line something else takes apart. It fails the resource instead.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenACommandLineCallbackIsAddedAfterTheLastPhase()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithArgs(context => context.Args.Insert(0, "--help"));
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("has a later command-line callback registered after", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Publish publishes no per-resource event, but it does publish
+    /// <see cref="Aspire.Hosting.Publishing.BeforePublishEvent"/> after every lifecycle hook and
+    /// before the pipeline serializes anything. A hook that only adds arguments is therefore
+    /// repaired rather than rejected: the guard retakes the last position there, so the hook's
+    /// arguments land behind the wrapper where they belong.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesArgumentsALifecycleHookAddedBehindTheWrapper()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new PrependArgumentLifecycleHook("DocumentDB", "--help"));
+#pragma warning restore CS0618
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+
+        var args = resource["args"]?.AsArray();
+        Assert.NotNull(args);
+        Assert.Equal(4, args!.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+        Assert.Equal("--help", args[3]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// What publish cannot repair: a subscriber to the very event the guard uses to retake the last
+    /// position, registered after the DocumentDB APIs so that it runs afterwards. Nothing is
+    /// published after that, so the callback itself refuses.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenABeforePublishSubscriberAddsArguments()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Aspire.Hosting.Publishing.BeforePublishEvent>((_, _) =>
+            {
+                documentDB.WithArgs(context => context.Args.Insert(0, "--help"));
+                return Task.CompletedTask;
+            });
+        });
+
+        Assert.Contains("has a later command-line callback registered", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The failure has to describe the shape of the pipeline and nothing else: the callback that
+    /// displaced the wrapper may well be the one carrying a secret.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailClosedMessageDoesNotRepeatTheDisplacingValue()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithArgs("--password", "hunter2-should-not-appear");
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(SingleServerResource(app)));
+
+        Assert.DoesNotContain("hunter2", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Retaking the last position must not cost a second evaluation: the annotation is moved, not
+    /// rebuilt, so Aspire's cached result for it - and therefore exactly one wrapper prefix -
+    /// survives every phase and every later gather.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsASingleEvaluationAcrossRepeatedPhases()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithOpenTelemetryMetrics(serviceName: "documentdb-local");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var first = await BuildContainerArgsAsync(resource);
+        var second = await BuildContainerArgsAsync(resource);
+
+        Assert.Equal(3, first.Count);
+        Assert.Equal(first, second);
+        Assert.Same(first[1], second[1]);
+    }
+
+    /// <summary>
+    /// A restart re-evaluates the callbacks: Aspire forgets each annotation's cached result and
+    /// republishes the per-resource phases before it recreates the container. The wrapper has to
+    /// come out of that as one prefix, not two. The same evaluation is what an explicitly started
+    /// resource gets, whose configuration is built after those phases rather than at startup.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRebuildsExactlyOneWrapperPrefixOnRestart()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs("--log-level", "trace");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var first = await BuildContainerArgsAsync(resource);
+
+        ForgetCachedCommandLineResults(resource);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var second = await BuildContainerArgsAsync(resource);
+
+        Assert.Equal(5, first.Count);
+        Assert.Equal(5, second.Count);
+        Assert.Equal("-c", second[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, second[2]);
+        Assert.Equal("--log-level", second[3]);
+        Assert.Equal("trace", second[4]);
+    }
+
+    /// <summary>
+    /// Drops every command-line callback's cached result, which is what Aspire's DCP executor does
+    /// before it recreates a container. The cache is an explicit implementation of an internal
+    /// interface, so it is reached by reflection; a failure here means the restart contract this
+    /// wrapper relies on has changed shape.
+    /// </summary>
+    private static void ForgetCachedCommandLineResults(DocumentDBServerResource resource)
+    {
+        foreach (var annotation in resource.Annotations.OfType<CommandLineArgsCallbackAnnotation>())
+        {
+            var callbackInterface = annotation.GetType().GetInterfaces().Single(
+                candidate => candidate.IsGenericType &&
+                    candidate.Name.StartsWith("ICallbackResourceAnnotation", StringComparison.Ordinal));
+
+            var forget = callbackInterface.GetMethod("ForgetCachedResult");
+            Assert.NotNull(forget);
+            forget!.Invoke(annotation, null);
+        }
+    }
+
+    /// <summary>
+    /// The real publisher, end to end: what azd receives has to carry the wrapper prefix first,
+    /// whatever the caller's own argument callbacks do to the list.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesTheWrapperFirstWhenALaterCallbackPrepends()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics()
+                .WithArgs(context => context.Args.Insert(0, "--help")));
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+
+        var args = resource["args"]?.AsArray();
+        Assert.NotNull(args);
+        Assert.Equal(4, args!.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+        Assert.Equal("--help", args[3]?.GetValue<string>());
+
+        var script = args[1]?.GetValue<string>();
+        Assert.NotNull(script);
+        Assert.DoesNotContain("\n", script!, StringComparison.Ordinal);
+        Assert.DoesNotContain("{", script!, StringComparison.Ordinal);
+        Assert.Contains($"exec {GatewayEntrypointScriptPath} \"$@\"", script!, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // Being last is not enough on its own
+    //
+    // Aspire records each callback's result the first time it runs and reuses
+    // it for the rest of the run. Anything that builds the resource's
+    // configuration early - ExecutionConfigurationBuilder from a lifecycle
+    // hook, or the dependency discovery a container creation does before it
+    // builds its spec - freezes the wrapper's answer. A change made after that
+    // is never re-validated, and because the gatherer takes the *last*
+    // annotation's recorded result as the whole argument list, a callback
+    // appended afterwards does not reorder the command line, it replaces it.
+    //
+    // The seal is compared at the two phases Aspire never caches: the
+    // container-runtime-arguments callback in a run, and BeforePublishEvent in
+    // a publish.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The reported bypass: a lifecycle hook builds the resource's configuration through the
+    /// public <see cref="ExecutionConfigurationBuilder"/> — which is what Aspire itself uses — and
+    /// only then appends an argument callback. Publish has no per-resource phase, so nothing would
+    /// re-run; the manifest would carry that callback's list and nothing else.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenAHookGathersArgumentsThenAppends()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Annotations.Add(
+                        new CommandLineArgsCallbackAnnotation(args => args.Insert(0, "--help")))));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its container command line had already been built", log, StringComparison.Ordinal);
+        Assert.Contains("a command-line callback was added or removed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same hook, re-pointing the entrypoint instead. The manifest writes <c>entrypoint</c>
+    /// before it evaluates <c>args</c>, so nothing downstream would notice.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenAHookGathersArgumentsThenChangesTheEntrypoint()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Entrypoint = "/late/entrypoint.sh"));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("its container entrypoint changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And swapping the image: the wrapper is built out of facts about the official image, so an
+    /// image selected after the command line was decided is a different container.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenAHookGathersArgumentsThenChangesTheImage()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Annotations.OfType<ContainerImageAnnotation>().Last().Tag = "pg17-0.114.0"));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("the image it will run changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The run-mode half. A container creation discovers the resource's dependencies first — which
+    /// builds and records its configuration — and only then invokes the container-runtime-argument
+    /// callbacks, before it reads the container's command. A caller callback there can re-point the
+    /// entrypoint after every argument check has already run.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenARuntimeCallbackChangesTheEntrypointAfterTheGather()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithContainerRuntimeArgs(context =>
+        {
+            documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+            context.Args.Add("--label");
+            context.Args.Add("late=1");
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+
+        // What Aspire does first: the dependency pass builds and records the configuration.
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("its container entrypoint changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A runtime-argument callback that appends another argument callback is the run-mode shape of
+    /// the publish bypass.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenARuntimeCallbackAppendsArgumentsAfterTheGather()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithContainerRuntimeArgs(_ =>
+            documentDB.Resource.Annotations.Add(
+                new CommandLineArgsCallbackAnnotation(args => args.Insert(0, "--help"))));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("has a later command-line callback registered", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Environment callbacks can re-point the entrypoint too. Aspire's dependency pass evaluates
+    /// them before the argument callbacks and records both, so the wrapper's own callback is what
+    /// sees the result — and it refuses to build arguments for an entrypoint it does not own.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenAnEnvironmentCallbackChangesTheEntrypoint()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithEnvironment(context => documentDB.Resource.Entrypoint = "/late/entrypoint.sh");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+
+        // The order Aspire's dependency pass uses: environment first, then arguments.
+        await BuildEnvironmentVariablesAsync(resource);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(resource));
+
+        Assert.Contains("/late/entrypoint.sh", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And when the entrypoint moves after the arguments were already recorded, the run's
+    /// unconditional checkpoint is what catches it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsWhenTheEntrypointMovesAfterTheArgumentsWereRecorded()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        resource.Entrypoint = "/late/entrypoint.sh";
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("its container entrypoint changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The guard moves its own callbacks to the end of their pipelines at every phase, so a
+    /// recording taken before one of those moves must not be read as somebody else changing the
+    /// resource. A hook that adds a container-runtime argument and only then reads the
+    /// configuration produces exactly that order, and has to keep working.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsToleratesTheGuardRetakingItsOwnPositionAfterAGather()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        // A lifecycle hook's shape: add a runtime argument and an environment variable, then read
+        // the configuration, all before the per-resource phases run.
+        await RaiseBeforeStartAsync(app);
+        documentDB.WithContainerRuntimeArgs("--label", "team=data");
+        documentDB.WithEnvironment("TEAM", "data");
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        // The phases that move the guard back behind both of those.
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(["--label", "team=data"], await RunContainerRuntimeArgsAsync(resource));
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+    }
+
+    /// <summary>
+    /// The control: a lifecycle hook that reads the configuration and changes nothing still
+    /// publishes, and publishes the same command line it read.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesWhenAHookOnlyReadsTheConfiguration()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics()
+                .WithArgs("--log-level", "trace");
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook("DocumentDB", _ => { }));
+#pragma warning restore CS0618
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+
+        var args = resource["args"]?.AsArray();
+        Assert.NotNull(args);
+        Assert.Equal(5, args!.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+        Assert.Equal("--log-level", args[3]?.GetValue<string>());
+        Assert.Equal("trace", args[4]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// A subscriber registered after the DocumentDB APIs runs after their
+    /// <c>BeforePublishEvent</c> verification. Gathering there freezes the validated wrapper;
+    /// changing the entrypoint afterwards must still be rejected by the checkpoint that runs
+    /// while the real publisher serializes the resource.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsRealPublicationWhenALateSubscriberChangesTheEntrypointAfterGathering()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+            });
+        });
+
+        Assert.Contains("its container entrypoint changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same late gather followed by a command callback changes which immutable argument list
+    /// Aspire would publish. Serialization must reject the changed callback membership rather than
+    /// trusting the wrapper result cached before the callback existed.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsRealPublicationWhenALateSubscriberAddsArgumentsAfterGathering()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.WithArgs("--late");
+            });
+        });
+
+        Assert.Contains("has a later command-line callback registered", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Every part of the effective image is part of the seal. These mutations use the public
+    /// builder APIs after the cached wrapper has been gathered, including the Dockerfile
+    /// classification that makes an otherwise official-looking annotation caller-owned.
+    /// </summary>
+    [Theory]
+    [InlineData("image")]
+    [InlineData("tag")]
+    [InlineData("digest")]
+    [InlineData("dockerfile")]
+    public async Task WithOpenTelemetryMetricsFailsRealPublicationWhenALateSubscriberChangesTheImageAfterGathering(
+        string mutation)
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+
+                switch (mutation)
+                {
+                    case "image":
+                        documentDB.WithImage("contoso/documentdb-local", InterlockedTag);
+                        break;
+                    case "tag":
+                        documentDB.WithImageTag("pg17-0.114.0");
+                        break;
+                    case "digest":
+                        documentDB.WithImageSHA256(OlderReleaseDigest);
+                        break;
+                    case "dockerfile":
+                        documentDB.WithDockerfile(CreateOfficialLookingDockerfileContext());
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Unknown mutation '{mutation}'.");
+                }
+            });
+        });
+
+        Assert.Contains("the image it will run changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Reading the cached configuration is legal. The serialization checkpoint must be invisible
+    /// when the model still matches the seal, including the exact wrapper command and manifest
+    /// fields the ordinary container writer emits.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAnIdenticalManifestWhenALateSubscriberOnlyGathers()
+    {
+        var baseline = await ManifestUtils.PublishManifestAsync(
+            appBuilder =>
+                appBuilder.AddDocumentDB("DocumentDB")
+                    .WithImageTag(InterlockedTag)
+                    .WithOpenTelemetryMetrics()
+                    .WithArgs("--log-level", "trace"),
+            $"{nameof(WithOpenTelemetryMetricsPublishesAnIdenticalManifestWhenALateSubscriberOnlyGathers)}-baseline");
+
+        var gathered = await ManifestUtils.PublishManifestAsync(
+            appBuilder =>
+            {
+                var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                    .WithImageTag(InterlockedTag)
+                    .WithOpenTelemetryMetrics()
+                    .WithArgs("--log-level", "trace");
+
+                appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, token) =>
+                    GatherPublishConfigurationAsync(documentDB.Resource, token));
+            },
+            $"{nameof(WithOpenTelemetryMetricsPublishesAnIdenticalManifestWhenALateSubscriberOnlyGathers)}-gathered");
+
+        Assert.True(JsonNode.DeepEquals(baseline, gathered));
+    }
+
+    /// <summary>
+    /// <c>WithManifestPublishingCallback</c> is a supported replacement API. A late subscriber
+    /// cannot use it to shadow the package checkpoint after making the cached command stale; the
+    /// checkpoint is restored after model events and rejects the resource before the replacement
+    /// writer runs.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsCannotShadowTheSerializationCheckpointWithALateManifestCallback()
+    {
+        var writerCalls = 0;
+
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+
+                documentDB.WithManifestPublishingCallback(async context =>
+                {
+                    Interlocked.Increment(ref writerCalls);
+                    await context.WriteContainerAsync(documentDB.Resource);
+                });
+            });
+        });
+
+        Assert.Contains("its container entrypoint changed", log, StringComparison.Ordinal);
+        Assert.Equal(0, writerCalls);
+    }
+
+    /// <summary>
+    /// The combined branch has one serialization authority. After one gather records both the
+    /// storage verdict and telemetry command, that callback checks both and delegates the caller's
+    /// writer exactly once rather than installing a second writer for either feature.
+    /// </summary>
+    [Fact]
+    public async Task TheSingleManifestCheckpointChecksStorageAndTelemetryBeforeDelegatingOneWriter()
+    {
+        var writerCalls = 0;
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data")
+                .WithOpenTelemetryMetrics();
+
+            documentDB.WithManifestPublishingCallback(async context =>
+            {
+                Interlocked.Increment(ref writerCalls);
+                await context.WriteContainerAsync(documentDB.Resource);
+            });
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, token) =>
+                GatherPublishConfigurationAsync(documentDB.Resource, token));
+        });
+
+        Assert.Equal(1, writerCalls);
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+        Assert.Equal("/data", resource["env"]?["DATA_PATH"]?.GetValue<string>());
+        Assert.Equal("documentdb-data", Assert.Single(resource["volumes"]!.AsArray())!["name"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// Exclusion is the supported no-output boundary: the pipeline checkpoint must not displace
+    /// Aspire's callback-less manifest annotation and accidentally publish the resource.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsKeepsAnExcludedResourceOutOfTheManifest()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume()
+                .WithOpenTelemetryMetrics()
+                .ExcludeFromManifest();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, token) =>
+                GatherPublishConfigurationAsync(documentDB.Resource, token));
+        });
+
+        Assert.Null(manifest["resources"]?["DocumentDB"]);
+    }
+
+    public static TheoryData<string[], string> StorageChangingRuntimeArgumentCases => new()
+    {
+        { ["--mount", "type=volume,source=runtime-secret,target=/tmp"], "--mount" },
+        { ["--mount=type=volume,source=runtime-secret,target=/tmp"], "--mount" },
+        { ["--volume", "runtime-secret:/tmp"], "--volume" },
+        { ["--volume=runtime-secret:/tmp"], "--volume" },
+        { ["-v", "runtime-secret:/tmp"], "-v" },
+        { ["-vruntime-secret:/tmp"], "-v" },
+        { ["-v=runtime-secret:/tmp"], "-v" },
+        { ["-itvruntime-secret:/tmp"], "-v" },
+        { ["-l=", "--mount", "type=volume,source=runtime-secret,target=/tmp"], "--mount" },
+        { ["--tmpfs", "/tmp:size=64m"], "--tmpfs" },
+        { ["--tmpfs=/tmp:size=64m"], "--tmpfs" },
+        { ["--volume-driver", "runtime-secret"], "--volume-driver" },
+        { ["--volumes-from", "runtime-secret"], "--volumes-from" },
+        { ["--use-api-socket"], "--use-api-socket" },
+        { ["--secret", "runtime-secret,type=mount,target=/tmp"], "--secret" },
+        { ["--secret=runtime-secret,type=mount,target=/tmp"], "--secret" },
+        { ["--image-volume", "tmpfs"], "--image-volume" },
+        { ["--image-volume=tmpfs"], "--image-volume" },
+        { ["--ipc", "host"], "--ipc" },
+        { ["--ipc=host"], "--ipc" },
+        { ["--chrootdirs", "/runtime-secret"], "--chrootdirs" },
+        { ["--chrootdirs=/runtime-secret"], "--chrootdirs" },
+        { ["--read-only-tmpfs"], "--read-only-tmpfs" },
+        { ["--read-only-tmpfs=true"], "--read-only-tmpfs" },
+        { ["--systemd"], "--systemd" },
+        { ["--systemd=always"], "--systemd" },
+        { ["--pod", "runtime-secret"], "--pod" },
+        { ["--pod=runtime-secret"], "--pod" },
+        { ["--pod-id-file", "/runtime-secret/pod-id"], "--pod-id-file" },
+        { ["--pod-id-file=/runtime-secret/pod-id"], "--pod-id-file" },
+        { ["--read-only"], "--read-only" },
+        { ["--read-only=true"], "--read-only" },
+        { ["--storage-opt", "overlay2.size=runtime-secret"], "--storage-opt" },
+        { ["--storage-opt=overlay2.size=runtime-secret"], "--storage-opt" },
+        { ["--init-path", "/runtime-secret/podman-init"], "--init-path" },
+        { ["--init-path=/runtime-secret/podman-init"], "--init-path" },
+        { ["--http-proxy", "--secret=runtime-secret,type=mount,target=/tmp"], "--secret" },
+        { ["--http-proxy=false", "--image-volume=runtime-secret"], "--image-volume" },
+    };
+
+    [Theory]
+    [MemberData(nameof(StorageChangingRuntimeArgumentCases))]
+    public async Task WithOpenTelemetryMetricsRejectsStorageChangingRuntimeArguments(
+        string[] runtimeArguments,
+        string expectedOption)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("storage-changing container runtime option", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedOption, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--entrypoint", "/runtime-secret/entrypoint")]
+    [InlineData("--entrypoint=/runtime-secret/entrypoint")]
+    public async Task WithOpenTelemetryMetricsRejectsRawRuntimeEntrypoints(params string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("'--entrypoint'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    public static TheoryData<string[]> ProtectedRuntimeEnvironmentCases => new()
+    {
+        { ["--env", "DATA_PATH=/runtime-secret"] },
+        { ["--env=CONFIG_DIR=/runtime-secret"] },
+        { ["-e", "GATEWAY_HOME=/runtime-secret"] },
+        { ["-eOTEL_METRICS_ENABLED=false"] },
+        { ["-e=OTEL_EXPORTER_OTLP_ENDPOINT=http://runtime-secret"] },
+        { ["--env=OTEL_METRICS_ENABLED"] },
+        { ["--env", "DATA_*"] },
+        { ["--env", "OTEL_*"] },
+        { ["--env=OTEL_*"] },
+        { ["-e", "OTEL_*"] },
+        { ["-eOTEL_*"] },
+        { ["--env", "*"] },
+        { ["--env-file", "/runtime-secret/environment"] },
+        { ["--env-file=/runtime-secret/environment"] },
+        { ["--env-host"] },
+        { ["--env-host=true"] },
+        { ["--env-merge", "DATA_PATH=/runtime-secret"] },
+        { ["--env-merge=CONFIG_DIR=/runtime-secret"] },
+        { ["--unsetenv", "OTEL_METRICS_ENABLED"] },
+        { ["--unsetenv=OTEL_EXPORTER_OTLP_ENDPOINT"] },
+        { ["--unsetenv-all"] },
+    };
+
+    [Theory]
+    [MemberData(nameof(ProtectedRuntimeEnvironmentCases))]
+    public async Task WithOpenTelemetryMetricsRejectsProtectedRuntimeEnvironmentOverrides(
+        string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+
+        if (runtimeArguments.Any(argument => argument.Contains('*')))
+        {
+            Assert.DoesNotContain("*", exception.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("--rootfs", "/runtime-secret/rootfs")]
+    [InlineData("--rootfs=/runtime-secret/rootfs")]
+    public async Task WithOpenTelemetryMetricsRejectsPodmanRootfsOverrides(params string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("'--rootfs'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("registry.example/runtime-secret:latest")]
+    [InlineData("--", "registry.example/runtime-secret:latest")]
+    public async Task RuntimeArgumentParserRejectsPositionalOperandsWithoutRepeatingThem(
+        params string[] runtimeArguments)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("positional container runtime operand", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("registry.example", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--authfile")]
+    [InlineData("--env-merge")]
+    [InlineData("--sdnotify")]
+    public async Task RuntimeArgumentParserEnforcesRequiredPodmanOptionArity(string runtimeArgument)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArgument);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("does not provide the required value", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(runtimeArgument, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--future-runtime-option=runtime-secret")]
+    [InlineData("-Zruntime-secret")]
+    public async Task RuntimeArgumentParserRejectsUnknownOptionsWithoutRepeatingTheirTokens(
+        string runtimeArgument)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArgument);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("outside the Docker and Podman run grammar", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("future-runtime-option", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("-Z", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserLeavesHarmlessPodmanOptionsAlone()
+    {
+        string[] runtimeArguments =
+        [
+            "--arch", "arm64",
+            "--authfile=/work/auth.json",
+            "--cgroups", "disabled",
+            "--gidmap=0:1000:1",
+            "--health-log-destination", "local",
+            "--http-proxy=false",
+            "--init",
+            "--net=bridge",
+            "--os", "linux",
+            "--retry", "3",
+            "--sdnotify=ignore",
+            "--tz", "UTC",
+            "--variant", "v8",
+            "--env-merge", "UNRELATED=prefix",
+            "--unsetenv=UNRELATED",
+            "--env", "UNRELATED_*",
+            "--env=UNRELATED_*",
+            "-eUNRELATED_*",
+            "--env=OTEL_*=literal",
+            "-e", "DATA_*=literal",
+            "--",
+        ];
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            runtimeArguments,
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotTreatUnrelatedOptionValuesAsOptions()
+    {
+        string[] runtimeArguments =
+        [
+            "--label", "--mount",
+            "-l--volume",
+            "--health-cmd", "--entrypoint",
+            "--name=--tmpfs",
+            "--env", "UNRELATED=DATA_PATH=/runtime-secret",
+            "-eUNRELATED=--mount",
+            "-it",
+            "--label=CONFIG_DIR=/runtime-secret",
+        ];
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(runtimeArguments);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            runtimeArguments,
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserUsesResolvedDeferredValuesExactlyOnce()
+    {
+        var option = new CountingValueProvider("--label");
+        var value = new CountingValueProvider("--mount");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(option);
+                context.Args.Add(value);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            ["--label", "--mount"],
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+        Assert.Equal(1, option.Evaluations);
+        Assert.Equal(1, value.Evaluations);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredStorageOptionWithoutRepeatingIt()
+    {
+        var option = new CountingValueProvider("--mount");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(option);
+                context.Args.Add("type=volume,source=runtime-secret,target=/tmp");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, option.Evaluations);
+        Assert.Contains("'--mount'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredProtectedEnvironmentValue()
+    {
+        var environment = new CountingValueProvider("DATA_PATH=/runtime-secret");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--env");
+                context.Args.Add(environment);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, environment.Evaluations);
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredProtectedEnvironmentPrefix()
+    {
+        var environment = new CountingValueProvider("OTEL_*");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--env");
+                context.Args.Add(environment);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, environment.Evaluations);
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("OTEL_*", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredPodmanSecretOption()
+    {
+        var option = new CountingValueProvider("--secret");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(option);
+                context.Args.Add("runtime-secret,type=mount,target=/tmp");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, option.Evaluations);
+        Assert.Contains("'--secret'", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserRejectsADeferredPodmanEnvironmentMerge()
+    {
+        var environment = new CountingValueProvider("DATA_PATH=/runtime-secret");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--env-merge");
+                context.Args.Add(environment);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Equal(1, environment.Evaluations);
+        Assert.Contains("raw container runtime environment override", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserResolvesADeferredHarmlessPodmanValueOnce()
+    {
+        var value = new CountingValueProvider("ignore");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add("--sdnotify");
+                context.Args.Add(value);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            ["--sdnotify", "ignore"],
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+        Assert.Equal(1, value.Evaluations);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotExposeASecretParameterOperandInPublishMode()
+    {
+        const string secret = "operand-secret-fragment";
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:operand"] = secret;
+        var operand = appBuilder.AddParameter("operand", secret: true);
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context => context.Args.Add(operand.Resource));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("positional container runtime operand", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("operand-secret", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotExposeACredentialReferenceOperandInPublishMode()
+    {
+        const string passwordValue = "ReferenceCredentialSecret987";
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:reference-password"] = passwordValue;
+        var password = appBuilder.AddParameter("reference-password", secret: true);
+        var credential = ReferenceExpression.Create(
+            $"mongodb://runtime-user:{password.Resource}@runtime-host:10260/admin");
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context => context.Args.Add(credential));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("positional container runtime operand", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(passwordValue, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("mongodb://", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("runtime-user", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserDoesNotExposeADeferredResolutionFailure()
+    {
+        var value = new ThrowingValueProvider("resolution-secret-fragment");
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context => context.Args.Add(value));
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("could not be resolved", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("resolution-secret", exception.ToString(), StringComparison.Ordinal);
+        Assert.Null(exception.InnerException);
+    }
+
+    [Fact]
+    public async Task RuntimeArgumentParserResolvesParameterBackedRuntimeArguments()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:runtime-option"] = "--label";
+        var runtimeOption = appBuilder.AddParameter("runtime-option", secret: true);
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs(context =>
+            {
+                context.Args.Add(runtimeOption.Resource);
+                context.Args.Add("team=data");
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        Assert.Equal(
+            ["--label", "team=data"],
+            await RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsAllowsNullOrFalseShellExecution(bool? shellExecution)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+        documentDB.Resource.ShellExecution = shellExecution;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsShellExecutionBeforeDcpRewritesTheCommand()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+        documentDB.Resource.ShellExecution = true;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var runtimeException = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+        var commandException = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(resource));
+
+        Assert.Contains("ShellExecution", runtimeException.Message, StringComparison.Ordinal);
+        Assert.Contains("rewrites the already verified wrapper arguments", runtimeException.Message, StringComparison.Ordinal);
+        Assert.Equal(runtimeException.Message, commandException.Message);
+    }
+
+    [Fact]
+    public async Task ShellExecutionMutationAfterCachedCommandGenerationFailsAtRuntimeCheckpoint()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        documentDB.Resource.ShellExecution = true;
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("ShellExecution", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CustomImagesKeepTheirRuntimeAndShellExecutionBehavior()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("contoso/documentdb-custom")
+            .WithImageTag("latest")
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs("--label", "documentdb.custom=1");
+        documentDB.Resource.ShellExecution = true;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Null(resource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+        Assert.Equal(
+            ["--label", "documentdb.custom=1"],
+            await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task OfficialImagesWithoutTheWrapperKeepShellExecutionBehavior()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.114.0")
+            .WithOpenTelemetryMetrics()
+            .WithArgs("echo", "unchanged")
+            .WithContainerRuntimeArgs("--label", "documentdb.legacy=1");
+        documentDB.Resource.ShellExecution = true;
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Null(resource.Entrypoint);
+        Assert.Equal(["echo", "unchanged"], await BuildContainerArgsAsync(resource));
+        Assert.Equal(
+            ["--label", "documentdb.legacy=1"],
+            await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenShellExecutionIsTrue()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+            documentDB.Resource.ShellExecution = true;
+        });
+
+        Assert.Contains("ShellExecution", log, StringComparison.Ordinal);
+        Assert.Contains("false or null", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ManifestDiagnosticsDoNotExposeASecretParameterArgument()
+    {
+        const string secret = "manifest-parameter-secret-fragment";
+
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.Configuration["Parameters:operand"] = secret;
+            var operand = appBuilder.AddParameter("operand", secret: true);
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics()
+                // The deferred value sits where the container entrypoint reads an operand, which
+                // is the one position the storage guard's command-line rule leaves alone; the
+                // point of this test is what a diagnostic says, not which rule raises it.
+                .WithArgs(context =>
+                {
+                    context.Args.Add("--log-level");
+                    context.Args.Add(operand.Resource);
+                })
+                .WithContainerRuntimeArgs(context => context.Args.Add(operand.Resource));
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, cancellationToken) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, cancellationToken);
+                documentDB.Resource.ShellExecution = true;
+            });
+        });
+
+        Assert.Contains("ShellExecution", log, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, log, StringComparison.Ordinal);
+        Assert.DoesNotContain("manifest-parameter-secret", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ManifestDiagnosticsDoNotExposeACredentialReferenceExpression()
+    {
+        const string passwordValue = "ManifestCredentialSecret987";
+
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.Configuration["Parameters:manifest-password"] = passwordValue;
+            var password = appBuilder.AddParameter("manifest-password", secret: true);
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB", password: password)
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+            documentDB
+                .WithArgs(context =>
+                {
+                    context.Args.Add("--log-level");
+                    context.Args.Add(documentDB.Resource.ConnectionStringExpression);
+                })
+                .WithContainerRuntimeArgs(context =>
+                    context.Args.Add(documentDB.Resource.ConnectionStringExpression));
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, cancellationToken) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, cancellationToken);
+                documentDB.Resource.ShellExecution = true;
+            });
+        });
+
+        Assert.Contains("ShellExecution", log, StringComparison.Ordinal);
+        Assert.DoesNotContain(passwordValue, log, StringComparison.Ordinal);
+        Assert.DoesNotContain("mongodb://", log, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("manifest-password", log, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(false)]
+    public async Task WithOpenTelemetryMetricsPublishesWithNullOrFalseShellExecution(bool? shellExecution)
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+            documentDB.Resource.ShellExecution = shellExecution;
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.Equal(GatewayConfigurationShell, resource?["entrypoint"]?.GetValue<string>());
+        Assert.Equal("-c", resource?["args"]?[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, resource?["args"]?[2]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// The other control: container runtime arguments that only do what they are for still work,
+    /// and the checkpoint returns the same resolved values it validated.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsLeavesBenignContainerRuntimeArgumentsAlone()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithContainerRuntimeArgs("--label", "team=data");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Equal(3, (await BuildContainerArgsAsync(resource)).Count);
+
+        Assert.Equal(["--label", "team=data"], await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    /// <summary>
+    /// A deferred value keeps its single evaluation: the wrapper's callback is moved between
+    /// phases, never rebuilt, so Aspire's record of it — and of everything before it — survives,
+    /// and a parameter that may be a secret is resolved by Aspire once rather than by this package
+    /// a second time.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsResolvesADeferredArgumentExactlyOnce()
+    {
+        var evaluations = 0;
+
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.Configuration["Parameters:level"] = "trace";
+        var level = appBuilder.AddParameter("level", secret: true);
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics()
+            .WithArgs(context =>
+            {
+                Interlocked.Increment(ref evaluations);
+                context.Args.Add("--log-level");
+                context.Args.Add(level.Resource);
+            });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        var first = await BuildContainerArgsAsync(resource);
+        var second = await BuildContainerArgsAsync(resource);
+
+        Assert.Equal(1, evaluations);
+        Assert.Equal(5, first.Count);
+        Assert.Equal(first, second);
+        Assert.Equal("-c", first[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, first[2]);
+        Assert.Equal("--log-level", first[3]);
+        Assert.Same(level.Resource, first[4]);
+    }
+
+    // ---------------------------------------------------------------------
+    // The same seal, for the storage the container mounts
+    //
+    // Storage lives in annotations, not in a callback, so a volume or bind
+    // mount added after the environment pipeline has been gathered changes
+    // what the container really mounts without running a single storage rule
+    // again. The verdict is recorded and compared at the same two uncached
+    // checkpoints as the command line.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The reported bypass, in a run: a lifecycle hook gathers the configuration and only then
+    /// mounts <c>/data</c> read-only. The environment the container receives is the one recorded
+    /// before the mount existed, so nothing would re-check it; DocumentDB 0.116 chowns and chmods
+    /// its data directory on start and cannot come up on a read-only one.
+    /// </summary>
+    [Fact]
+    public async Task AReadOnlyDataMountAddedAfterAGatherFailsTheRun()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+        appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+            new GatherThenMutateLifecycleHook(
+                "DocumentDB",
+                resource => resource.Annotations.Add(
+                    new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: true))));
+#pragma warning restore CS0618
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RunLifecycleHooksAsync(app);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("a volume or bind mount was added, removed or changed", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same thing in a publish, through the real publisher. Publish raises no per-resource
+    /// event, and a subscriber registered after this package could run after
+    /// <c>BeforePublishEvent</c> too, so the check has to live where the resource is actually
+    /// serialized.
+    /// </summary>
+    [Fact]
+    public async Task AReadOnlyDataMountAddedAfterAGatherFailsRealManifestPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Annotations.Add(
+                        new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: true))));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", log, StringComparison.Ordinal);
+        Assert.Contains("a volume or bind mount was added, removed or changed", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A subscriber registered after <c>AddDocumentDB</c> gets the last <c>BeforePublishEvent</c>,
+    /// which is after every retake this package can arrange. Replacing the judged data volume with
+    /// a read-only bind mount there still has to be caught, which is what makes the serialization
+    /// checkpoint rather than the event the authority.
+    /// </summary>
+    [Fact]
+    public async Task ReplacingTheDataMountFromALateBeforePublishSubscriberFailsPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data")
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (evt, token) =>
+            {
+                var resource = evt.Services.GetRequiredService<DistributedApplicationModel>()
+                    .Resources.OfType<DocumentDBServerResource>().Single();
+
+                await ExecutionConfigurationBuilder.Create(resource)
+                    .WithArgumentsConfig()
+                    .WithEnvironmentVariablesConfig()
+                    .BuildAsync(
+                        new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                        NullLogger.Instance,
+                        token);
+
+                foreach (var mount in resource.Annotations.OfType<ContainerMountAnnotation>().ToList())
+                {
+                    resource.Annotations.Remove(mount);
+                }
+
+                resource.Annotations.Add(
+                    new ContainerMountAnnotation("/srv/readonly", "/data", ContainerMountType.BindMount, isReadOnly: true));
+            });
+        });
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The corruption guard's own bypass: two resources on an image that predates the data
+    /// directory's exclusive lock gather with no storage at all, and only then are put on one
+    /// named volume. Nothing at runtime would refuse the pairing on those images, so the check has
+    /// to.
+    /// </summary>
+    [Fact]
+    public async Task TwoOldImagesPutOnOneVolumeAfterAGatherFailPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("primary").WithImageTag("pg17-0.114.0");
+            appBuilder.AddDocumentDB("secondary").WithImageTag("pg17-0.114.0");
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherAllThenMutateLifecycleHook(model =>
+                {
+                    foreach (var resource in model.Resources.OfType<DocumentDBServerResource>())
+                    {
+                        resource.Annotations.Add(
+                            new ContainerMountAnnotation("shared-late", "/data", ContainerMountType.Volume, isReadOnly: false));
+                    }
+                }));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its data directory ('/data') had already been checked", log, StringComparison.Ordinal);
+        Assert.Contains("a shared one puts two clusters on one directory", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The one shape where the storage rules legitimately decline to judge: publish mode with a
+    /// <c>DATA_PATH</c> that is a manifest expression and no storage at all. "Mounts nothing" is
+    /// still an observation, and a mount added after it has been made contradicts it.
+    /// </summary>
+    [Fact]
+    public async Task StorageAddedAfterADeferredDataPathWasAcceptedFailsPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var dataPath = appBuilder.AddParameter("datapath", "/pgdata");
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithEnvironment("DATA_PATH", dataPath);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Annotations.Add(
+                        new ContainerMountAnnotation("late-data", "/pgdata", ContainerMountType.Volume, isReadOnly: true))));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its storage (it mounted none) had already been checked", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Storage that is re-declared rather than changed is the same storage. The mounts are
+    /// recorded by value and in a fixed order, so replacing an annotation with an identical one —
+    /// or shuffling the collection — leaves the verdict standing and the manifest is published,
+    /// gateway wrapper and all.
+    /// </summary>
+    [Fact]
+    public async Task ReDeclaringTheSameStorageAfterAGatherIsAccepted()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data")
+                .WithBindMount("./certs", "/certs", isReadOnly: true);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource =>
+                    {
+                        var mounts = resource.Annotations.OfType<ContainerMountAnnotation>().ToList();
+
+                        foreach (var mount in mounts)
+                        {
+                            resource.Annotations.Remove(mount);
+                        }
+
+                        // Fresh instances, reversed, describing exactly the same storage.
+                        mounts.Reverse();
+                        foreach (var mount in mounts)
+                        {
+                            resource.Annotations.Add(
+                                new ContainerMountAnnotation(mount.Source, mount.Target, mount.Type, mount.IsReadOnly));
+                        }
+                    }));
+#pragma warning restore CS0618
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal("/data", resource!["env"]?["DATA_PATH"]?.GetValue<string>());
+
+        var volume = Assert.Single(resource["volumes"]!.AsArray());
+        Assert.Equal("documentdb-data", volume!["name"]?.GetValue<string>());
+        Assert.Equal("/data", volume["target"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// A resource the caller excluded is not written at all, checkpoint or no checkpoint: there is
+    /// no published configuration to be wrong about, and taking the last manifest position from
+    /// the exclusion would publish a resource the caller removed.
+    /// </summary>
+    [Fact]
+    public async Task AnExcludedResourceIsStillAbsentFromTheManifest()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume()
+                .WithOpenTelemetryMetrics()
+                .ExcludeFromManifest());
+
+        Assert.Null(manifest["resources"]?["DocumentDB"]);
+    }
+
+    /// <summary>
+    /// The window between the run's checkpoint and the gather it protects. Aspire invokes every
+    /// container-runtime-argument callback, in annotation order, and only then builds the
+    /// container's environment, so a callback appended after the checkpoint runs once the verdict
+    /// has already been re-checked — and can still append an environment callback that moves
+    /// <c>DATA_PATH</c> onto read-only storage, because the guard's own environment callback is
+    /// cached and no longer re-checks anything.
+    /// </summary>
+    [Fact]
+    public async Task ARuntimeArgumentCallbackAddedAfterAGatherFailsTheRun()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume(name: "documentdb-data")
+            .WithVolume("documentdb-archive", "/archive", isReadOnly: true);
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, async (_, token) =>
+        {
+            var resource = documentDB.Resource;
+
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithArgumentsConfig()
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+                    NullLogger.Instance,
+                    token);
+
+            resource.Annotations.Add(new ContainerRuntimeArgsCallbackAnnotation(_ =>
+            {
+                resource.Annotations.Add(new EnvironmentCallbackAnnotation(
+                    (Func<EnvironmentCallbackContext, Task>)(context =>
+                    {
+                        context.EnvironmentVariables["DATA_PATH"] = "/archive";
+                        return Task.CompletedTask;
+                    })));
+
+                return Task.CompletedTask;
+            }));
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("has a later container-runtime-arguments callback registered after", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The publish checkpoint has to be invisible when nothing is wrong: it writes exactly what
+    /// the publisher would have written for the resource on its own.
+    /// </summary>
+    [Fact]
+    public async Task ThePublishCheckpointLeavesTheManifestUnchanged()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataBindMount("./pgdata"));
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal("container.v0", resource!["type"]?.GetValue<string>());
+        Assert.Equal(
+            $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{InterlockedTag}",
+            resource["image"]?.GetValue<string>());
+        Assert.Equal("/data", resource["env"]?["DATA_PATH"]?.GetValue<string>());
+        Assert.NotNull(resource["connectionString"]);
+        Assert.NotNull(resource["bindings"]);
+
+        var bindMount = Assert.Single(resource["bindMounts"]!.AsArray());
+        Assert.Equal("/data", bindMount!["target"]?.GetValue<string>());
+        Assert.False(bindMount["readOnly"]?.GetValue<bool>());
+    }
+
+    /// <summary>
+    /// A lifecycle hook that moves <c>DATA_PATH</c> without reading the configuration first is
+    /// repairable rather than fatal. Publish raises no per-resource event, so
+    /// <c>BeforePublishEvent</c> is where the guard takes the last position in the environment
+    /// pipeline back; the value it then reads is judged on its own terms — here, onto a read-only
+    /// mount — instead of being reported as an ordering problem.
+    /// </summary>
+    [Fact]
+    public async Task ADataPathSetByALifecycleHookIsJudgedOnItsOwnTermsWhenPublishing()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume(name: "documentdb-data")
+                .WithVolume("documentdb-archive", "/pgdata", isReadOnly: true);
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new DataPathLifecycleHook("DocumentDB", "/pgdata"));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("mounts its data directory ('/pgdata') read-only", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Invokes the resource's container-runtime-argument callbacks the way Aspire's container
+    /// creator does: in annotation order, over one shared list, with no result cache — which is
+    /// what makes this the run's unconditional checkpoint.
+    /// </summary>
+    private sealed class CountingValueProvider(string value) : IValueProvider
+    {
+        public int Evaluations { get; private set; }
+
+        public ValueTask<string?> GetValueAsync(CancellationToken cancellationToken = default)
+        {
+            Evaluations++;
+            return ValueTask.FromResult<string?>(value);
+        }
+    }
+
+    private sealed class ThrowingValueProvider(string message) : IValueProvider
+    {
+        public ValueTask<string?> GetValueAsync(CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<string?>(new InvalidOperationException(message));
+    }
+
+    private static async Task<string[]> RunContainerRuntimeArgsAsync(DocumentDBServerResource resource)
+    {
+        var args = new List<object>();
+        var context = new ContainerRuntimeArgsCallbackContext(args, CancellationToken.None);
+
+        foreach (var annotation in resource.Annotations.OfType<ContainerRuntimeArgsCallbackAnnotation>())
+        {
+            await annotation.Callback(context);
+        }
+
+        return [.. args.Select(argument => argument as string ?? argument.ToString()!)];
+    }
+
+    private static async Task GatherPublishConfigurationAsync(
+        DocumentDBServerResource resource,
+        CancellationToken cancellationToken)
+    {
+        await ExecutionConfigurationBuilder.Create(resource)
+            .WithArgumentsConfig()
+            .WithEnvironmentVariablesConfig()
+            .BuildAsync(
+                new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                NullLogger.Instance,
+                cancellationToken);
+    }
+
+    /// <summary>
+    /// A lifecycle hook that builds the resource's configuration through the same public API
+    /// Aspire uses, and then changes the resource — the shape that made a validated command line
+    /// stale.
+    /// </summary>
+#pragma warning disable CS0618 // Type or member is obsolete
+    private sealed class GatherThenMutateLifecycleHook(
+        string resourceName,
+        Action<DocumentDBServerResource> mutate) : IDistributedApplicationLifecycleHook
+    {
+        public async Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            var resource = appModel.Resources.OfType<DocumentDBServerResource>()
+                .Single(candidate => candidate.Name == resourceName);
+
+            await ExecutionConfigurationBuilder.Create(resource)
+                .WithArgumentsConfig()
+                .WithEnvironmentVariablesConfig()
+                .BuildAsync(
+                    new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                    NullLogger.Instance,
+                    cancellationToken);
+
+            mutate(resource);
+        }
+    }
+
+    /// <summary>
+    /// The multi-resource form: every DocumentDB resource in the model has its configuration built
+    /// first, so no verdict is still pending when the model is changed.
+    /// </summary>
+    private sealed class GatherAllThenMutateLifecycleHook(
+        Action<DistributedApplicationModel> mutate) : IDistributedApplicationLifecycleHook
+    {
+        public async Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            foreach (var resource in appModel.Resources.OfType<DocumentDBServerResource>())
+            {
+                await ExecutionConfigurationBuilder.Create(resource)
+                    .WithArgumentsConfig()
+                    .WithEnvironmentVariablesConfig()
+                    .BuildAsync(
+                        new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                        NullLogger.Instance,
+                        cancellationToken);
+            }
+
+            mutate(appModel);
+        }
+    }
+#pragma warning restore CS0618
+
+    // Lifecycle hooks are obsolete in favour of eventing subscribers, but Aspire still runs
+    // registered hooks - after BeforeStartEvent - so they remain a way to add a command-line
+    // callback late, and the wrapper has to hold against it.
+#pragma warning disable CS0618 // Type or member is obsolete
+    private sealed class PrependArgumentLifecycleHook(string resourceName, string argument) : IDistributedApplicationLifecycleHook
+    {
+        public Task BeforeStartAsync(DistributedApplicationModel appModel, CancellationToken cancellationToken = default)
+        {
+            appModel.Resources.OfType<DocumentDBServerResource>().Single(resource => resource.Name == resourceName)
+                .Annotations.Add(new CommandLineArgsCallbackAnnotation(args => args.Insert(0, argument)));
+
+            return Task.CompletedTask;
+        }
+    }
+
+    private static async Task RunLifecycleHooksAsync(DistributedApplication app)
+    {
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        foreach (var hook in app.Services.GetServices<IDistributedApplicationLifecycleHook>())
+        {
+            await hook.BeforeStartAsync(model, CancellationToken.None);
+        }
+    }
+#pragma warning restore CS0618
+
+    // ---------------------------------------------------------------------
+    // One terminal command line, two sets of rules
+    //
+    // The data-storage guard and the OpenTelemetry gateway wrapper both need
+    // the last word on the container command line, which is a single position.
+    // They share one callback instead: the storage rule runs first, on the
+    // caller's own arguments, because it models the image entrypoint's
+    // '--option value' grammar; the wrapper then turns the list into a
+    // '/bin/bash -c' command line; and the finished list is checked against
+    // both rules before it is used.
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The wrapper does not shelter a reserved argument. The storage rule reads the caller's
+    /// arguments, not the shell command line the wrapper builds out of them.
+    /// </summary>
+    [Theory]
+    [InlineData("--data-path")]
+    [InlineData("-d")]
+    public async Task AReservedDataPathArgumentIsRejectedWithTheTelemetryWrapperInstalled(string option)
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume()
+            .WithOpenTelemetryMetrics()
+            .WithArgs(option, "/pgdata");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+
+        Assert.Contains($"passes the command-line argument '{option}'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A callback registered after <c>WithOpenTelemetryMetrics()</c> now runs before the wrapper,
+    /// which is exactly where the storage rule has to see it.
+    /// </summary>
+    [Fact]
+    public async Task AReservedDataPathArgumentPrependedAfterTheWrapperIsStillRejected()
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume()
+            .WithOpenTelemetryMetrics();
+
+        documentDB.WithArgs(context =>
+        {
+            context.Args.Insert(0, "/pgdata");
+            context.Args.Insert(0, "--data-path");
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+
+        Assert.Contains("passes the command-line argument '--data-path'", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The wrapper prefix is not read as entrypoint grammar: <c>--</c> does not shelter the token
+    /// after it, so a deferred token in the caller's first position is judged exactly as it is
+    /// without the wrapper.
+    /// </summary>
+    [Fact]
+    public async Task ADeferredLeadingArgumentIsRejectedWithTheTelemetryWrapperInstalled()
+    {
+        var appBuilder = CreateAppBuilder();
+        var option = appBuilder.AddParameter("option", "--log-level");
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume()
+            .WithOpenTelemetryMetrics()
+            .WithArgs(option, "trace");
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureArgumentsAsync(app, "DocumentDB"));
+
+        Assert.Contains("in a position where the container entrypoint reads an option name", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The positive case: both rules pass, the wrapper prefix is first, and the caller's
+    /// arguments follow it unchanged.
+    /// </summary>
+    [Fact]
+    public async Task TheStorageRulesAndTheTelemetryWrapperAgreeOnOneCommandLine()
+    {
+        var appBuilder = CreateAppBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume()
+            .WithOpenTelemetryMetrics()
+            .WithArgs("--log-level", "trace");
+
+        using var app = appBuilder.Build();
+
+        var args = await ConfigureArgumentsAsync(app, "DocumentDB");
+
+        Assert.Equal(5, args.Length);
+        Assert.Equal("-c", args[0]);
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]);
+        Assert.Equal("--log-level", args[3]);
+        Assert.Equal("trace", args[4]);
+        Assert.Contains($"exec {GatewayEntrypointScriptPath} \"$@\"", args[1], StringComparison.Ordinal);
+
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+    }
+
+    /// <summary>
+    /// Both guards keep their own pipeline. Neither is weakened by sharing the command line: the
+    /// environment guard still refuses to answer when something is appended after it, and the
+    /// command-line guard still refuses when something is appended after that.
+    /// </summary>
+    [Theory]
+    [InlineData("environment")]
+    [InlineData("command-line")]
+    public async Task BothGuardsStillFailClosedWithTheTelemetryWrapperInstalled(string pipeline)
+    {
+        var appBuilder = CreateAppBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(InterlockedTag)
+            .WithDataVolume()
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            if (pipeline == "environment")
+            {
+                documentDB.WithEnvironment("DATA_PATH", "/pgdata");
+            }
+            else
+            {
+                documentDB.WithArgs("--log-level", "trace");
+            }
+
+            return Task.CompletedTask;
+        });
+
+        using var app = appBuilder.Build();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ConfigureResourceAsync(app, "DocumentDB"));
+
+        Assert.Contains($"has a later {pipeline} callback registered after", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The seal covers the storage rules as well, because both are steps of the one callback whose
+    /// result gets recorded. A reserved <c>--data-path</c> added after the command line was already
+    /// built would never be scanned; the resource is failed instead.
+    /// </summary>
+    [Fact]
+    public async Task AReservedDataPathAddedAfterTheCommandLineWasBuiltFailsClosed()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume()
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new GatherThenMutateLifecycleHook(
+                    "DocumentDB",
+                    resource => resource.Annotations.Add(
+                        new CommandLineArgsCallbackAnnotation(args =>
+                        {
+                            args.Add("--data-path");
+                            args.Add("/pgdata");
+                        }))));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("was changed after its container command line had already been built", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The repairable counterpart: a hook that adds the same reserved argument without reading the
+    /// configuration first is ordered before the storage rule, which then rejects it on its own
+    /// terms.
+    /// </summary>
+    [Fact]
+    public async Task AReservedDataPathAddedByALifecycleHookIsStillRejectedOnItsOwnTerms()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume()
+                .WithOpenTelemetryMetrics();
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            appBuilder.Services.AddSingleton<IDistributedApplicationLifecycleHook>(
+                new DataPathArgumentLifecycleHook("DocumentDB"));
+#pragma warning restore CS0618
+        });
+
+        Assert.Contains("passes the command-line argument '--data-path'", log, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The real publisher with both features on: the manifest names the official image, carries
+    /// the wrapper in <c>entrypoint</c>/<c>args</c>, and still records the data directory the
+    /// storage guard judged.
+    /// </summary>
+    [Fact]
+    public async Task PublishCarriesTheWrapperAndTheJudgedDataPathTogether()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDataVolume()
+                .WithOpenTelemetryMetrics()
+                .WithArgs(context => context.Args.Insert(0, "--help")));
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(GatewayConfigurationShell, resource!["entrypoint"]?.GetValue<string>());
+        Assert.Equal("/data", resource["env"]?["DATA_PATH"]?.GetValue<string>());
+
+        var args = resource["args"]?.AsArray();
+        Assert.NotNull(args);
+        Assert.Equal(4, args!.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+        Assert.Equal("--help", args[3]?.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData("/custom/entrypoint.sh")]
+    [InlineData("/bin/bash")]
+    public async Task WithOpenTelemetryMetricsRejectsAnyCallerSuppliedEntrypoint(string entrypoint)
+    {
+        // Even /bin/bash is a caller-owned entrypoint: its arguments are the caller's, so
+        // accepting it would splice the wrapper arguments into someone else's command line.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithEntrypoint(entrypoint)
+            .WithArgs("-c", "echo hi")
+            .WithOpenTelemetryMetrics();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains(entrypoint, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsToleratesRepeatedLifecycleEvents()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        await RaiseBeforeStartAsync(app);
+        await RaiseBeforeStartAsync(app);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsArgumentsResolvedWithoutTheWrapperEntrypoint()
+    {
+        // The arguments only mean anything to the wrapper's own entrypoint. If they are resolved
+        // while something else owns the container command, they would be spliced into it.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
             .WithImageTag("pg17-0.116.0")
             .WithOpenTelemetryMetrics();
 
         using var app = appBuilder.Build();
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(documentDB.Resource));
 
-        Assert.Equal("documentdb_gateway", env["OTEL_SERVICE_NAME"]);
+        Assert.Contains("<image default>", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsPreservesCallerProvided0116ServiceName()
+    public async Task WithOpenTelemetryMetricsRejectsArgumentsWhenTheEntrypointIsReplacedLaterInTheSameStartup()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
+        // A BeforeStartEvent subscriber registered after ours runs after ours, so the entrypoint
+        // check in the event handler cannot see the replacement. The argument callback runs after
+        // every subscriber, which is why it re-checks.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+        {
+            documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        Assert.Equal("/late/entrypoint.sh", SingleServerResource(app).Entrypoint);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(SingleServerResource(app)));
+
+        Assert.Contains("/late/entrypoint.sh", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishWhenTheEntrypointIsReplacedLaterInTheSameStartup()
+    {
+        // End to end through the real publishing pipeline: no manifest may be written with the
+        // wrapper's arguments attached to somebody else's entrypoint. The publisher reports the
+        // failed step rather than letting the exception escape RunAsync, which is what makes
+        // 'aspire publish' exit non-zero.
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithOpenTelemetryMetrics();
+
+            appBuilder.Eventing.Subscribe<BeforeStartEvent>((_, _) =>
+            {
+                documentDB.Resource.Entrypoint = "/late/entrypoint.sh";
+                return Task.CompletedTask;
+            });
+        });
+
+        Assert.Contains("publish-manifest' failed", log, StringComparison.Ordinal);
+        Assert.Contains("/late/entrypoint.sh", log, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsAnEntrypointReplacedAfterTheWrapperTookOwnership()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
         appBuilder.AddDocumentDB("DocumentDB")
             .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        SingleServerResource(app).Entrypoint = "/custom/entrypoint.sh";
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains("/custom/entrypoint.sh", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("pg17-0.114.0")]
+    [InlineData("latest")]
+    public async Task WithOpenTelemetryMetricsRejectsAnImageDowngradedAfterTheWrapperWasInstalled(string tag)
+    {
+        // The wrapper cannot be uninstalled once the entrypoint carries it: skipping the
+        // arguments would leave /bin/bash with nothing to run, which starts no container at all.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+
+        documentDB.WithImageTag(tag);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains(tag, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsACustomImageSwappedInAfterTheWrapperWasInstalled()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        Assert.Equal(GatewayConfigurationShell, SingleServerResource(app).Entrypoint);
+
+        documentDB.WithImage("contoso/documentdb-local", "pg17-0.116.0");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RaiseBeforeStartAsync(app));
+        Assert.Contains("entrypoint", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("pg17-0.116.0")]
+    [InlineData("pg17-0.114.0")]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedOfficialImage(string supersededTag)
+    {
+        // ContainerImageAnnotation makes tag and digest mutually exclusive, so a digest pin leaves
+        // no tag to classify from and the DocumentDB version behind it is unknowable. Both stale
+        // directions matter: pg17-0.116.0 would have been wrapped and pg17-0.114.0 would have been
+        // skipped, and either guess is silently wrong.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(supersededTag)
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics();
+
+        var image = documentDB.Resource.Annotations.OfType<ContainerImageAnnotation>().Last();
+        Assert.Null(image.Tag);
+        Assert.Equal("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", image.SHA256);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithOpenTelemetryMetrics", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsClassifiesByTagWhenATagSupersedesAnEarlierDigest()
+    {
+        // The other direction of the same exclusivity: a later WithImageTag drops the digest, so
+        // the version is knowable again and the wrapper must apply rather than keep failing.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        var image = documentDB.Resource.Annotations.OfType<ContainerImageAnnotation>().Last();
+        Assert.Null(image.SHA256);
+        Assert.Equal("pg17-0.116.0", image.Tag);
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Equal(GatewayConfigurationShell, containerResource.Entrypoint);
+        Assert.Equal(3, (await BuildContainerArgsAsync(containerResource)).Count);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedOfficialImageWhenDisabled()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics(enabled: false);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildAndRaiseBeforeStartAsync(appBuilder));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsRejectsADigestPinnedOfficialImageWhenResolvingArguments()
+    {
+        // The argument callback resolves independently of the lifecycle event, so it has to reach
+        // the same conclusion rather than quietly emitting an unwrapped command line.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics();
+
+        using var app = appBuilder.Build();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => BuildContainerArgsAsync(documentDB.Resource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsAllowsADigestPinnedCustomImage()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("contoso/documentdb-local", "pg17-0.116.0")
+            .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var containerResource = SingleServerResource(app);
+        Assert.Null(containerResource.Entrypoint);
+        Assert.Empty(await BuildContainerArgsAsync(containerResource));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsWrapperScriptSurvivesPublisherArgumentProcessing()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics(serviceName: "custom-service");
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var script = await GetWrapperScriptAsync(SingleServerResource(app));
+
+        // azd evaluates '{...}' inside every container argument as a manifest binding expression
+        // before rendering it, so a shell '${VAR}' or '${VAR:-default}' is at best passed through
+        // by accident and at worst a hard publish failure.
+        Assert.DoesNotContain('{', script);
+        Assert.DoesNotContain('}', script);
+
+        // A newline turns the rendered YAML scalar into a block scalar, which does not survive the
+        // per-argument templating publishers use.
+        Assert.DoesNotContain('\n', script);
+        Assert.DoesNotContain('\r', script);
+
+        Assert.StartsWith("set -e;", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsDoesNotInventAServiceNameOn0116()
+    {
+        // The shipped TelemetryOptions.ServiceName is left in place instead, so the gateway keeps
+        // the identity its own configuration specifies.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.116.0")
+            .WithOpenTelemetryMetrics();
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        var env = await BuildEnvironmentVariablesAsync(SingleServerResource(app));
+        Assert.False(env.ContainsKey("OTEL_SERVICE_NAME"));
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsLeavesAnEnvironmentOnlyServiceNameSubordinateToTheConfigurationFile()
+    {
+        // WithEnvironment is not a WithOpenTelemetryMetrics override, so the JSON identity is not
+        // removed and continues to win inside the gateway. The variable is still propagated.
+        var appBuilder = CreateLifecycleTestBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
             .WithEnvironment("OTEL_SERVICE_NAME", "caller-service")
             .WithOpenTelemetryMetrics();
 
-        using var app = appBuilder.Build();
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
 
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+        var containerResource = SingleServerResource(app);
         var env = await BuildEnvironmentVariablesAsync(containerResource);
-
         Assert.Equal("caller-service", env["OTEL_SERVICE_NAME"]);
+
+        var script = await GetWrapperScriptAsync(containerResource);
+        Assert.DoesNotContain(".TelemetryOptions.ServiceName", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1111,10 +8400,11 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsAddsAllEnvironmentVariablesInManifest()
+    public async Task WithOpenTelemetryMetricsAddsAllEnvironmentVariablesIn0114Manifest()
     {
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithDocumentDBVersion(DocumentDBVersion.V0_114_0)
             .WithOpenTelemetryMetrics(
                 endpoint: "http://otel-collector:4317",
                 enabled: true,
@@ -1134,57 +8424,177 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsRejects0116PublishMode()
+    public async Task WithOpenTelemetryMetricsPublishesADeployableManifestFor0116()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
-        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
-            .WithOpenTelemetryMetrics();
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithOpenTelemetryMetrics(
+                    endpoint: "http://otel-collector:4317",
+                    exportInterval: TimeSpan.FromSeconds(30))
+                .WithImageTag("pg17-0.116.0"));
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => ManifestUtils.GetManifest(documentDB.Resource));
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
 
-        Assert.Contains("v0.116.0", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("SetupConfiguration.json", exception.Message, StringComparison.Ordinal);
+        // The published resource still names the official image; the compatibility override is
+        // carried entirely by manifest fields every publisher understands.
+        Assert.Equal(
+            "ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0",
+            resource!["image"]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+
+        var args = Assert.IsType<JsonArray>(resource["args"]);
+        Assert.Equal(3, args.Count);
+        Assert.Equal("-c", args[0]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShellArgumentZero, args[2]?.GetValue<string>());
+
+        var script = args[1]?.GetValue<string>();
+        Assert.NotNull(script);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", script!, StringComparison.Ordinal);
+        Assert.Contains($"exec {GatewayEntrypointScriptPath} \"$@\"", script!, StringComparison.Ordinal);
+
+        Assert.Equal("true", resource["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal("http://otel-collector:4317", resource["env"]?["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]?.GetValue<string>());
+        Assert.Equal("30000", resource["env"]?["OTEL_METRIC_EXPORT_INTERVAL"]?.GetValue<string>());
+        Assert.Null(resource["env"]?["OTEL_SERVICE_NAME"]);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsAllows0116PublishModeWhenDisabled()
+    public async Task WithOpenTelemetryMetricsPublishesAWrappedManifestWhenDisabled()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
-        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
-            .WithOpenTelemetryMetrics()
-            .WithOpenTelemetryMetrics(enabled: false);
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg17-0.116.0")
+                .WithOpenTelemetryMetrics()
+                .WithOpenTelemetryMetrics(enabled: false));
 
-        var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
 
-        Assert.Equal("false", manifest["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal("false", resource!["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
 
-        using var app = appBuilder.Build();
-        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
-        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
-        var configuration = Assert.Single(containerResource.Annotations.OfType<ContainerFileSystemCallbackAnnotation>());
-        var entries = await InvokeContainerFileCallbackAsync(configuration, containerResource, app.Services);
-
-        Assert.Empty(entries);
+        // Disabling has to survive a configuration file that enables metrics from JSON, so the
+        // wrapper is published for the disabled case too.
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+        var args = Assert.IsType<JsonArray>(resource["args"]);
+        Assert.Contains($"jq '{MetricsBlockFilter})'", args[1]!.GetValue<string>(), StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task WithOpenTelemetryMetricsRejects0116PublishModeWhenFinalCallEnablesMetrics()
+    public async Task WithOpenTelemetryMetricsPublishesAWrappedManifestForTheDefaultImage()
     {
-        var appBuilder = DistributedApplication.CreateBuilder();
-        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
-            .WithImageTag("pg17-0.116.0")
-            .WithOpenTelemetryMetrics(enabled: false)
-            .WithOpenTelemetryMetrics();
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB").WithOpenTelemetryMetrics());
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => ManifestUtils.GetManifest(documentDB.Resource));
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
 
-        Assert.Contains("v0.116.0", exception.Message, StringComparison.Ordinal);
+        Assert.Equal("true", resource!["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+        Assert.Equal(3, Assert.IsType<JsonArray>(resource["args"]).Count);
     }
 
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAnUnwrappedManifestForCustomImages()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage("contoso/documentdb-local", "pg17-0.116.0")
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Null(resource!["entrypoint"]);
+        Assert.Null(resource["args"]);
+    }
+
+    /// <summary>
+    /// The real publishing pipeline is where the distinction is decided for <c>azd</c>: the
+    /// manifest carries a <c>build</c> instruction rather than an <c>image</c>, and no wrapper.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAnUnwrappedManifestForDockerfileBuilds()
+    {
+        var contextPath = CreateOfficialLookingDockerfileContext();
+
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag(InterlockedTag)
+                .WithDockerfile(contextPath)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Null(resource!["image"]);
+        Assert.NotNull(resource["build"]);
+        Assert.Null(resource["entrypoint"]);
+        Assert.Null(resource["args"]);
+        Assert.Equal("true", resource["env"]?["OTEL_METRICS_ENABLED"]?.GetValue<string>());
+    }
+
+    /// <summary>
+    /// Through the real publishing pipeline: the rearranged spelling publishes the same image
+    /// reference as the default one, and carries the wrapper with it.
+    /// </summary>
+    [Fact]
+    public async Task WithOpenTelemetryMetricsPublishesAWrappedManifestForAQualifiedOfficialImage()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage(QualifiedOfficialImage, InterlockedTag)
+                .WithImageRegistry(null!)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Equal($"{QualifiedOfficialImage}:{InterlockedTag}", resource!["image"]?.GetValue<string>());
+        Assert.Equal(GatewayConfigurationShell, resource["entrypoint"]?.GetValue<string>());
+        Assert.Equal(3, resource["args"]?.AsArray().Count);
+    }
+
+    /// <summary>
+    /// Through the real publishing pipeline, for a reference whose prefix carries a namespace:
+    /// the manifest ships the reference the caller composed, unwrapped, because that repository is
+    /// not one this package publishes.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local", "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local", "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    public async Task WithOpenTelemetryMetricsPublishesAnUnwrappedManifestForAnExtraPathSegment(
+        string? registry,
+        string image,
+        string expected)
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImage(image, InterlockedTag)
+                .WithImageRegistry(registry!)
+                .WithOpenTelemetryMetrics());
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+
+        Assert.Equal($"{expected}:{InterlockedTag}", resource!["image"]?.GetValue<string>());
+        Assert.Null(resource["entrypoint"]);
+        Assert.Null(resource["args"]);
+    }
+
+    [Fact]
+    public async Task WithOpenTelemetryMetricsFailsPublishForADigestPinnedOfficialImage()
+    {
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ManifestUtils.PublishManifestAsync(appBuilder =>
+                appBuilder.AddDocumentDB("DocumentDB")
+                    .WithImageTag("pg17-0.114.0")
+                    .WithImageSHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                    .WithOpenTelemetryMetrics()));
+
+        Assert.Contains("digest", exception.Message, StringComparison.Ordinal);
+    }
 
     [Fact]
     public async Task WithOwnerAddsEnvironmentVariable()
@@ -1215,6 +8625,7 @@ public class AddDocumentDBTests
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
             .WithLogLevel(DocumentDBLogLevel.Debug)
+            .WithEnvironment("INIT_DATA", "true")
             .WithInitData(initDataPath)
             .WithTlsCertificate(certPath, keyPath)
             .WithTelemetry(enabled: false)
@@ -1225,7 +8636,9 @@ public class AddDocumentDBTests
 
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
+        Assert.Equal("debug", manifest["env"]?["DOCUMENTDB_LOG_LEVEL"]?.GetValue<string>());
         Assert.Equal("debug", manifest["env"]?["LOG_LEVEL"]?.GetValue<string>());
+        Assert.Equal("false", manifest["env"]?["INIT_DATA"]?.GetValue<string>());
         Assert.Equal("/init_doc_db.d", manifest["env"]?["INIT_DATA_PATH"]?.GetValue<string>());
         Assert.Equal("true", manifest["env"]?["SKIP_INIT_DATA"]?.GetValue<string>());
         Assert.Equal(expectedCertTarget, manifest["env"]?["CERT_PATH"]?.GetValue<string>());
@@ -1608,18 +9021,34 @@ public class AddDocumentDBTests
     }
 
     [Fact]
-    public async Task WithPostgresEndpointGuardDoesNotFireDuringManifestGeneration()
+    public async Task WithPostgresEndpointFloorRejectsSerializingAPreV0_112_0Image()
     {
-        // Manifest generation goes through Aspire's publish pipeline, which does NOT
-        // publish BeforeResourceStartedEvent (no container is started). The guard must
-        // not interfere with `azd publish` / `--publisher manifest` flows, even when
-        // pinning a pre-v0.112 tag.
+        // The floor is a property of the image, not of the mode the app host is running in: a
+        // manifest that names an image whose entrypoint cannot accept the credentials the same
+        // manifest publishes describes a deployment that cannot authenticate. Serialization is
+        // the publish counterpart of the run checkpoint, so it refuses with the same guidance.
         var appBuilder = DistributedApplication.CreateBuilder();
         var documentDB = appBuilder.AddDocumentDB("DocumentDB")
             .WithImageTag("pg17-0.111.0")
             .WithPostgresEndpoint();
 
-        // Generating the manifest must not throw.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ManifestUtils.GetManifest(documentDB.Resource));
+
+        Assert.Contains("pg17-0.111.0", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresEndpoint() requires DocumentDB", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ManifestGenerationIsUnaffectedForAnImageThatSatisfiesTheFloor()
+    {
+        // The counterpart of the test above: publishing a resource whose image is legal is
+        // untouched by the checkpoint, bindings and all.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.112.0")
+            .WithPostgresEndpoint();
+
         var manifest = await ManifestUtils.GetManifest(documentDB.Resource);
 
         Assert.NotNull(manifest);
@@ -1765,6 +9194,671 @@ public class AddDocumentDBTests
         Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
     }
 
+    [Fact]
+    public async Task WithPostgresEndpointGuardSkippedForDockerfileBuilds()
+    {
+        // The floor is a property of the published release. The tag on a Dockerfile build names
+        // the build's starting point at best, so it is exempt on the same terms as a custom image
+        // — with a warning that says the enforcement was skipped, not a hard failure keyed on a
+        // tag that is not what runs.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.110.0")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        // Must NOT throw, even though the annotated tag is < v0.112.0.
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("Dockerfile", warnings[0].Message, StringComparison.Ordinal);
+        Assert.Contains("NOT enforced", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardStillEnforcedWhenOnlyTheBaseImageIsOverridden()
+    {
+        // WithDockerfileBaseImage() selects base images for a *generated* Dockerfile. There is no
+        // build here to generate one, so it changes nothing about the image this resource pulls
+        // and must not be mistaken for a caller-owned build.
+        var appBuilder = DistributedApplication.CreateBuilder();
+
+#pragma warning disable ASPIREDOCKERFILEBUILDER001
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg17-0.110.0")
+            .WithDockerfileBaseImage($"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{InterlockedTag}")
+            .WithPostgresEndpoint();
+#pragma warning restore ASPIREDOCKERFILEBUILDER001
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true));
+
+        Assert.Contains("requires DocumentDB", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorIsNotEnforcedOnDockerfileBuilds()
+    {
+        // pg18-0.113.0 does not exist upstream, but a Dockerfile build never asks the registry
+        // for it: the failure this floor converts into an actionable message cannot happen, so
+        // the guard has nothing to say and — like the custom-image path — says it silently.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag("pg18-0.113.0")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext());
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+
+        // Control: the same tag without the build is still a hard failure.
+        var controlBuilder = DistributedApplication.CreateBuilder();
+        controlBuilder.AddDocumentDB("DocumentDB").WithImageTag("pg18-0.113.0");
+
+        using var controlApp = controlBuilder.Build();
+        var controlResource = Assert.Single(controlApp.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(controlApp, controlResource, useEmptyServices: true));
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardEnforcedForAQualifiedOfficialImage()
+    {
+        // The floor is a property of the published release, and this is the published release —
+        // written with the registry inside the image annotation.
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, "pg17-0.110.0")
+            .WithImageRegistry(null!)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true));
+
+        Assert.Contains("requires DocumentDB", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WithPostgresEndpointGuardSkippedForAnExtraPathSegment()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage("evil/documentdb/documentdb-local", "pg17-0.110.0")
+            .WithImageRegistry(null!)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("custom image", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorIsEnforcedForAQualifiedOfficialImage()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, "pg18-0.113.0")
+            .WithImageRegistry(null!);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true));
+
+        Assert.Contains("only publishes pg18 images", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A Dockerfile build is decided before the reference is read, so no spelling of the image
+    /// annotation brings the version-dependent behaviour back.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildStaysCustomEvenWithAQualifiedOfficialImage()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(QualifiedOfficialImage, "pg17-0.110.0")
+            .WithImageRegistry(null!)
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("Dockerfile", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData(null, "contoso.azurecr.io/mirrors/documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    [InlineData(null, "harbor.corp.local/library/documentdb/documentdb-local")]
+    [InlineData("harbor.corp.local/library", "documentdb/documentdb-local")]
+    public async Task WithPostgresEndpointGuardSkippedForAnExtraPathSegmentInEitherField(
+        string? registry,
+        string image)
+    {
+        // The version behind a repository this package does not publish is unknown, so the floor
+        // is not enforced against the tag -- in either spelling of the same reference.
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, "pg17-0.110.0")
+            .WithImageRegistry(registry!)
+            .WithPostgresEndpoint();
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("custom image", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, "ghcr.io/evil/documentdb/documentdb-local")]
+    [InlineData("ghcr.io/evil", "documentdb/documentdb-local")]
+    [InlineData("contoso.azurecr.io/mirrors", "documentdb/documentdb-local")]
+    public async Task PgVariantFloorIsNotEnforcedForAnExtraPathSegment(string? registry, string image)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithImage(image, "pg18-0.113.0")
+            .WithImageRegistry(registry!);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Theory]
+    [MemberData(nameof(DigestBehindACuratedTag))]
+    public async Task WithPostgresEndpointGuardSkippedForADigestBehindACuratedTag(
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+        SetImageAnnotation(documentDB, image, tag, sha256);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        var warnings = sink.LogEntries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+        Assert.Contains("digest", warnings[0].Message, StringComparison.Ordinal);
+        Assert.Contains(OlderReleaseDigest, warnings[0].Message, StringComparison.Ordinal);
+        Assert.Contains("NOT enforced", warnings[0].Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The tag is not trusted in the other direction either: one that reads below the floor is
+    /// not grounds for failing a resource whose digest may name a release above it.
+    /// </summary>
+    [Fact]
+    public async Task WithPostgresEndpointGuardDoesNotFailOnATagSupersededByADigest()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:pg17-0.110.0",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.Contains("digest", Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning)).Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PgVariantFloorIsNotEnforcedForADigestBehindACuratedTag()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:pg18-0.113.0",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.DoesNotContain(sink.LogEntries, e => e.Level == LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A Dockerfile build is decided before the reference is read at all, so a digest behind a
+    /// curated tag changes nothing about it.
+    /// </summary>
+    [Fact]
+    public async Task ADockerfileBuildWithADigestBehindACuratedTagStaysABuild()
+    {
+        var sink = new CapturingLoggerSink();
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.Services.AddSingleton<ILoggerProvider>(new CapturingLoggerProvider(sink));
+
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithDockerfile(CreateOfficialLookingDockerfileContext())
+            .WithPostgresEndpoint();
+        SetImageAnnotation(
+            documentDB,
+            $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}",
+            tag: null,
+            sha256: OlderReleaseDigest);
+
+        using var app = appBuilder.Build();
+        var resource = Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+        await PublishBeforeResourceStartedAsync(app, resource, useEmptyServices: true);
+
+        Assert.Contains("Dockerfile", Assert.Single(sink.LogEntries.Where(e => e.Level == LogLevel.Warning)).Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // The final effective image
+    //
+    // Both floors above are reported by ordinary BeforeResourceStartedEvent
+    // subscribers, and a subscriber registered after AddDocumentDB runs after
+    // them. Nothing publishes another event between that point and the
+    // container's creation - the arguments are gathered next, which seals the
+    // already-changed image as the initial state and so detects nothing - and
+    // a publish raises no per-resource event at all. So the floors are applied
+    // again from the package's single uncached authority, alongside the
+    // storage and telemetry checks it already carries.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ALateSubscriberDowngradingAWithPostgresEndpointResourceFailsTheRunCheckpoint()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag("pg17-0.111.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+
+        // The event cleared the default image before the change, and gathering the command line
+        // afterwards seals the changed one - so nothing so far has anything to compare against.
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("pg17-0.111.0", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresEndpoint() requires DocumentDB", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateSubscriberSelectingAnUnpublishedPg18ImageFailsTheRunCheckpoint()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithPostgresVersion(DocumentDBPostgresVersion.Pg18);
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag("pg18-0.113.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(resource));
+
+        Assert.Contains("pg18-0.113.0", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("upstream only publishes pg18 images from DocumentDB v0.114.0", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateSubscriberSwitchingToACompatibleImageIsAccepted()
+    {
+        // Changing the image late is legitimate. Only an image that cannot work is refused, and
+        // the change is sealed before anything reads it, so the staleness rule has nothing to say
+        // about it either.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag("pg17-0.114.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Theory]
+    [InlineData("nightly")]
+    [InlineData("pg18-0.113.0-rc.1")]
+    public async Task ALateSubscriberSwitchingToAnUnrecognisedTagIsNotJudgedByTheRunCheckpoint(string tag)
+    {
+        // The checkpoint applies the same policy as the event, so the documented carve-outs
+        // survive it: a tag outside the curated grammar carries no version to judge.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImageTag(tag);
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task ALateSubscriberSwitchingToACustomImageIsNotJudgedByTheRunCheckpoint()
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithImage("forks/my-build", "pg18-0.110.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task ALateSubscriberPinningADigestBehindACuratedTagIsNotJudgedByTheRunCheckpoint()
+    {
+        // The runtime resolves the digest and ignores the tag, so a tag reading below the floor
+        // is not grounds for failing a resource whose digest may name a release above it.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            SetImageAnnotation(
+                documentDB,
+                $"{DocumentDBContainerImageTags.Image}:pg17-0.111.0@sha256:{OlderReleaseDigest}",
+                tag: null,
+                sha256: null);
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task ALateSubscriberSwitchingToADockerfileBuildIsNotJudgedByTheRunCheckpoint()
+    {
+        // A resource built from the caller's own Dockerfile runs the build output, whatever the
+        // annotation reads, so no published release is named and no floor applies.
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+        var context = CreateOfficialLookingDockerfileContext();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, (_, _) =>
+        {
+            documentDB.WithDockerfile(context).WithImageTag("pg17-0.111.0");
+            return Task.CompletedTask;
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+        await RaiseResourceStartPhasesAsync(app);
+
+        var resource = SingleServerResource(app);
+        Assert.Empty(await BuildContainerArgsAsync(resource));
+        Assert.Empty(await RunContainerRuntimeArgsAsync(resource));
+    }
+
+    [Fact]
+    public async Task ALateBeforePublishSubscriberDowngradingAWithPostgresEndpointResourceFailsPublication()
+    {
+        // A subscriber registered after AddDocumentDB gets the last BeforePublishEvent, which is
+        // after every retake and every check this package can arrange at an event. It gathers the
+        // resource's configuration first, so the change lands behind a frozen command line - which
+        // is what leaves serialization as the only remaining authority.
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.WithImageTag("pg17-0.111.0");
+            });
+        });
+
+        Assert.Contains("pg17-0.111.0", log, StringComparison.Ordinal);
+        Assert.Contains("WithPostgresEndpoint() requires DocumentDB", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateBeforePublishSubscriberSelectingAnUnpublishedPg18ImageFailsPublication()
+    {
+        var log = await ManifestUtils.PublishManifestExpectingFailureAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+                .WithPostgresVersion(DocumentDBPostgresVersion.Pg18);
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>(async (_, token) =>
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+                documentDB.WithImageTag("pg18-0.113.0");
+            });
+        });
+
+        Assert.Contains("pg18-0.113.0", log, StringComparison.Ordinal);
+        Assert.Contains("upstream only publishes pg18 images from DocumentDB v0.114.0", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ALateBeforePublishSubscriberSwitchingToACompatibleImagePublishesIt()
+    {
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+        {
+            var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithPostgresEndpoint();
+
+            appBuilder.Eventing.Subscribe<Publishing.BeforePublishEvent>((_, _) =>
+            {
+                documentDB.WithImageTag("pg17-0.114.0");
+                return Task.CompletedTask;
+            });
+        });
+
+        var resource = manifest["resources"]?["DocumentDB"];
+        Assert.NotNull(resource);
+        Assert.Equal(
+            $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-0.114.0",
+            resource!["image"]?.GetValue<string>());
+        Assert.NotNull(resource["bindings"]?["postgres"]);
+    }
+
+    [Fact]
+    public async Task ExcludeFromManifestStillOmitsTheResourceAndIsNotJudged()
+    {
+        // ExcludeFromManifest() is the deliberate boundary: a resource that emits nothing has no
+        // published image to judge, so the checkpoint takes itself out rather than failing it.
+        var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
+            appBuilder.AddDocumentDB("DocumentDB")
+                .WithImageTag("pg18-0.113.0")
+                .ExcludeFromManifest());
+
+        Assert.Null(manifest["resources"]?["DocumentDB"]);
+    }
+
+    /// <summary>
+    /// Storage, telemetry and the image floors are three different rules, and all three are the
+    /// verdict of the same callback at the same moment. Nothing was added beside the authority
+    /// this package already owns.
+    /// </summary>
+    [Fact]
+    public async Task OneUncachedCheckpointEnforcesStorageTelemetryAndTheImageFloors()
+    {
+        Assert.Contains(
+            "was changed after its data directory ('/data') had already been checked",
+            (await FailAtTheRunCheckpointAsync(
+                documentDB => documentDB.Resource.Annotations.Add(
+                    new ContainerMountAnnotation("late-data", "/data", ContainerMountType.Volume, isReadOnly: true)),
+                gatherFirst: true)).Message,
+            StringComparison.Ordinal);
+
+        Assert.Contains(
+            "has a later command-line callback registered",
+            (await FailAtTheRunCheckpointAsync(
+                documentDB => documentDB.WithArgs(context => context.Args.Insert(0, "--help")),
+                gatherFirst: false)).Message,
+            StringComparison.Ordinal);
+
+        Assert.Contains(
+            "WithPostgresEndpoint() requires DocumentDB",
+            (await FailAtTheRunCheckpointAsync(
+                _ => { },
+                gatherFirst: false,
+                imageTag: "pg17-0.111.0")).Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Builds a telemetry-enabled resource with a PostgreSQL endpoint, lets the last
+    /// <see cref="BeforeResourceStartedEvent"/> subscriber change it, and returns whatever the
+    /// container-runtime-arguments checkpoint refused it with.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="imageTag"/> is chosen while the model is being built, which is before the
+    /// run seals the image. A floor is therefore judged on the image the orchestrator was really
+    /// given rather than on one substituted after the seal, which is refused as a change instead.
+    /// </remarks>
+    private static async Task<InvalidOperationException> FailAtTheRunCheckpointAsync(
+        Action<IResourceBuilder<DocumentDBServerResource>> mutate,
+        bool gatherFirst,
+        string imageTag = InterlockedTag)
+    {
+        var appBuilder = CreateLifecycleTestBuilder();
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB")
+            .WithImageTag(imageTag)
+            .WithPostgresEndpoint()
+            .WithOpenTelemetryMetrics();
+
+        appBuilder.Eventing.Subscribe<BeforeResourceStartedEvent>(documentDB.Resource, async (_, token) =>
+        {
+            if (gatherFirst)
+            {
+                await GatherPublishConfigurationAsync(documentDB.Resource, token);
+            }
+
+            mutate(documentDB);
+        });
+
+        using var app = await BuildAndRaiseBeforeStartAsync(appBuilder);
+
+        try
+        {
+            await RaiseResourceStartPhasesAsync(app);
+        }
+        catch (InvalidOperationException)
+        {
+            // A rule that also reports itself at the resource-start event reports itself again at
+            // the uncached checkpoint below, which is the one this asserts on.
+        }
+
+        return await Assert.ThrowsAsync<InvalidOperationException>(
+            () => RunContainerRuntimeArgsAsync(SingleServerResource(app)));
+    }
+
     private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, IResource resource, bool useEmptyServices = false)
     {
         var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
@@ -1776,6 +9870,22 @@ public class AddDocumentDBTests
         var services = useEmptyServices
             ? new ServiceCollection().AddSingleton(app.Services.GetRequiredService<ILoggerFactory>()).BuildServiceProvider()
             : app.Services;
+        var evt = new BeforeResourceStartedEvent(resource, services);
+        return eventing.PublishAsync(evt, EventDispatchBehavior.BlockingSequential, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Publishes <see cref="BeforeResourceStartedEvent"/> with services that expose both the
+    /// capturable <see cref="ILoggerFactory"/> fallback and the application model, which the
+    /// storage guard needs to see sibling resources.
+    /// </summary>
+    private static Task PublishBeforeResourceStartedWithModelAsync(DistributedApplication app, IResource resource)
+    {
+        var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
+        var services = new ServiceCollection()
+            .AddSingleton(app.Services.GetRequiredService<ILoggerFactory>())
+            .AddSingleton(app.Services.GetRequiredService<DistributedApplicationModel>())
+            .BuildServiceProvider();
         var evt = new BeforeResourceStartedEvent(resource, services);
         return eventing.PublishAsync(evt, EventDispatchBehavior.BlockingSequential, CancellationToken.None);
     }
@@ -1976,32 +10086,387 @@ public class AddDocumentDBTests
         return parameters;
     }
 
-    private static async Task<Dictionary<string, object>> BuildEnvironmentVariablesAsync(DocumentDBServerResource resource)
+    /// <summary>
+    /// Runs the resource's real environment pipeline — the same
+    /// <see cref="ExecutionConfigurationBuilder"/> the container creator uses — and returns the
+    /// unprocessed values the callbacks produced.
+    /// </summary>
+    /// <remarks>
+    /// Nothing here invokes a callback directly. Aspire evaluates each callback once per run and
+    /// caches the result, so a test that drives this helper sees exactly what a container would,
+    /// and a guard that participates in the pipeline cannot be tested against a value the
+    /// container never receives.
+    /// </remarks>
+    private static async Task<Dictionary<string, object>> BuildEnvironmentVariablesAsync(
+        DocumentDBServerResource resource,
+        ILogger? logger = null,
+        DistributedApplicationOperation operation = DistributedApplicationOperation.Run)
     {
-        var environmentVariables = new Dictionary<string, object>(StringComparer.Ordinal);
-        var executionContext = new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run);
+        // Resolution failures are not this helper's business: it reports what the callbacks
+        // produced, and a value that could not be resolved (a parameter with no value in a unit
+        // test, say) is still a value they produced.
+        var result = await BuildExecutionConfigurationAsync(resource, logger, operation, includeArguments: false, throwOnResolutionFailure: false);
 
-        foreach (var annotation in resource.Annotations.OfType<EnvironmentCallbackAnnotation>())
-        {
-            await annotation.Callback(new EnvironmentCallbackContext(executionContext, resource, environmentVariables, CancellationToken.None));
-        }
-
-        return environmentVariables;
+        return result.EnvironmentVariablesWithUnprocessed.ToDictionary(
+            entry => entry.Key,
+            entry => entry.Value.Unprocessed,
+            StringComparer.Ordinal);
     }
 
-    private static async Task<IReadOnlyList<ContainerFileSystemItem>> InvokeContainerFileCallbackAsync(
-        ContainerFileSystemCallbackAnnotation annotation,
-        DocumentDBServerResource resource,
-        IServiceProvider services)
+    /// <summary>
+    /// Publishes <see cref="BeforeStartEvent"/> (which is what installs the storage guard's
+    /// callbacks, exactly as a real start does) and then builds the named resource's environment
+    /// and arguments through the real pipeline, returning the environment the container would be
+    /// given.
+    /// </summary>
+    private static async Task<Dictionary<string, string>> ConfigureResourceAsync(
+        DistributedApplication app,
+        string resourceName,
+        CapturingLoggerSink? sink = null,
+        DistributedApplicationOperation operation = DistributedApplicationOperation.Run)
     {
-        var entries = await annotation.Callback(
-            new ContainerFileSystemCallbackContext
-            {
-                Model = resource,
-                Services = services,
-            },
+        var result = await ConfigureResourceCoreAsync(app, resourceName, sink, operation);
+
+        return result.EnvironmentVariables.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The argument-pipeline counterpart of <see cref="ConfigureResourceAsync"/>.
+    /// </summary>
+    private static async Task<string[]> ConfigureArgumentsAsync(
+        DistributedApplication app,
+        string resourceName,
+        CapturingLoggerSink? sink = null,
+        DistributedApplicationOperation operation = DistributedApplicationOperation.Run)
+    {
+        var result = await ConfigureResourceCoreAsync(app, resourceName, sink, operation);
+
+        return result.Arguments.Select(argument => argument.Value).ToArray();
+    }
+
+    private static async Task<IExecutionConfigurationResult> ConfigureResourceCoreAsync(
+        DistributedApplication app,
+        string resourceName,
+        CapturingLoggerSink? sink,
+        DistributedApplicationOperation operation)
+    {
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        await PublishBeforeStartAsync(app);
+
+        if (operation == DistributedApplicationOperation.Run)
+        {
+            // Run mode publishes this per resource just before the orchestrator builds the
+            // container's environment and arguments; the guard uses it to take the last position
+            // in both pipelines again.
+            await PublishBeforeResourceStartedAsync(app, resourceName);
+        }
+
+        var resource = model.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
+        var logger = sink is null ? null : new CapturingLoggerProvider(sink).CreateLogger(resourceName);
+
+        return await BuildExecutionConfigurationAsync(resource, logger, operation, includeArguments: true, throwOnResolutionFailure: true);
+    }
+
+    /// <summary>Publishes the event that installs the storage guard's callbacks.</summary>
+    private static Task PublishBeforeStartAsync(DistributedApplication app)
+    {
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+
+        return app.Services.GetRequiredService<IDistributedApplicationEventing>().PublishAsync(
+            new BeforeStartEvent(app.Services, model),
+            EventDispatchBehavior.BlockingSequential,
+            CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Publishes the per-resource event the orchestrator publishes immediately before it builds a
+    /// container's configuration, which is where the guard re-takes the last position.
+    /// </summary>
+    private static Task PublishBeforeResourceStartedAsync(DistributedApplication app, string resourceName)
+    {
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var resource = model.Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
+
+        return app.Services.GetRequiredService<IDistributedApplicationEventing>().PublishAsync(
+            new BeforeResourceStartedEvent(resource, app.Services),
+            EventDispatchBehavior.BlockingSequential,
+            CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Writes the resource's manifest entry through Aspire's real manifest writer, after the event
+    /// that installs the guard — so the guard participates exactly as it does in <c>aspire
+    /// publish</c>.
+    /// </summary>
+    private static async Task<JsonNode> PublishManifestAsync(DistributedApplication app, string resourceName)
+    {
+        await PublishBeforeStartAsync(app);
+
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
+
+        return await ManifestUtils.GetManifest(resource);
+    }
+
+    /// <summary>
+    /// Writes the resource's manifest entry through Aspire's real writer expecting the checkpoint
+    /// to refuse it, and returns the refusal together with the entry text the writer had already
+    /// produced.
+    /// </summary>
+    private static async Task<(InvalidOperationException Failure, string Entry)> WriteManifestExpectingFailureAsync(
+        DistributedApplication app,
+        string resourceName)
+    {
+        await PublishBeforeStartAsync(app);
+
+        var resource = app.Services.GetRequiredService<DistributedApplicationModel>()
+            .Resources.OfType<DocumentDBServerResource>().Single(r => r.Name == resourceName);
+
+        return await ManifestUtils.WriteResourceExpectingFailureAsync(resource);
+    }
+
+    private static async Task<IExecutionConfigurationResult> BuildExecutionConfigurationAsync(
+        DocumentDBServerResource resource,
+        ILogger? logger,
+        DistributedApplicationOperation operation,
+        bool includeArguments,
+        bool throwOnResolutionFailure)
+    {
+        var executionContext = new DistributedApplicationExecutionContext(operation);
+
+        // Aspire discovers a container's dependencies before it builds its configuration, and that
+        // pass runs the same callbacks through the same one-shot cache with no logger attached. The
+        // harness reproduces it, so a guard that wrote its warnings to the callback context's
+        // logger would be seen to lose them here exactly as it does in a real run. It covers the
+        // same pipelines the caller asked for, so an environment-only assertion is not made to
+        // depend on the argument pipeline as well.
+        var discovery = ExecutionConfigurationBuilder.Create(resource);
+        if (includeArguments)
+        {
+            discovery = discovery.WithArgumentsConfig();
+        }
+
+        await discovery
+            .WithEnvironmentVariablesConfig()
+            .BuildAsync(executionContext, NullLogger.Instance, CancellationToken.None);
+
+        var builder = ExecutionConfigurationBuilder.Create(resource);
+        if (includeArguments)
+        {
+            builder = builder.WithArgumentsConfig();
+        }
+
+        var result = await builder
+            .WithEnvironmentVariablesConfig()
+            .BuildAsync(
+                executionContext,
+                logger ?? NullLogger.Instance,
+                CancellationToken.None);
+
+        // The container creator refuses to start a resource whose configuration failed to resolve;
+        // surfacing the cause keeps a test from asserting against a half-built environment.
+        if (throwOnResolutionFailure && result.Exception is not null)
+        {
+            throw result.Exception is AggregateException { InnerExceptions.Count: 1 } aggregate
+                ? aggregate.InnerException!
+                : result.Exception;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Creates a publish-mode builder for tests that raise <see cref="BeforeStartEvent"/>.
+    /// </summary>
+    /// <remarks>
+    /// Raising that event on a run-mode builder also runs Aspire's built-in DCP subscriber, which
+    /// requires a DCP installation these model-level tests deliberately do not have. The gateway
+    /// compatibility wrapper resolves identically in both modes, and the Docker suite covers what
+    /// run mode actually launches.
+    /// </remarks>
+    private static IDistributedApplicationBuilder CreateLifecycleTestBuilder() =>
+        DistributedApplication.CreateBuilder(["Publishing:Publisher=manifest", "Publishing:OutputPath=./"]);
+
+    /// <summary>
+    /// Builds the application and raises <see cref="BeforeStartEvent"/>, which is the point at
+    /// which the OpenTelemetry gateway compatibility wrapper resolves the resource's final image.
+    /// Both the orchestrator and the manifest publisher raise it before they read the resource.
+    /// </summary>
+    private static async Task<DistributedApplication> BuildAndRaiseBeforeStartAsync(
+        IDistributedApplicationBuilder appBuilder)
+    {
+        var app = appBuilder.Build();
+
+        try
+        {
+            await RaiseBeforeStartAsync(app);
+        }
+        catch
+        {
+            app.Dispose();
+            throw;
+        }
+
+        return app;
+    }
+
+    private static async Task RaiseBeforeStartAsync(DistributedApplication app)
+    {
+        var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        await eventing.PublishAsync(new BeforeStartEvent(app.Services, model), CancellationToken.None);
+    }
+
+    private static DocumentDBServerResource SingleServerResource(DistributedApplication app) =>
+        Assert.Single(app.Services.GetRequiredService<DistributedApplicationModel>().Resources.OfType<DocumentDBServerResource>());
+
+    /// <summary>
+    /// Builds the resource's container arguments through Aspire's own argument gatherer, and
+    /// returns the values the callbacks produced before resolution.
+    /// </summary>
+    /// <remarks>
+    /// Aspire evaluates every command-line callback in annotation order over one shared list and
+    /// caches each callback's result. Invoking the callbacks by hand instead would lose both the
+    /// order the container is really configured in and the single evaluation the wrapper depends
+    /// on, and a wrapper that has to be the last word cannot be tested against a command line the
+    /// container never receives.
+    /// </remarks>
+    private static async Task<IReadOnlyList<object>> BuildContainerArgsAsync(
+        DocumentDBServerResource resource,
+        DistributedApplicationOperation operation = DistributedApplicationOperation.Run)
+    {
+        var result = await ExecutionConfigurationBuilder.Create(resource)
+            .WithArgumentsConfig()
+            .BuildAsync(
+                new DistributedApplicationExecutionContext(operation),
+                NullLogger.Instance,
+                CancellationToken.None);
+
+        if (result.Exception is not null)
+        {
+            throw result.Exception is AggregateException { InnerExceptions.Count: 1 } aggregate
+                ? aggregate.InnerException!
+                : result.Exception;
+        }
+
+        return [.. result.ArgumentsWithUnprocessed.Select(argument => argument.Unprocessed)];
+    }
+
+    /// <summary>
+    /// Publishes the per-resource events a run publishes between <see cref="BeforeStartEvent"/>
+    /// and the point at which a container's arguments are gathered, in that order.
+    /// </summary>
+    private static async Task RaiseResourceStartPhasesAsync(DistributedApplication app)
+    {
+        var eventing = app.Services.GetRequiredService<IDistributedApplicationEventing>();
+        var resource = SingleServerResource(app);
+
+        await eventing.PublishAsync(
+            new ResourceEndpointsAllocatedEvent(resource, app.Services),
+            EventDispatchBehavior.BlockingSequential,
             CancellationToken.None);
 
-        return entries.ToList();
+        await eventing.PublishAsync(
+            new BeforeResourceStartedEvent(resource, app.Services),
+            EventDispatchBehavior.BlockingSequential,
+            CancellationToken.None);
+    }
+
+    private static async Task<string> GetWrapperScriptAsync(DocumentDBServerResource resource)
+    {
+        var args = await BuildContainerArgsAsync(resource);
+        Assert.Equal(3, args.Count);
+        return Assert.IsType<string>(args[1]);
+    }
+
+    // A real digest of the published pg17-0.114.0 image, embedded as a literal so nothing here
+    // depends on the registry or on a tag upstream can move. That release predates the /data
+    // VOLUME declaration and the data-directory flock, which is what makes it the right thing to
+    // find behind a "pg17-0.116.0" tag.
+    private const string OlderReleaseDigest =
+        "8c8a716e27f398b03c397424c4ddd901bddbc22b9f910b17096b0b246c7c9011";
+
+    /// <summary>
+    /// The three shapes in which one reference carries both a parseable curated tag and a digest,
+    /// written as the (image, tag, sha256) they land on the annotation as.
+    /// </summary>
+    /// <remarks>
+    /// All three publish a reference the runtime resolves by digest, so none of them runs the
+    /// release the tag names.
+    /// </remarks>
+    public static TheoryData<string, string?, string?> DigestBehindACuratedTag => new()
+    {
+        { $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}@sha256:{OlderReleaseDigest}", null, null },
+        { $"{DocumentDBContainerImageTags.Image}:{InterlockedTag}", null, OlderReleaseDigest },
+        { $"{DocumentDBContainerImageTags.Image}@sha256:{OlderReleaseDigest}", InterlockedTag, null },
+    };
+
+    /// <summary>
+    /// Writes an image annotation spelled exactly as given, replacing the one AddDocumentDB
+    /// installed.
+    /// </summary>
+    /// <remarks>
+    /// Aspire's <c>WithImage</c> / <c>WithImageTag</c> / <c>WithImageSHA256</c> keep the
+    /// annotation's tag and digest mutually exclusive and drop an inline tag when the same string
+    /// also carries a digest, so a reference holding both is written on directly. It is still
+    /// exactly what the manifest emits.
+    /// </remarks>
+    private static void SetImageAnnotation(
+        IResourceBuilder<DocumentDBServerResource> builder,
+        string image,
+        string? tag,
+        string? sha256)
+    {
+        foreach (var existing in builder.Resource.Annotations.OfType<ContainerImageAnnotation>().ToList())
+        {
+            builder.Resource.Annotations.Remove(existing);
+        }
+
+        var annotation = new ContainerImageAnnotation
+        {
+            Registry = DocumentDBContainerImageTags.Registry,
+            Image = image,
+        };
+
+        if (tag is not null)
+        {
+            annotation.Tag = tag;
+        }
+
+        if (sha256 is not null)
+        {
+            annotation.SHA256 = sha256;
+        }
+
+        builder.Resource.Annotations.Add(annotation);
+    }
+
+    /// <summary>
+    /// Creates a real Dockerfile build context: <c>WithDockerfile(...)</c> resolves and validates
+    /// both paths eagerly.
+    /// </summary>
+    /// <remarks>
+    /// The Dockerfile starts <c>FROM</c> the official image on purpose. Together with the image
+    /// annotation <c>AddDocumentDB</c> installs — which Aspire keeps, and which a caller can
+    /// re-point at the official repository and tag afterwards — it makes the resource look
+    /// official from every angle the package can inspect, which is exactly the case these tests
+    /// exist for.
+    /// </remarks>
+    private static string CreateOfficialLookingDockerfileContext(
+        [CallerMemberName] string? testName = null)
+    {
+        var contextPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "dockerfile-contexts",
+            $"{testName ?? "context"}-{Guid.NewGuid():N}");
+
+        Directory.CreateDirectory(contextPath);
+        File.WriteAllText(
+            Path.Combine(contextPath, "Dockerfile"),
+            $"FROM {DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{InterlockedTag}\n" +
+            "RUN echo caller-owned-layer\n");
+
+        return contextPath;
     }
 }

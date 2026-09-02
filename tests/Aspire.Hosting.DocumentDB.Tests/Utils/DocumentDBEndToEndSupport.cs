@@ -2,7 +2,9 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.TestUtilities;
 using Microsoft.Extensions.DependencyInjection;
@@ -24,6 +26,10 @@ internal static class DocumentDBEndToEndSupport
 {
     private const string EndToEndTimeoutEnvironmentVariable = "DOCUMENTDB_E2E_TIMEOUT_SECONDS";
     private static readonly TimeSpan DefaultEndToEndTimeout = TimeSpan.FromMinutes(5);
+    private static readonly Regex AnsiEscapeSequenceRegex = new(
+        "\u001B\\[[0-?]*[ -/]*[@-~]",
+        RegexOptions.CultureInvariant);
+    private static readonly TimeSpan DefaultDockerTimeout = TimeSpan.FromSeconds(30);
 
     public static void RequireDocker()
     {
@@ -270,11 +276,28 @@ internal static class DocumentDBEndToEndSupport
     /// </summary>
     public static async Task<(int ExitCode, string StandardOutput)> RunDockerAsync(params string[] arguments)
     {
-        var (exitCode, standardOutput, _) = await RunDockerCoreAsync(arguments);
+        var (exitCode, standardOutput, _) = await RunDockerCoreAsync(DefaultDockerTimeout, arguments);
+        return (exitCode, standardOutput);
+    }
+
+    /// <summary>
+    /// Runs a docker command with an explicit budget, for the few commands that legitimately take
+    /// longer than <see cref="DefaultDockerTimeout"/> - notably pulling a multi-gigabyte image on a
+    /// cold runner, where the default budget would report a healthy daemon as unresponsive.
+    /// </summary>
+    public static async Task<(int ExitCode, string StandardOutput)> RunDockerAsync(
+        TimeSpan timeout,
+        params string[] arguments)
+    {
+        var (exitCode, standardOutput, _) = await RunDockerCoreAsync(timeout, arguments);
         return (exitCode, standardOutput);
     }
 
     private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunDockerCoreAsync(
+        params string[] arguments) => await RunDockerCoreAsync(DefaultDockerTimeout, arguments);
+
+    private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunDockerCoreAsync(
+        TimeSpan commandTimeout,
         params string[] arguments)
     {
         var startInfo = new ProcessStartInfo("docker")
@@ -292,7 +315,7 @@ internal static class DocumentDBEndToEndSupport
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException($"Failed to start 'docker {string.Join(' ', arguments)}'.");
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeout = new CancellationTokenSource(commandTimeout);
 
         var stdout = process.StandardOutput.ReadToEndAsync(timeout.Token);
         var stderr = process.StandardError.ReadToEndAsync(timeout.Token);
@@ -313,7 +336,8 @@ internal static class DocumentDBEndToEndSupport
             }
 
             throw new InvalidOperationException(
-                $"'docker {string.Join(' ', arguments)}' did not complete within 30s; the Docker daemon appears unresponsive.");
+                $"'docker {string.Join(' ', arguments)}' did not complete within " +
+                $"{commandTimeout.TotalSeconds:0}s; the Docker daemon appears unresponsive.");
         }
 
         return (process.ExitCode, await stdout, await stderr);
@@ -367,6 +391,26 @@ internal static class DocumentDBEndToEndSupport
             $"Resource '{resourceName}' never reported a container id in its snapshot.");
     }
 
+    /// <summary>
+    /// Reads the image reference the container runtime was actually given when it created the
+    /// container.
+    /// </summary>
+    /// <remarks>
+    /// The Aspire resource snapshot's <c>container.image</c> property is not a substitute:
+    /// <c>ApplicationOrchestrator.OnResourceStarting</c> computes it from the live model with
+    /// <c>TryGetContainerImageName</c>, so it agrees with the model even when the container spec
+    /// DCP prepared earlier says something else. <c>.Config.Image</c> is what the daemon recorded
+    /// at create time, which is the only account of the container that actually exists.
+    /// </remarks>
+    public static async Task<string> GetContainerImageAsync(string containerId)
+    {
+        var (exitCode, output) = await RunDockerAsync("inspect", containerId, "--format", "{{.Config.Image}}");
+
+        Assert.Equal(0, exitCode);
+
+        return output.Trim();
+    }
+
     /// <summary>Reads the effective environment of a running container as a dictionary.</summary>
     public static async Task<IReadOnlyDictionary<string, string>> GetContainerEnvironmentAsync(string containerId)
     {
@@ -394,6 +438,98 @@ internal static class DocumentDBEndToEndSupport
         var (_, output, error) = await RunDockerCoreAsync("logs", containerId);
         return CombineStandardOutputAndError(output, error);
     }
+
+    public static async Task<string> GetContainerLogsSinceAsync(string containerId, DateTimeOffset since)
+    {
+        var (exitCode, output, error) = await RunDockerCoreAsync(
+            "logs",
+            "--since",
+            since.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
+            containerId);
+
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"'docker logs --since' failed for container '{containerId}' with exit code {exitCode}: {error}");
+        }
+
+        return CombineStandardOutputAndError(output, error);
+    }
+
+    internal static string NormalizeContainerLogs(string logs) =>
+        AnsiEscapeSequenceRegex.Replace(logs, string.Empty);
+
+    /// <summary>
+    /// When the container runtime started this container, used to tell the current run's
+    /// PostgreSQL log lines from the ones replayed out of a persisted data directory.
+    /// </summary>
+    /// <remarks>
+    /// Polled rather than read once: a container that has been created but not yet started reports
+    /// the zero timestamp, and accepting that as the anchor would make every replayed line from
+    /// every previous run look current. The resource snapshot publishes a container id as soon as
+    /// the runtime has one, so this window is real. If the container never reports a start time the
+    /// caller is told exactly that instead of silently losing the anchor.
+    /// </remarks>
+    public static async Task<DateTimeOffset> GetContainerStartedAtAsync(
+        string containerId,
+        CancellationToken cancellationToken = default)
+    {
+        var lastValue = string.Empty;
+
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            var (exitCode, output) = await RunDockerAsync("inspect", containerId, "--format", "{{.State.StartedAt}}");
+
+            if (exitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Could not read the start time of container '{containerId}' (exit code {exitCode}).");
+            }
+
+            lastValue = output.Trim();
+
+            if (!TryParseContainerStartedAt(lastValue, out var startedAt))
+            {
+                throw new InvalidOperationException(
+                    $"Container '{containerId}' reported an unparseable start time '{lastValue}'.");
+            }
+
+            if (!IsUnstartedContainerStartTime(startedAt))
+            {
+                return startedAt;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        throw new InvalidOperationException(
+            $"Container '{containerId}' never reported a start time: the runtime still reports the " +
+            $"zero timestamp '{lastValue}', so there is no anchor to separate this run's PostgreSQL " +
+            "log lines from ones replayed out of the persisted data directory.");
+    }
+
+    /// <summary>
+    /// Whether a start time is the zero value the container runtime reports for a container it has
+    /// created but not started.
+    /// </summary>
+    /// <remarks>
+    /// Docker reports <c>0001-01-01T00:00:00Z</c>. Matched on the year rather than by equality with
+    /// <see cref="DateTimeOffset.MinValue"/> so a differently-normalised zero cannot slip through;
+    /// no container can genuinely have started in year one.
+    /// </remarks>
+    internal static bool IsUnstartedContainerStartTime(DateTimeOffset startedAt) =>
+        startedAt.UtcDateTime.Year <= 1;
+
+    /// <summary>
+    /// Parses a container runtime start timestamp, which carries more fractional digits than a
+    /// <see cref="DateTime"/> keeps (Docker emits nanoseconds).
+    /// </summary>
+    internal static bool TryParseContainerStartedAt(string value, out DateTimeOffset startedAt) =>
+        DateTimeOffset.TryParse(
+            value,
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+            out startedAt);
 
     internal static string CombineStandardOutputAndError(string standardOutput, string standardError)
     {

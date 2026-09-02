@@ -17,7 +17,7 @@ public class Program
         // new DocumentDB version. The v0.112-0 floor is enforced by WithPostgresEndpoint()
         // itself; see https://github.com/microsoft/azure-databases-aspire/issues/71.
         builder.AddDocumentDB("documentdb")
-            .WithImageTag("pg17-0.114.0")
+            .WithImageTag("pg17-0.116.0")
             .WithPostgresEndpoint();
 
         var app = builder.Build();

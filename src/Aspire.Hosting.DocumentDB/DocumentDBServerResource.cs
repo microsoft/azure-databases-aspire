@@ -85,14 +85,73 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// </summary>
     internal DocumentDBPostgresVersion PgVersion { get; private set; } = DocumentDBPostgresVersion.Pg17;
 
+    /// <summary>
+    /// The raw, unencoded user name. This is the form the container expects in its
+    /// <c>USERNAME</c> environment variable, so it must never be percent-encoded.
+    /// Use <see cref="AppendUserInfo"/> for the URI forms.
+    /// </summary>
     internal ReferenceExpression UserNameReference =>
         UserNameParameter is not null ?
             ReferenceExpression.Create($"{UserNameParameter}") :
             ReferenceExpression.Create($"{DefaultUserName}");
 
     /// <summary>
+    /// Appends the <c>user:password@</c> userinfo component to <paramref name="builder"/>,
+    /// percent-encoding both credentials so that arbitrary values remain unambiguous inside the
+    /// <c>mongodb://</c> and <c>postgresql://</c> URI grammars.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Encoding is delegated to Aspire's <c>uri</c> string format, which applies
+    /// <see cref="Uri.EscapeDataString(string)"/> when the expression is resolved. The integration
+    /// therefore never reads the credential values itself, and
+    /// <see cref="ReferenceExpression.ValueExpression"/> keeps the plain <c>{parameter.value}</c>
+    /// placeholders. When the model is published, Aspire projects each formatted parameter onto an
+    /// <c>annotated.string</c> companion resource (<c>{parameter}-uri-encoded</c>) that carries the
+    /// <c>uri</c> filter, so no secret is inlined into the manifest. The publisher consuming that
+    /// manifest implements the filter, so the escaping applied at deployment time is its own; see
+    /// <see href="https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#credential-encoding">the
+    /// credential-encoding documentation</see> for the known divergences.
+    /// </para>
+    /// <para>
+    /// Values consisting only of RFC 3986 unreserved characters (<c>A-Z a-z 0-9 - . _ ~</c>) are
+    /// emitted verbatim. That covers the default <c>admin</c> user name and the password
+    /// <see cref="Aspire.Hosting.DocumentDBBuilderExtensions.AddDocumentDB(IDistributedApplicationBuilder, string, int?, IResourceBuilder{ParameterResource}, IResourceBuilder{ParameterResource})"/>
+    /// generates when none is supplied, so simple-credential connection strings are byte-identical
+    /// to the ones produced before encoding was introduced.
+    /// </para>
+    /// <para>
+    /// The container's own <c>USERNAME</c> / <c>PASSWORD</c> environment variables are deliberately
+    /// left unencoded — see <see cref="UserNameReference"/>.
+    /// </para>
+    /// </remarks>
+    private void AppendUserInfo(ReferenceExpressionBuilder builder, ParameterResource passwordParameter)
+    {
+        if (UserNameParameter is not null)
+        {
+            builder.Append($"{UserNameParameter:uri}");
+        }
+        else
+        {
+            builder.Append($"{DefaultUserName:uri}");
+        }
+
+        builder.Append($":{passwordParameter:uri}@");
+    }
+
+    /// <summary>
     /// Gets the connection string for the DocumentDB server.
     /// </summary>
+    /// <remarks>
+    /// The user name and password are percent-encoded into the URI userinfo component. Aspire
+    /// applies RFC 3986 escaping (<see cref="Uri.EscapeDataString(string)"/>) when it resolves this
+    /// reference, so MongoDB clients decode the original values back. In a published manifest the
+    /// escaping is instead performed by the downstream publisher, which does not necessarily match
+    /// RFC 3986; see
+    /// <see href="https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#credential-encoding">Credential
+    /// encoding</see> for publisher-specific behavior, including the <c>azd</c> limitation for
+    /// credentials containing spaces.
+    /// </remarks>
     public ReferenceExpression ConnectionStringExpression => BuildConnectionString();
 
     /// <summary>
@@ -111,7 +170,10 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// <c>documentdb-local</c> entrypoint, which connects with <c>-d postgres</c>.
     /// Credentials come from the same <see cref="UserNameParameter"/> /
     /// <see cref="PasswordParameter"/> used by the MongoDB gateway because the
-    /// container creates a single admin user shared by both surfaces.
+    /// container creates a single admin user shared by both surfaces, and they are
+    /// percent-encoded exactly as they are in
+    /// <see cref="ConnectionStringExpression"/>, with the same publisher-specific
+    /// behavior when the model is published.
     /// </para>
     /// <para>
     /// No <c>sslmode</c> query parameter is added, because the bundled
@@ -130,7 +192,7 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
 
         if (PasswordParameter is not null)
         {
-            builder.Append($"{UserNameReference}:{PasswordParameter}@");
+            AppendUserInfo(builder, PasswordParameter);
         }
 
         builder.Append($"{PrimaryEndpoint.Property(EndpointProperty.HostAndPort)}");
@@ -183,7 +245,7 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
 
         if (PasswordParameter is not null)
         {
-            builder.Append($"{UserNameReference}:{PasswordParameter}@");
+            AppendUserInfo(builder, PasswordParameter);
         }
 
         builder.Append($"{PostgresEndpoint.Property(EndpointProperty.HostAndPort)}");

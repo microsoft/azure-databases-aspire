@@ -173,6 +173,12 @@ It runs in CI as the `script-test` job of `.github/workflows/build-and-test.yml`
 `check-documentdb-version` workflow deliberately does **not** gate detection on these tests: a
 failure there would silently stop version detection instead of surfacing on a PR.
 
+`validate-nuget-package.py` is the pre-publish gate used by `nuget-publish.yml`. For tag pushes it
+requires a canonical `vMAJOR.MINOR.PATCH` tag and verifies that the single packed package's
+`.nuspec` version exactly matches it. Manual workflow runs validate the package without enabling
+NuGet publishing or GitHub release creation. Its unit and workflow wiring tests run in the same
+standard-library suite.
+
 The companion C# drift guard
 `VersionAutomationScriptTests` (in `tests/Aspire.Hosting.DocumentDB.Tests`) covers what only .NET
 can see: that `REQUIRED_PG_SET` stays a subset of `DocumentDBPostgresVersion`, that the public API
