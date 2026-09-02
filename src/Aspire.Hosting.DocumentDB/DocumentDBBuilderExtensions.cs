@@ -349,6 +349,12 @@ public static class DocumentDBBuilderExtensions
         UnrecognizedTag,
 
         /// <summary>
+        /// The curated repository, pinned by digest. The digest is what the runtime resolves, so
+        /// the version is unknown whatever tag the reference also carries.
+        /// </summary>
+        DigestPinned,
+
+        /// <summary>
         /// The curated repository with a tag this build recognises — the only origin that carries
         /// a DocumentDB version.
         /// </summary>
@@ -360,10 +366,11 @@ public static class DocumentDBBuilderExtensions
     /// </summary>
     /// <remarks>
     /// <see cref="KnownVersion"/> and <see cref="PostgresVariant"/> are populated only when
-    /// <see cref="Origin"/> is <see cref="DocumentDBImageOrigin.Curated"/>. Every
-    /// version-dependent decision in this package is therefore gated on
-    /// <c>KnownVersion is { } version</c>: one place decides what is known, and no caller can
-    /// conclude a version from an image whose version is not known.
+    /// <see cref="Origin"/> is <see cref="DocumentDBImageOrigin.Curated"/>, which in particular
+    /// means never when a <see cref="Digest"/> is present. Every version-dependent decision in
+    /// this package is therefore gated on <c>KnownVersion is { } version</c>: one place decides
+    /// what is known, and no caller can conclude a version from an image whose version is not
+    /// known.
     /// </remarks>
     /// <param name="Origin">How much is known about the image.</param>
     /// <param name="Image">
@@ -419,9 +426,20 @@ public static class DocumentDBBuilderExtensions
     /// <see cref="ContainerImageAnnotation.Image"/> alone, because the boundary between registry
     /// and repository is the caller's to move: see
     /// <see cref="DocumentDBContainerImageTags.NamesCuratedRepository"/>. A tag or digest the
-    /// annotation supplies wins over one written into the reference, and a reference that supplies
-    /// both is contradictory — Aspire emits <c>repo:a:b</c>, which resolves to nothing — so the
-    /// version is treated as unknown rather than guessed from either.
+    /// annotation supplies wins over one written into the reference, and two tags in one reference
+    /// are contradictory — Aspire emits <c>repo:a:b</c>, which resolves to nothing — so neither is
+    /// trusted.
+    /// </para>
+    /// <para>
+    /// A digest beats every tag. A reference may carry both — <c>repo:pg17-0.116.0@sha256:...</c>,
+    /// or an inline tag beside an annotation <c>SHA256</c>, or the reverse — and the runtime
+    /// resolves the digest and ignores the tag, so the tag names whichever release the caller
+    /// last typed rather than the image that starts. Reading a version out of it would let an
+    /// image predating the <c>/data</c> volume, the data-directory <c>flock</c> or a credential
+    /// floor inherit the promises of a release it is not. So any digest at all classifies the
+    /// resource as <see cref="DocumentDBImageOrigin.DigestPinned"/>, which carries no version;
+    /// the repository is still known, which is what lets the telemetry API reject the pin with a
+    /// message instead of silently skipping it.
     /// </para>
     /// </remarks>
     private static DocumentDBEffectiveImage ResolveEffectiveImage(IResource resource)
@@ -441,19 +459,24 @@ public static class DocumentDBBuilderExtensions
         var curated = DocumentDBContainerImageTags.NamesCuratedRepository(
             image.Registry, image.Image, out var inlineTag, out var inlineDigest);
 
-        var contradictory =
-            (!string.IsNullOrEmpty(image.Tag) && inlineTag is not null) ||
-            (!string.IsNullOrEmpty(image.SHA256) && inlineDigest is not null);
-
         var tag = string.IsNullOrEmpty(image.Tag) ? inlineTag : image.Tag;
         var digest = string.IsNullOrEmpty(image.SHA256) ? inlineDigest : image.SHA256;
+
+        // Two tags in one reference contradict each other. A digest given twice needs no such
+        // rule: any digest at all already forces the version unknown.
+        var ambiguousTag = !string.IsNullOrEmpty(image.Tag) && inlineTag is not null;
 
         if (!curated)
         {
             return new(DocumentDBImageOrigin.CustomRepository, image.Image, tag, digest, 0, null);
         }
 
-        if (contradictory ||
+        if (!string.IsNullOrEmpty(digest))
+        {
+            return new(DocumentDBImageOrigin.DigestPinned, image.Image, tag, digest, 0, null);
+        }
+
+        if (ambiguousTag ||
             !DocumentDBContainerImageTags.TryParseDocumentDBTag(tag, out var pg, out var version))
         {
             return new(DocumentDBImageOrigin.UnrecognizedTag, image.Image, tag, digest, 0, null);
@@ -631,7 +654,8 @@ public static class DocumentDBBuilderExtensions
     /// unactionable hard failure. A resource built from the caller's own Dockerfile is exempt
     /// on the same terms even when its image annotation names the curated image and a
     /// recognised tag, because the tag describes the build's starting point at best and the
-    /// floor is a property of the published release.
+    /// floor is a property of the published release. So is a digest-pinned reference, whose tag
+    /// the runtime discards in favour of the digest.
     /// </para>
     /// </remarks>
     private static IResourceBuilder<DocumentDBServerResource> SubscribeMinimumPostgresImageGuard(
@@ -691,6 +715,25 @@ public static class DocumentDBBuilderExtensions
                             evt.Resource.Name,
                             image.Image,
                             image.Tag,
+                            DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
+                    }
+                    return Task.CompletedTask;
+                }
+
+                // A digest supersedes the tag at the runtime, so the tag says nothing about the
+                // image that starts and the floor has nothing to check it against.
+                if (image.Origin == DocumentDBImageOrigin.DigestPinned)
+                {
+                    if (Interlocked.CompareExchange(ref warningLogged, 1, 0) == 0)
+                    {
+                        logger?.LogWarning(
+                            "DocumentDB resource '{ResourceName}' pins its image by digest '{Digest}', so the " +
+                            "DocumentDB version it runs is not the one tag '{Tag}' names. The v{MinVersion} " +
+                            "minimum required by WithPostgresEndpoint() for credential parity is NOT enforced " +
+                            "on digest-pinned images.",
+                            evt.Resource.Name,
+                            image.Digest,
+                            image.Tag ?? "<none>",
                             DocumentDBContainerImageTags.MinimumPostgresEndpointVersion);
                     }
                     return Task.CompletedTask;
@@ -2607,8 +2650,12 @@ public static class DocumentDBBuilderExtensions
         // official image however its annotations read, and every part of the wrapper - the
         // entrypoint script path, the packaged configuration layout, bash and jq - is a property
         // of the official image that this package has not established for a build it did not
-        // produce.
-        if (image.Origin is not (DocumentDBImageOrigin.Curated or DocumentDBImageOrigin.UnrecognizedTag))
+        // produce. Stated as the complement so that every origin naming the curated repository -
+        // including a digest pin, which has to reach the rejection below rather than be skipped -
+        // falls through.
+        if (image.Origin is DocumentDBImageOrigin.None
+            or DocumentDBImageOrigin.DockerfileBuild
+            or DocumentDBImageOrigin.CustomRepository)
         {
             return NotRequired(configuration, resource, image);
         }
