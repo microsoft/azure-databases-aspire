@@ -681,12 +681,14 @@ builder.AddProject<Projects.Worker>("worker")
 > - **Run mode only.** Manifest generation (`azd publish`, `--publisher
 >   manifest`) does not start the container, so the guard does not fire and
 >   the manifest is produced regardless of tag.
-> - **Curated image only.** A custom image (any
->   `ContainerImageAnnotation.Image` other than
->   `documentdb/documentdb-local`, e.g. a fork via `.WithImage("myorg/build", "pg17-0.110.0")`)
->   is exempt with a one-time warning. The container registry does not factor
->   into the carve-out — a private mirror of the curated image is still
->   guarded.
+> - **Curated image only.** A custom image (any reference whose repository
+>   is not `documentdb/documentdb-local`, e.g. a fork via
+>   `.WithImage("myorg/build", "pg17-0.110.0")`) is exempt with a one-time
+>   warning. The container registry does not factor into the carve-out — a
+>   private mirror of the curated image is still guarded — and the registry may
+>   be written into either annotation field, because the composed reference is
+>   what is judged. See
+>   [How the image is recognised](#how-the-image-is-recognised).
 > - **Unknown tag patterns** (`:latest`, `:nightly`, `pg17-0.112.0-rc.1`,
 >   custom non-`pg{NN}-X.Y.Z` strings) bypass the version check with a
 >   one-time warning, so pinning a custom build or pre-release does not break
@@ -750,6 +752,43 @@ builder.AddDocumentDB("documentdb")
        .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
        .WithImageTag("pg17-0.999.0");
 ```
+
+### How the image is recognised
+
+`ContainerImageAnnotation` models a reference as a registry prefix plus a repository, and Aspire
+joins the two with a single separator — it never re-splits them. Where you put that boundary is
+therefore up to you, and all of these resolve to the same official image:
+
+```csharp
+builder.AddDocumentDB("documentdb");                                   // ghcr.io/documentdb + documentdb/documentdb-local
+
+builder.AddDocumentDB("documentdb")
+       .WithImage("ghcr.io/documentdb/documentdb/documentdb-local", "pg17-0.116.0")
+       .WithImageRegistry(null);                                       // the whole reference in one field
+
+builder.AddDocumentDB("documentdb")
+       .WithImage("documentdb/documentdb/documentdb-local", "pg17-0.116.0")
+       .WithImageRegistry("ghcr.io");                                  // the boundary moved one segment
+```
+
+Recognition is done on the composed reference, so every spelling of one image is classified the
+same way. The repository identity stays exact — `documentdb/documentdb-local`, segment for
+segment — and only the prefix in front of it may vary, which is what keeps a **private mirror**
+covered: `contoso.azurecr.io/documentdb/documentdb-local` and `localhost:5000/documentdb/documentdb-local`
+are the curated image behind a different registry, whether you write the registry in
+`WithImageRegistry(...)` or inline.
+
+A leading path that is not a registry is part of the repository, so it names a different image and
+keeps the custom-image treatment. `evil/documentdb/documentdb-local` has no registry in front of it
+(a first segment is a registry host only when it contains a `.` or a `:`, or is `localhost`), and
+`ghcr.io/evil/documentdb/documentdb-local` has a path segment that is not part of the curated
+registry. Writing the full reference into the image *without* clearing the registry is also not the
+official image: Aspire composes `ghcr.io/documentdb/ghcr.io/documentdb/documentdb/documentdb-local`,
+which resolves to nothing.
+
+A digest is read whether it arrives through `WithImageSHA256(...)` or inline as
+`repository@sha256:...`, and a `:` is a tag only in the last path segment, so a registry port is
+never mistaken for one.
 
 ### Building your own image from a Dockerfile
 
