@@ -369,9 +369,21 @@ public static class DocumentDBBuilderExtensions
     /// <c>/srv/documentdb/../documentdb</c> are the same host directory.
     /// </summary>
     /// <remarks>
-    /// Symbolic links are deliberately not resolved: doing so needs the directory to exist at
-    /// model-build time and would make the answer depend on the state of the host filesystem at a
-    /// moment that has nothing to do with the run.
+    /// <para>
+    /// Symbolic links are deliberately not resolved, and that is a bounded limitation rather than
+    /// an oversight. Resolving one needs the whole path to exist on the machine building the model
+    /// — <see cref="Directory.ResolveLinkTarget(string, bool)"/> throws for a path that does not,
+    /// and resolves no intermediate link component of a longer path — and a bind source routinely
+    /// does not exist there: the daemon may be in a VM or on another machine entirely, and a
+    /// publish has no daemon at all. Resolving what does exist locally would also make the emitted
+    /// container command, and therefore the manifest, depend on the publishing machine's
+    /// filesystem, which is the one property this package's manifest handling is built to avoid.
+    /// Two bind sources that name one directory only through a link are therefore compared as
+    /// written and treated as different storage. The container's own <c>realpath</c> still resolves
+    /// links inside the image at runtime, Docker resolves the bind source on the daemon side, and
+    /// the <c>0.116.0</c> data-directory interlock still refuses two clusters on one directory, so
+    /// what is lost is the early diagnosis and not the protection.
+    /// </para>
     /// </remarks>
     private static string CanonicalizeHostPath(string source)
     {

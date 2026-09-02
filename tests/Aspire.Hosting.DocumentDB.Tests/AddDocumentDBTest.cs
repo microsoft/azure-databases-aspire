@@ -997,6 +997,15 @@ public class AddDocumentDBTests
         Assert.DoesNotContain("\"/tmp|/data/cluster\"", script, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Two bind sources that are different directories leave every candidate usable, and the
+    /// emitted script is the one a resource with no mounts gets. This is also where the documented
+    /// limit sits: sources are compared as written, so two spellings that name one directory only
+    /// through a symbolic link are treated as different storage here. Resolving them would require
+    /// the path to exist on the machine building the model — which a bind source aimed at a VM,
+    /// a remote daemon, or a directory Docker has yet to create does not — and would make the
+    /// published manifest depend on the publishing machine's filesystem.
+    /// </summary>
     [Fact]
     public async Task ATemporaryRootBackedByDifferentStorageIsLeftAlone()
     {
