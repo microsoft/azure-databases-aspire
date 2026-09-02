@@ -426,7 +426,7 @@ internal static class DocumentDBEndToEndSupport
             "--since",
             since.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
             containerId);
- 
+
         if (exitCode != 0)
         {
             throw new InvalidOperationException(
