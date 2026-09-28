@@ -1,0 +1,67 @@
+#nullable enable
+Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource
+Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource.ConnectionStringExpression.get -> Aspire.Hosting.ApplicationModel.ReferenceExpression!
+Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource.DatabaseName.get -> string!
+Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource.DocumentDBDatabaseResource(string! name, string! databaseName, Aspire.Hosting.ApplicationModel.DocumentDBServerResource! parent) -> void
+Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource.Parent.get -> Aspire.Hosting.ApplicationModel.DocumentDBServerResource!
+Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion
+Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion.Pg15 = 15 -> Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion
+Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion.Pg16 = 16 -> Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion
+Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion.Pg17 = 17 -> Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion
+Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion.Pg18 = 18 -> Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.ConnectionStringExpression.get -> Aspire.Hosting.ApplicationModel.ReferenceExpression!
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.Databases.get -> System.Collections.Generic.IReadOnlyList<Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource!>!
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.DocumentDBServerResource(string! name) -> void
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.DocumentDBServerResource(string! name, Aspire.Hosting.ApplicationModel.ParameterResource? userNameParameter, Aspire.Hosting.ApplicationModel.ParameterResource? passwordParameter) -> void
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.PasswordParameter.get -> Aspire.Hosting.ApplicationModel.ParameterResource?
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.PostgresConnectionStringExpression.get -> Aspire.Hosting.ApplicationModel.ReferenceExpression!
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.PostgresEndpoint.get -> Aspire.Hosting.ApplicationModel.EndpointReference!
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.PrimaryEndpoint.get -> Aspire.Hosting.ApplicationModel.EndpointReference!
+Aspire.Hosting.ApplicationModel.DocumentDBServerResource.UserNameParameter.get -> Aspire.Hosting.ApplicationModel.ParameterResource?
+Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_109_0 = 1 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_110_0 = 2 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_111_0 = 3 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_112_0 = 4 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_113_0 = 5 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_114_0 = 6 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_116_0 = 7 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersions
+Aspire.Hosting.DocumentDBBuilderExtensions
+Aspire.Hosting.DocumentDBLogLevel
+Aspire.Hosting.DocumentDBLogLevel.Debug = 4 -> Aspire.Hosting.DocumentDBLogLevel
+Aspire.Hosting.DocumentDBLogLevel.Error = 1 -> Aspire.Hosting.DocumentDBLogLevel
+Aspire.Hosting.DocumentDBLogLevel.Info = 3 -> Aspire.Hosting.DocumentDBLogLevel
+Aspire.Hosting.DocumentDBLogLevel.Quiet = 0 -> Aspire.Hosting.DocumentDBLogLevel
+Aspire.Hosting.DocumentDBLogLevel.Trace = 5 -> Aspire.Hosting.DocumentDBLogLevel
+Aspire.Hosting.DocumentDBLogLevel.Warn = 2 -> Aspire.Hosting.DocumentDBLogLevel
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_109_0 = "0.109.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_110_0 = "0.110.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_111_0 = "0.111.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_112_0 = "0.112.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_113_0 = "0.113.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_114_0 = "0.114.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_116_0 = "0.116.0" -> string!
+static Aspire.Hosting.ApplicationModel.DocumentDBVersions.All.get -> System.Collections.Generic.IReadOnlyList<string!>!
+static Aspire.Hosting.ApplicationModel.DocumentDBVersions.Latest.get -> string!
+static Aspire.Hosting.DocumentDBBuilderExtensions.AddDatabase(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! name, string? databaseName = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.AddDocumentDB(this Aspire.Hosting.IDistributedApplicationBuilder! builder, string! name, int? port = null, Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.ParameterResource!>? userName = null, Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.ParameterResource!>? password = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.AddDocumentDB(this Aspire.Hosting.IDistributedApplicationBuilder! builder, string! name, int? port) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.AllowInsecureTls(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, bool allowInsecureTls = true) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.UseTls(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, bool useTls = true) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithDataBindMount(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! source, bool isReadOnly = false) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithDataVolume(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string? name = null, bool isReadOnly = false, string? targetPath = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithDocumentDBVersion(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, Aspire.Hosting.ApplicationModel.DocumentDBVersion version) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithHostPort(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, int? port) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithInitData(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! source) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithLogLevel(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, Aspire.Hosting.DocumentDBLogLevel logLevel) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithOpenTelemetryMetrics(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string? endpoint = null, bool enabled = true, System.TimeSpan? exportInterval = null, System.TimeSpan? timeout = null, string? serviceName = null, string? serviceVersion = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutExtendedRum(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutSampleData(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutUserCreation(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithOwner(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! owner) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithPostgresEndpoint(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, int? port = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithPostgresVersion(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, Aspire.Hosting.ApplicationModel.DocumentDBPostgresVersion pgVersion) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithTelemetry(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, bool enabled = true) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithTlsCertificate(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! certPath, string! keyPath) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!

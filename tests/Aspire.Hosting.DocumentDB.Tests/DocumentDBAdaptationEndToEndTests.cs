@@ -34,6 +34,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// </para>
 /// </remarks>
 [Trait("Category", "Integration")]
+[Trait("Shard", "5")]
 public class DocumentDBAdaptationEndToEndTests
 {
     private const string EndToEndTimeoutEnvironmentVariable = "DOCUMENTDB_E2E_TIMEOUT_SECONDS";
@@ -193,10 +194,10 @@ public class DocumentDBAdaptationEndToEndTests
         var rejection = await Record.ExceptionAsync(
             () => PingOnceAsync(plainConnectionString!, "appdb", CancellationToken.None));
 
-        Assert.NotNull(rejection);
-        Assert.True(
-            rejection is TimeoutException or MongoException,
-            $"Expected the plain connection to be refused by TLS enforcement, but got: {rejection}");
+        // The listener accepts the connection and hangs up on the plaintext hello; a refused
+        // connection or an authentication error would be a different claim.
+        Assert.IsType<TimeoutException>(rejection);
+        Assert.Contains("EndOfStreamException", rejection.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -385,7 +386,7 @@ public class DocumentDBAdaptationEndToEndTests
         // success (~4.3 KB, larger than the pipe buffer), so waiting first would deadlock as soon
         // as the image being probed actually exists locally. The timeout covers a wedged daemon,
         // which would otherwise stall the whole run.
-        var startInfo = new ProcessStartInfo("docker")
+        var startInfo = new ProcessStartInfo(DocumentDBContainerRuntime.Executable)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,

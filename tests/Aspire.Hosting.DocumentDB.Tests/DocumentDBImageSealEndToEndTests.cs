@@ -25,6 +25,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// observe a real disagreement.
 /// </remarks>
 [Trait("Category", "Integration")]
+[Trait("Shard", "5")]
 public class DocumentDBImageSealEndToEndTests
 {
     // ------------------------------------------------------------------

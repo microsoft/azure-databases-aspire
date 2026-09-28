@@ -14,7 +14,21 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
   unit-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -26,6 +40,8 @@ jobs:
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           global-json-file: global.json
+          cache: true
+          cache-dependency-path: Directory.Packages.props
 
       - name: Restore
         run: dotnet restore azure-databases-aspire.sln
@@ -34,11 +50,56 @@ jobs:
         run: dotnet build azure-databases-aspire.sln --no-restore
 
       - name: Unit Tests
-        run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build --filter "Category=Unit"
+        run: >-
+          dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build
+          --filter "Category=Unit" --logger trx --collect:"Code Coverage;Format=cobertura" --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Unit coverage ratchet
+        run: |
+          shopt -s nullglob
+          reports=(TestResults/*/*.cobertura.xml)
+          if [ ${#reports[@]} -ne 1 ]; then echo "::error::Expected one Cobertura report, found ${#reports[@]}"; exit 1; fi
+          python3 eng/scripts/check-coverage.py --report "${reports[0]}" --baseline eng/coverage/unit.json --package Aspire.Hosting.DocumentDB
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unit-test-results
+          path: TestResults
+          if-no-files-found: ignore
+
+  # Pilot: not a ci-gate dependency until it has a green, fast week behind it.
+  unit-test-pilot:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: Directory.Packages.props
+
+      - name: Unit Tests
+        run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --filter "Category=Unit" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
 
   script-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,12 +109,173 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Version-automation script tests
-        run: python3 -m unittest discover -s eng/scripts/tests -v
+      # One automation test compiles a rewritten copy of DocumentDBVersion.cs.
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Install coverage
+        run: python3 -m pip install -r eng/scripts/requirements-ci.txt
+
+      - name: Script tests
+        run: |
+          python3 -m coverage run --branch --source=eng/scripts --omit='eng/scripts/tests/*' -m unittest discover -s eng/scripts/tests -v
+          python3 -m coverage xml -o TestResults/scripts-coverage.xml
+
+      - name: Script coverage ratchet
+        run: |
+          args=()
+          for f in eng/scripts/*.py; do args+=(--require-file "$f"); done
+          python3 eng/scripts/check-coverage.py --report TestResults/scripts-coverage.xml --baseline eng/coverage/scripts.json "${args[@]}"
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # MinVer and the API baseline both read release tags
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: Directory.Packages.props
+
+      - name: Restore
+        run: dotnet restore azure-databases-aspire.sln
+
+      - name: Build (Release)
+        run: dotnet build azure-databases-aspire.sln -c Release --no-restore
+
+      - name: Unit Tests (Release)
+        run: >-
+          dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj -c Release --no-build
+          --filter "Category=Unit" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      # Pinned to a published release, advanced by hand after each publish. Not --no-build:
+      # restore has to see the baseline version to download it.
+      - name: Pack with API validation against the last release
+        run: >-
+          dotnet pack src/Aspire.Hosting.DocumentDB/Aspire.Hosting.DocumentDB.csproj -c Release -o ./artifacts
+          -p:EnablePackageValidation=true -p:PackageValidationBaselineVersion=0.116.0
+
+      - name: Validate packed package
+        run: python3 eng/scripts/validate-nuget-package.py --artifacts ./artifacts
+
+  consumer-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: Directory.Packages.props
+
+      - name: Pack
+        run: dotnet pack src/Aspire.Hosting.DocumentDB/Aspire.Hosting.DocumentDB.csproj -c Release -o ./artifacts
+
+      - name: Consumer smoke
+        run: eng/consumer-smoke/run.sh ./artifacts
 
   integration-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: '1'
+            images: pg17-LATEST pg17-0.114.0
+          - shard: '2'
+            images: pg15-LATEST pg16-LATEST pg17-LATEST pg18-LATEST pg15-0.114.0 pg16-0.114.0 pg17-0.114.0
+          - shard: '3'
+            images: pg17-LATEST pg17-0.114.0 pg17-0.112.0 pg17-0.111.0
+          - shard: '4'
+            images: pg17-LATEST pg17-0.114.0
+          - shard: '5'
+            images: pg17-LATEST pg18-LATEST pg17-0.114.0 pg18-0.114.0 pg17-0.111.0
+    name: integration-test (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pulls overlap restore and build; tests would pull on demand anyway, so this only saves time.
+      - name: Start image pulls
+        env:
+          IMAGES: ${{ matrix.images }}
+        run: |
+          latest=$(grep -oE 'const string V0_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          read -ra tags <<< "${IMAGES//LATEST/$latest}"
+          (
+            if printf 'ghcr.io/documentdb/documentdb/documentdb-local:%s\n' "${tags[@]}" | xargs -P 4 -n 1 docker pull -q; then
+              echo 0 > "$RUNNER_TEMP/pulls.exit"
+            else
+              echo 1 > "$RUNNER_TEMP/pulls.exit"
+            fi
+          ) > "$RUNNER_TEMP/pulls.log" 2>&1 &
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: Directory.Packages.props
+
+      - name: Restore
+        run: dotnet restore azure-databases-aspire.sln
+
+      - name: Build
+        run: dotnet build azure-databases-aspire.sln --no-restore
+
+      - name: Wait for image pulls
+        run: |
+          for _ in $(seq 300); do [ -s "$RUNNER_TEMP/pulls.exit" ] && break; sleep 2; done
+          if [ "$(cat "$RUNNER_TEMP/pulls.exit" 2>/dev/null)" != "0" ]; then
+            cat "$RUNNER_TEMP/pulls.log"; echo "::error::Image pre-pull failed or timed out"; exit 1
+          fi
+
+      - name: Integration Tests
+        run: >-
+          dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build
+          --filter "Category=Integration&Shard=${{ matrix.shard }}" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Verify pulled images against the digest lock
+        run: eng/scripts/verify-pulled-images.sh
+
+      # Always uploaded: the per-test durations are what the shards are balanced from.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-test-results-${{ matrix.shard }}
+          path: TestResults
+          if-no-files-found: ignore
+
+  version-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [1, 2, 3, 4, 5, 6, 7, 8, 9] # DocumentDBVersionSmokeCatalogTests.CiLegCount
+    name: version-smoke (${{ matrix.leg }}/9)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,6 +284,8 @@ jobs:
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           global-json-file: global.json
+          cache: true
+          cache-dependency-path: Directory.Packages.props
 
       - name: Restore
         run: dotnet restore azure-databases-aspire.sln
@@ -69,5 +293,83 @@ jobs:
       - name: Build
         run: dotnet build azure-databases-aspire.sln --no-restore
 
-      - name: Integration Tests
-        run: dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build --filter "Category=Integration"
+      - name: Version smoke
+        env:
+          DOCUMENTDB_SMOKE_LEG: ${{ matrix.leg }}/9
+        run: >-
+          dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build
+          --filter "Category=VersionSmoke" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Verify pulled images against the digest lock
+        run: eng/scripts/verify-pulled-images.sh
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: version-smoke-results-${{ matrix.leg }}
+          path: TestResults
+          if-no-files-found: ignore
+
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 18]
+    name: backend (pg${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: Directory.Packages.props
+
+      - name: Restore
+        run: dotnet restore azure-databases-aspire.sln
+
+      - name: Build
+        run: dotnet build azure-databases-aspire.sln --no-restore
+
+      - name: Backend compact
+        env:
+          DOCUMENTDB_BACKEND_PG: ${{ matrix.pg }}
+        run: >-
+          dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj --no-build
+          --filter "Category=Backend" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Verify pulled images against the digest lock
+        run: eng/scripts/verify-pulled-images.sh
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backend-results-pg${{ matrix.pg }}
+          path: TestResults
+          if-no-files-found: ignore
+
+  # The only required status check: a failed, cancelled or skipped dependency fails it.
+  ci-gate:
+    if: always()
+    needs: [lint, unit-test, script-test, package, consumer-smoke, integration-test, version-smoke, backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null

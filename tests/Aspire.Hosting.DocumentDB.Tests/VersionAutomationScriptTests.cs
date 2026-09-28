@@ -9,8 +9,8 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 
 /// <summary>
 /// Cross-language drift guards: things only a .NET test can check, because they compare the
-/// compiled enums (and the public-API baseline) against files that the C# compiler never sees —
-/// the Python version-automation script and the Markdown documentation.
+/// compiled enums against files that the C# compiler never sees — the Python version-automation
+/// script and the Markdown documentation.
 ///
 /// <para>
 /// Behavioral verification of the script itself lives in <c>eng/scripts/tests/</c>, where the
@@ -44,7 +44,7 @@ public class VersionAutomationScriptTests
             "looking for a directory containing 'global.json' or '.git'.");
     }
 
-    private static string ReadRepoFile(params string[] relativeSegments)
+    internal static string ReadRepoFile(params string[] relativeSegments)
     {
         var path = Path.Combine([s_repoRoot, .. relativeSegments]);
         Assert.True(File.Exists(path), $"Expected repository file not found: {path}");
@@ -258,41 +258,5 @@ public class VersionAutomationScriptTests
         var troubleshooting = ReadRepoFile("docs", "troubleshooting.md");
         Assert.True(troubleshooting.Contains($"documentdb-local:{defaultTag}", StringComparison.Ordinal),
             $"The 'docker pull' example in docs/troubleshooting.md does not use the current default tag '{defaultTag}'.");
-    }
-
-    [Fact]
-    public void ApiBaselineListsEveryPublicEnumMember()
-    {
-        // The version-detection workflow appends members to DocumentDBVersion.cs but deliberately
-        // never edits the public-API baseline; the maintainer does that by hand on the auto-PR.
-        // This test is what makes that documented gate real - it fails until the baseline is
-        // updated, so an auto-PR cannot merge with a stale public-API record.
-        var baseline = ReadRepoFile("src", "Aspire.Hosting.DocumentDB", "api", "Aspire.Hosting.DocumentDB.cs");
-
-        foreach (var version in Enum.GetValues<DocumentDBVersion>())
-        {
-            AssertBaselineDeclaresMember(baseline, version.ToString(), (int)version);
-            Assert.Contains($"public const string {version} = ", baseline, StringComparison.Ordinal);
-        }
-
-        foreach (var pg in Enum.GetValues<DocumentDBPostgresVersion>())
-        {
-            AssertBaselineDeclaresMember(baseline, pg.ToString(), (int)pg);
-        }
-    }
-
-    /// <summary>
-    /// Asserts the baseline declares <paramref name="member"/> with <paramref name="value"/>.
-    /// The trailing comma is optional: dropping it on the last member of an enum is valid C# and
-    /// must not fail this guard.
-    /// </summary>
-    private static void AssertBaselineDeclaresMember(string baseline, string member, int value)
-    {
-        var declared = Regex.IsMatch(baseline, $@"\b{Regex.Escape(member)}\s*=\s*{value}\s*[,}}\r\n]");
-
-        Assert.True(declared,
-            $"The public API baseline (src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs) " +
-            $"does not declare '{member} = {value}'. Add it by hand - the baseline is the " +
-            "human-reviewed record of public API changes and is never written by automation.");
     }
 }
