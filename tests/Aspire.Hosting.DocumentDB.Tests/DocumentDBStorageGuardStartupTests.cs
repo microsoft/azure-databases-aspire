@@ -23,6 +23,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// after <see cref="BeforeStartEvent"/> has installed the guard" is asserted rather than assumed.
 /// </remarks>
 [Trait("Category", "Integration")]
+[Trait("Shard", "5")]
 [Collection(DocumentDBStorageGuardAppHostCollection.Name)]
 public class DocumentDBStorageGuardStartupTests
 {

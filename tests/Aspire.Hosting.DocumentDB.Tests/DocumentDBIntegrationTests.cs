@@ -19,6 +19,7 @@ using Xunit.Sdk;
 namespace Aspire.Hosting.DocumentDB.Tests;
 
 [Trait("Category", "Integration")]
+[Trait("Shard", "5")]
 public class DocumentDBIntegrationTests
 {
     private const string EndToEndTimeoutEnvironmentVariable = "DOCUMENTDB_E2E_TIMEOUT_SECONDS";
@@ -64,6 +65,36 @@ public class DocumentDBIntegrationTests
         var deleteResult = await collection.DeleteOneAsync(filter, cancellationToken: cts.Token);
         Assert.Equal(1, deleteResult.DeletedCount);
         Assert.Equal(0, await collection.CountDocumentsAsync(filter, cancellationToken: cts.Token));
+    }
+
+    [Fact]
+    public async Task HealthCheckGoesUnhealthyWhileStoppedAndRecoversAfterStart()
+    {
+        if (!RequiresDockerAttribute.IsSupported)
+        {
+            throw SkipException.ForSkip("Docker is required for DocumentDB end-to-end validation.");
+        }
+
+        using var cts = CreateEndToEndTimeoutSource();
+
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Aspire.Hosting.DocumentDB.EndToEndApp.Program>(cts.Token);
+        await using var app = await appHost.BuildAsync(cts.Token);
+
+        await app.StartAsync(cts.Token);
+
+        var healthCheckService = app.Services.GetRequiredService<HealthCheckService>();
+        var commands = app.Services.GetRequiredService<ResourceCommandService>();
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
+
+        // The check reuses one cached client, so this also proves that client notices the outage
+        // and reconnects rather than reporting a stale answer either way.
+        var stop = await commands.ExecuteCommandAsync("documentdb", KnownResourceCommands.StopCommand, cts.Token);
+        Assert.True(stop.Success, stop.Message);
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token, HealthStatus.Unhealthy);
+
+        var start = await commands.ExecuteCommandAsync("documentdb", KnownResourceCommands.StartCommand, cts.Token);
+        Assert.True(start.Success, start.Message);
+        await WaitForHealthCheckAsync(healthCheckService, "documentdb_check", cts.Token);
     }
 
     [Fact]
@@ -331,7 +362,11 @@ public class DocumentDBIntegrationTests
         throw new InvalidOperationException("DocumentDB did not become reachable in time.", lastException);
     }
 
-    private static async Task WaitForHealthCheckAsync(HealthCheckService healthCheckService, string healthCheckKey, CancellationToken cancellationToken)
+    private static async Task WaitForHealthCheckAsync(
+        HealthCheckService healthCheckService,
+        string healthCheckKey,
+        CancellationToken cancellationToken,
+        HealthStatus expected = HealthStatus.Healthy)
     {
         HealthReport? lastReport = null;
 
@@ -341,7 +376,7 @@ public class DocumentDBIntegrationTests
                 registration => registration.Name == healthCheckKey,
                 cancellationToken);
 
-            if (lastReport.Entries.TryGetValue(healthCheckKey, out var entry) && entry.Status == HealthStatus.Healthy)
+            if (lastReport.Entries.TryGetValue(healthCheckKey, out var entry) && entry.Status == expected)
             {
                 return;
             }
@@ -355,7 +390,7 @@ public class DocumentDBIntegrationTests
             lastMessage = $"{lastEntry.Status}: {lastEntry.Description}";
         }
 
-        throw new InvalidOperationException($"Health check '{healthCheckKey}' did not become healthy in time. Last result: {lastMessage}");
+        throw new InvalidOperationException($"Health check '{healthCheckKey}' did not become {expected} in time. Last result: {lastMessage}");
     }
 
     private static int GetAvailableTcpPort()

@@ -1,0 +1,235 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  TEST_PROJECT: tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj
+  # Runs on podman and ARM64 too: AppHost lifecycle, the Postgres endpoint, and crash recovery.
+  PORTABILITY_FILTER: (Category=Integration&FullyQualifiedName~DocumentDBIntegrationTests)|Category=Nightly
+
+jobs:
+  version-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Version smoke (every cell)
+        run: dotnet test "$TEST_PROJECT" --filter "Category=VersionSmoke" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-version-smoke-results
+          path: TestResults
+          if-no-files-found: ignore
+
+  digest-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Verify locked digests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 eng/scripts/check-documentdb-versions.py --verify-digests
+
+  merged-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Unit and integration tests
+        run: >-
+          dotnet test "$TEST_PROJECT" --filter "Category=Unit|Category=Integration"
+          --logger trx --collect:"Code Coverage;Format=cobertura" --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Merged coverage ratchet
+        run: |
+          shopt -s nullglob
+          reports=(TestResults/*/*.cobertura.xml)
+          if [ ${#reports[@]} -ne 1 ]; then echo "::error::Expected one Cobertura report, found ${#reports[@]}"; exit 1; fi
+          python3 eng/scripts/check-coverage.py --report "${reports[0]}" --baseline eng/coverage/merged.json --package Aspire.Hosting.DocumentDB
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-merged-coverage-results
+          path: TestResults
+          if-no-files-found: ignore
+
+  podman:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOTNET_ASPIRE_CONTAINER_RUNTIME: podman
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      # A docker call anywhere in the run now fails instead of quietly using the other runtime.
+      - name: Require rootless podman and hide docker
+        run: |
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+          mkdir -p "$RUNNER_TEMP/no-docker"
+          printf '#!/bin/sh\necho "docker was called during the podman lane: $*" >&2\nexit 127\n' > "$RUNNER_TEMP/no-docker/docker"
+          chmod +x "$RUNNER_TEMP/no-docker/docker"
+          echo "$RUNNER_TEMP/no-docker" >> "$GITHUB_PATH"
+
+      - name: Portability subset on podman
+        run: dotnet test "$TEST_PROJECT" --filter "$PORTABILITY_FILTER" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Podman ran the containers
+        run: podman images --format '{{.Repository}}' | grep -qx 'ghcr.io/documentdb/documentdb/documentdb-local'
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-podman-results
+          path: TestResults
+          if-no-files-found: ignore
+
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check for an arm64 image
+        id: manifest
+        run: |
+          latest=$(grep -oE 'const string V0_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          image="ghcr.io/documentdb/documentdb/documentdb-local:pg17-$latest"
+          # Inspect and parse outside the if, so a registry or parse error fails the job instead of reading as "no arm64".
+          manifest=$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}')
+          arm64=$(jq 'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "arm64")' <<<"$manifest")
+          if [ "$arm64" = true ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=No arm64 image::$image has no linux/arm64 manifest; ARM64 is an accepted gap until upstream publishes one."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup .NET
+        if: steps.manifest.outputs.published == 'true'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Portability subset on arm64
+        if: steps.manifest.outputs.published == 'true'
+        run: dotnet test "$TEST_PROJECT" --filter "$PORTABILITY_FILTER" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        if: steps.manifest.outputs.published == 'true'
+        run: python3 eng/scripts/check-test-results.py TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-arm64-results
+          path: TestResults
+          if-no-files-found: ignore
+
+  consumer-variants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Pack
+        run: dotnet pack src/Aspire.Hosting.DocumentDB/Aspire.Hosting.DocumentDB.csproj -c Release -o ./artifacts
+
+      # The PR smoke runs the package's own dependency floors; this is a consumer already on the newest stable ones.
+      - name: Consumer smoke on the newest Aspire and MongoDB.Driver
+        run: |
+          latest() { curl -fsSL "https://api.nuget.org/v3-flatcontainer/$1/index.json" | jq -er '[.versions[] | select(contains("-") | not)] | sort_by(split(".") | map(tonumber)) | last'; }
+          ConsumerAspireVersion=$(latest aspire.hosting.apphost)
+          ConsumerMongoDriverVersion=$(latest mongodb.driver)
+          export ConsumerAspireVersion ConsumerMongoDriverVersion
+          echo "Aspire.Hosting.AppHost $ConsumerAspireVersion, MongoDB.Driver $ConsumerMongoDriverVersion"
+          eng/consumer-smoke/run.sh ./artifacts
+
+  report:
+    needs: [version-smoke, digest-drift, merged-coverage, podman, arm64, consumer-variants]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the nightly failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")')
+          body="Nightly failed in: $failed. $RUN_URL"
+          gh label create nightly-failure --color B60205 --description "Nightly workflow failure" 2>/dev/null || true
+          issue=$(gh issue list --label nightly-failure --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "Nightly failure" --label nightly-failure --body "$body"
+          fi

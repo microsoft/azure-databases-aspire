@@ -5,6 +5,8 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using Aspire.Hosting.ApplicationModel;
+using MongoDB.Bson;
+using MongoDB.Driver;
 using Xunit;
 using static Aspire.Hosting.DocumentDB.Tests.DocumentDBEndToEndSupport;
 
@@ -22,36 +24,39 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// really does.
 /// </remarks>
 [Trait("Category", "Integration")]
+[Trait("Shard", "4")]
 public class DocumentDBStorageBehaviorTests
 {
     private const string CandidateVersion = "0.116.0";
     private const string BaselineVersion = "0.114.0";
 
-    private static readonly string s_candidateImage =
-        $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-{CandidateVersion}";
+    private static readonly string s_candidateImage = DocumentDBImageDigestLock.PinnedReference($"pg17-{CandidateVersion}");
 
     /// <summary>The first image with the storage contract, and the newest one this build knows.</summary>
     public static TheoryData<string> InterlockedVersions => new() { CandidateVersion, DocumentDBVersions.Latest };
 
-    private static string InterlockedImage(string version) =>
-        $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-{version}";
+    private static string InterlockedImage(string version) => DocumentDBImageDigestLock.PinnedReference($"pg17-{version}");
 
-    private static readonly string s_baselineImage =
-        $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:pg17-{BaselineVersion}";
+    private static readonly string s_baselineImage = DocumentDBImageDigestLock.PinnedReference($"pg17-{BaselineVersion}");
 
     /// <summary>
     /// The image <see cref="RunInBindMountAsync"/> uses to read a bind mount back as root. Pulled
     /// explicitly so the probe never depends on another test having warmed the cache.
     /// </summary>
-    private static readonly string s_probeImage =
-        $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{DocumentDBContainerImageTags.Tag}";
+    private static readonly string s_probeImage = DocumentDBImageDigestLock.PinnedReference(DocumentDBContainerImageTags.Tag);
+
+    private const string ProbeUserName = "storageprobe";
+    private const string ProbePassword = "Storage_Passw0rd!";
 
     private static readonly string[] s_credentialEnvironment =
     [
-        "-e", "USERNAME=storageprobe",
-        "-e", "PASSWORD=Storage_Passw0rd!",
+        "-e", $"USERNAME={ProbeUserName}",
+        "-e", $"PASSWORD={ProbePassword}",
         "-e", "SKIP_INIT_DATA=true",
     ];
+
+    /// <summary>Publishes the gateway on a random loopback port, for tests that talk to it.</summary>
+    private static readonly string[] s_publishGateway = ["-p", "127.0.0.1::10260"];
 
     /// <summary>
     /// The image declares <c>/data</c> as a volume, so a run that mounts nothing there still gets a
@@ -116,6 +121,7 @@ public class DocumentDBStorageBehaviorTests
         var image = InterlockedImage(version);
         await EnsureImageAsync(image);
 
+        using var cts = CreateEndToEndTimeoutSource();
         var volumeName = UniqueName("lock-vol");
         var firstContainer = UniqueName("lock-a");
         var secondContainer = UniqueName("lock-b");
@@ -126,15 +132,21 @@ public class DocumentDBStorageBehaviorTests
             Assert.Equal(0, createExit);
 
             var (firstExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", firstContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, image]);
+                ["run", "-d", "--name", firstContainer, "-v", $"{volumeName}:/data", .. s_publishGateway, .. s_credentialEnvironment, image]);
             Assert.Equal(0, firstExit);
 
             await WaitForLogAsync(firstContainer, "database system is ready to accept connections");
 
+            // Written before the second container starts, so "refused" also has to mean "left the
+            // winner's data alone".
+            var winner = await ConnectAsync(await GetGatewayConnectionStringAsync(firstContainer), "lock", cts.Token);
+            var sentinels = winner.GetCollection<BsonDocument>("sentinel");
+            await sentinels.InsertOneAsync(new BsonDocument { ["_id"] = "before-loser" }, cancellationToken: cts.Token);
+
             // Same volume, second container: the lock is held, so this one must exit instead of
             // opening a second PostgreSQL instance on the same data directory.
             var (secondExit, _) = await RunDockerAsync(
-                ["run", "--name", secondContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, image]);
+                ["run", "--name", secondContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
             Assert.NotEqual(0, secondExit);
 
             var logs = await GetContainerLogsAsync(secondContainer);
@@ -147,6 +159,15 @@ public class DocumentDBStorageBehaviorTests
             var (stateExit, state) = await RunDockerAsync("inspect", firstContainer, "--format", "{{.State.Running}}");
             Assert.Equal(0, stateExit);
             Assert.Equal("true", state.Trim());
+
+            // ...and the winner still reads what it wrote and still accepts writes.
+            Assert.NotNull(await sentinels
+                .Find(Builders<BsonDocument>.Filter.Eq("_id", "before-loser"))
+                .SingleOrDefaultAsync(cts.Token));
+            await sentinels.InsertOneAsync(new BsonDocument { ["_id"] = "after-loser" }, cancellationToken: cts.Token);
+            Assert.Equal(2, await sentinels.CountDocumentsAsync(FilterDefinition<BsonDocument>.Empty, cancellationToken: cts.Token));
+
+            await RemoveAndAssertGoneAsync([firstContainer, secondContainer], [volumeName]);
         }
         finally
         {
@@ -157,49 +178,129 @@ public class DocumentDBStorageBehaviorTests
     }
 
     /// <summary>
-    /// A read-only data directory cannot work: <c>initdb</c> has to take ownership of it. The
-    /// failure is also slow and misattributed, which is why the package rejects the configuration
-    /// at build time instead of letting the container run.
+    /// From 0.116.0 custom initialization is one-shot per data directory. A seed that fails part
+    /// way fails the first container; the next one on the same directory neither retries it nor
+    /// refuses to serve — it warns and keeps what the failed attempt applied.
     /// </summary>
-    [Theory]
-    [MemberData(nameof(InterlockedVersions))]
-    public async Task ReadOnlyDataDirectoryFailsInitializationWithAMisleadingTimeout(string version)
+    [Fact]
+    public async Task ACustomSeedThatFailsPartWayIsNotRetriedOnTheSameDataDirectory()
     {
         RequireDocker();
-        var image = InterlockedImage(version);
-        await EnsureImageAsync(image);
+        await EnsureImageAsync(s_candidateImage);
 
-        var volumeName = UniqueName("ro-vol");
-        var containerName = UniqueName("ro");
+        using var cts = CreateEndToEndTimeoutSource();
+        var volumeName = UniqueName("seed-vol");
+        var firstContainer = UniqueName("seed-a");
+        var secondContainer = UniqueName("seed-b");
+        var seedDirectory = Path.Combine(AppContext.BaseDirectory, UniqueName("seed"));
+        Directory.CreateDirectory(seedDirectory);
+
+        // Scripts run in name order: the first one lands, the second one fails the attempt. It
+        // has to exit non-zero: the image feeds scripts to mongosh over stdin, where an uncaught
+        // throw is printed and then reported as "Successfully executed".
+        await File.WriteAllTextAsync(
+            Path.Combine(seedDirectory, "01-applied.js"),
+            """db.getSiblingDB("seeded").items.insertOne({ step: "applied" });""",
+            cts.Token);
+        await File.WriteAllTextAsync(Path.Combine(seedDirectory, "02-fails.js"), "quit(1);", cts.Token);
+
+        string[] storage =
+            ["-v", $"{volumeName}:/data", "-v", $"{seedDirectory}:/init_doc_db.d:ro", "-e", "INIT_DATA_PATH=/init_doc_db.d"];
 
         try
         {
             var (createExit, _) = await RunDockerAsync("volume", "create", volumeName);
             Assert.Equal(0, createExit);
 
-            var (runExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, image]);
-            Assert.Equal(0, runExit);
+            var (firstExit, _) = await RunDockerAsync(
+                ["run", "-d", "--name", firstContainer, .. storage, .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
+            Assert.Equal(0, firstExit);
 
-            // The banner a user actually notices blames PostgreSQL start-up timing, and only
-            // appears a full minute after the container already knew it could not proceed.
-            var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
-
-            // The real causes are individual lines inside interleaved log streams.
-            Assert.Contains("chown: changing ownership of '/data': Read-only file system", logs, StringComparison.Ordinal);
+            Assert.NotEqual(0, await WaitForContainerExitCodeAsync(firstContainer));
             Assert.Contains(
-                "initdb: error: could not change permissions of directory \"/data\": Read-only file system",
-                logs,
+                "Error: Custom data initialization failed",
+                await GetContainerLogsAsync(firstContainer),
                 StringComparison.Ordinal);
 
-            // The banner is logged before the entrypoint unwinds, so the exit code is only stable
-            // once the container has actually stopped.
-            Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
+            var (secondExit, _) = await RunDockerAsync(
+                ["run", "-d", "--name", secondContainer, .. storage, .. s_publishGateway, .. s_credentialEnvironment, s_candidateImage]);
+            Assert.Equal(0, secondExit);
+
+            var logs = await WaitForLogAsync(secondContainer, "=== DocumentDB is ready ===");
+            Assert.Contains(
+                "Warning: a previous custom data initialization was attempted but its success was not recorded",
+                logs,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain("Initializing database with custom data", logs, StringComparison.Ordinal);
+
+            // What the failed attempt applied is kept, and was not applied a second time.
+            var database = await ConnectAsync(await GetGatewayConnectionStringAsync(secondContainer), "seeded", cts.Token);
+            Assert.Equal(
+                1,
+                await database.GetCollection<BsonDocument>("items")
+                    .CountDocumentsAsync(Builders<BsonDocument>.Filter.Eq("step", "applied"), cancellationToken: cts.Token));
+
+            await RemoveAndAssertGoneAsync([firstContainer, secondContainer], [volumeName]);
         }
         finally
         {
-            await RunDockerAsync("rm", "-f", "-v", containerName);
+            await RunDockerAsync("rm", "-f", "-v", firstContainer);
+            await RunDockerAsync("rm", "-f", "-v", secondContainer);
             await RemoveVolumeAsync(volumeName);
+            TryDeleteDirectory(seedDirectory);
+        }
+    }
+
+    // A class of its own so xUnit runs it in parallel with NonEmptyDataDirectory; each takes ~95s.
+    [Trait("Category", "Integration")]
+    [Trait("Shard", "4")]
+    public class ReadOnlyDataDirectory
+    {
+        /// <summary>
+        /// A read-only data directory cannot work: <c>initdb</c> has to take ownership of it. The
+        /// failure is also slow and misattributed, which is why the package rejects the configuration
+        /// at build time instead of letting the container run.
+        /// </summary>
+        [Theory]
+        [MemberData(nameof(InterlockedVersions), MemberType = typeof(DocumentDBStorageBehaviorTests))]
+        public async Task ReadOnlyDataDirectoryFailsInitializationWithAMisleadingTimeout(string version)
+        {
+            RequireDocker();
+            var image = InterlockedImage(version);
+            await EnsureImageAsync(image);
+
+            var volumeName = UniqueName("ro-vol");
+            var containerName = UniqueName("ro");
+
+            try
+            {
+                var (createExit, _) = await RunDockerAsync("volume", "create", volumeName);
+                Assert.Equal(0, createExit);
+
+                var (runExit, _) = await RunDockerAsync(
+                    ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
+                Assert.Equal(0, runExit);
+
+                // The banner a user actually notices blames PostgreSQL start-up timing, and only
+                // appears a full minute after the container already knew it could not proceed.
+                var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
+
+                // The real causes are individual lines inside interleaved log streams.
+                Assert.Contains("chown: changing ownership of '/data': Read-only file system", logs, StringComparison.Ordinal);
+                Assert.Contains(
+                    "initdb: error: could not change permissions of directory \"/data\": Read-only file system",
+                    logs,
+                    StringComparison.Ordinal);
+
+                // The banner is logged before the entrypoint unwinds, so the exit code is only stable
+                // once the container has actually stopped.
+                Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
+            }
+            finally
+            {
+                await RunDockerAsync("rm", "-f", "-v", containerName);
+                await RemoveVolumeAsync(volumeName);
+            }
         }
     }
 
@@ -419,72 +520,78 @@ public class DocumentDBStorageBehaviorTests
         }
     }
 
-    /// <summary>
-    /// A data directory that holds anything other than a PostgreSQL cluster is refused, not
-    /// cleaned: the container leaves the contents alone, never starts PostgreSQL, and exits behind
-    /// the same misleading 60-second banner. One stray dot-file — a <c>.gitkeep</c> committed to
-    /// keep the directory in source control, or a <c>.DS_Store</c> the host wrote — is enough.
-    /// </summary>
-    [Theory]
-    [MemberData(nameof(InterlockedVersions))]
-    public async Task ANonEmptyDataDirectoryWithoutAClusterIsRefusedAndLeftIntact(string version)
+    // A class of its own so xUnit runs it in parallel with ReadOnlyDataDirectory; each takes ~95s.
+    [Trait("Category", "Integration")]
+    [Trait("Shard", "4")]
+    public class NonEmptyDataDirectory
     {
-        RequireDocker();
-        var image = InterlockedImage(version);
-        await EnsureImageAsync(image);
-        await EnsureImageAsync(s_probeImage);
-
-        var hostDirectory = Path.Combine(AppContext.BaseDirectory, UniqueName("stray"));
-        Directory.CreateDirectory(hostDirectory);
-        await File.WriteAllTextAsync(Path.Combine(hostDirectory, StrayFileName), StrayFileContents);
-
-        var containerName = UniqueName("stray");
-        try
+        /// <summary>
+        /// A data directory that holds anything other than a PostgreSQL cluster is refused, not
+        /// cleaned: the container leaves the contents alone, never starts PostgreSQL, and exits behind
+        /// the same misleading 60-second banner. One stray dot-file — a <c>.gitkeep</c> committed to
+        /// keep the directory in source control, or a <c>.DS_Store</c> the host wrote — is enough.
+        /// </summary>
+        [Theory]
+        [MemberData(nameof(InterlockedVersions), MemberType = typeof(DocumentDBStorageBehaviorTests))]
+        public async Task ANonEmptyDataDirectoryWithoutAClusterIsRefusedAndLeftIntact(string version)
         {
-            var (runExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, image]);
-            Assert.Equal(0, runExit);
+            RequireDocker();
+            var image = InterlockedImage(version);
+            await EnsureImageAsync(image);
+            await EnsureImageAsync(s_probeImage);
 
-            var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
+            var hostDirectory = Path.Combine(AppContext.BaseDirectory, UniqueName("stray"));
+            Directory.CreateDirectory(hostDirectory);
+            await File.WriteAllTextAsync(Path.Combine(hostDirectory, StrayFileName), StrayFileContents);
 
-            Assert.Contains(
-                "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory",
-                logs,
-                StringComparison.Ordinal);
+            var containerName = UniqueName("stray");
+            try
+            {
+                var (runExit, _) = await RunDockerAsync(
+                    ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
+                Assert.Equal(0, runExit);
 
-            Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
+                var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
 
-            // The refusal is not destructive. The directory is read back through a container
-            // running as root rather than with System.IO: the entrypoint chowns the bind mount to
-            // the container's uid and chmods it 0750, and on Linux — where the host and the
-            // container really do share the inode — the test process can then no longer even
-            // enumerate it. A host-side File.Exists would report a file that is merely
-            // inaccessible as deleted, which is the opposite of what this test is asserting.
-            var entries = await ListBindMountEntriesAsync(hostDirectory);
+                Assert.Contains(
+                    "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory",
+                    logs,
+                    StringComparison.Ordinal);
 
-            Assert.Contains(StrayFileName, entries);
-            Assert.DoesNotContain("PG_VERSION", entries);
+                Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
 
-            // Presence in the listing proves the name survived; reading it proves the contents did
-            // too, and that the entrypoint did not truncate the file it refused to initialize over.
-            var (readExit, contents) = await RunInBindMountAsync(hostDirectory, $"cat /probe/{StrayFileName}");
-            Assert.Equal(0, readExit);
-            Assert.Equal(StrayFileContents, contents.Trim());
+                // The refusal is not destructive. The directory is read back through a container
+                // running as root rather than with System.IO: the entrypoint chowns the bind mount to
+                // the container's uid and chmods it 0750, and on Linux — where the host and the
+                // container really do share the inode — the test process can then no longer even
+                // enumerate it. A host-side File.Exists would report a file that is merely
+                // inaccessible as deleted, which is the opposite of what this test is asserting.
+                var entries = await ListBindMountEntriesAsync(hostDirectory);
 
-            // Root inside the container is subject to no permission the entrypoint could have set,
-            // so a failing existence check here is proof of absence rather than of a mode change:
-            // nothing was initialized over the refused directory.
-            var (clusterProbeExit, _) = await RunInBindMountAsync(hostDirectory, "test -e /probe/PG_VERSION");
-            Assert.NotEqual(0, clusterProbeExit);
-        }
-        finally
-        {
-            await RunDockerAsync("rm", "-f", "-v", containerName);
+                Assert.Contains(StrayFileName, entries);
+                Assert.DoesNotContain("PG_VERSION", entries);
 
-            // The contents now belong to the container's uid; widen the modes from inside a
-            // container so the host-side delete can succeed under a different uid on CI.
-            await TryRelaxBindMountPermissionsAsync(hostDirectory);
-            TryDeleteDirectory(hostDirectory);
+                // Presence in the listing proves the name survived; reading it proves the contents did
+                // too, and that the entrypoint did not truncate the file it refused to initialize over.
+                var (readExit, contents) = await RunInBindMountAsync(hostDirectory, $"cat /probe/{StrayFileName}");
+                Assert.Equal(0, readExit);
+                Assert.Equal(StrayFileContents, contents.Trim());
+
+                // Root inside the container is subject to no permission the entrypoint could have set,
+                // so a failing existence check here is proof of absence rather than of a mode change:
+                // nothing was initialized over the refused directory.
+                var (clusterProbeExit, _) = await RunInBindMountAsync(hostDirectory, "test -e /probe/PG_VERSION");
+                Assert.NotEqual(0, clusterProbeExit);
+            }
+            finally
+            {
+                await RunDockerAsync("rm", "-f", "-v", containerName);
+
+                // The contents now belong to the container's uid; widen the modes from inside a
+                // container so the host-side delete can succeed under a different uid on CI.
+                await TryRelaxBindMountPermissionsAsync(hostDirectory);
+                TryDeleteDirectory(hostDirectory);
+            }
         }
     }
 
@@ -511,6 +618,37 @@ public class DocumentDBStorageBehaviorTests
         }
         catch (UnauthorizedAccessException)
         {
+        }
+    }
+
+    private static async Task<string> GetGatewayConnectionStringAsync(string containerName)
+    {
+        // One line per published address, e.g. "127.0.0.1:55001".
+        var (exitCode, output) = await RunDockerAsync("port", containerName, "10260/tcp");
+        Assert.Equal(0, exitCode);
+        var hostPort = output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)[0];
+
+        return $"mongodb://{ProbeUserName}:{Uri.EscapeDataString(ProbePassword)}@{hostPort}/?tls=true&tlsInsecure=true&directConnection=true";
+    }
+
+    /// <summary>
+    /// Removes what a test created and fails if any of it survived. Called on the success path
+    /// only, so a leak is reported without replacing the failure a test was diagnosing.
+    /// </summary>
+    private static async Task RemoveAndAssertGoneAsync(string[] containers, string[] volumes)
+    {
+        foreach (var container in containers)
+        {
+            await RunDockerAsync("rm", "-f", "-v", container);
+            var (exitCode, _) = await RunDockerAsync("container", "inspect", container);
+            Assert.True(exitCode != 0, $"Container '{container}' was not removed.");
+        }
+
+        foreach (var volume in volumes)
+        {
+            await RemoveVolumeAsync(volume);
+            var (exitCode, _) = await RunDockerAsync("volume", "inspect", volume);
+            Assert.True(exitCode != 0, $"Volume '{volume}' was not removed.");
         }
     }
 
@@ -552,7 +690,7 @@ public class DocumentDBStorageBehaviorTests
         TimeSpan timeout,
         params string[] arguments)
     {
-        var startInfo = new ProcessStartInfo("docker")
+        var startInfo = new ProcessStartInfo(DocumentDBContainerRuntime.Executable)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -595,6 +733,19 @@ public class DocumentDBStorageBehaviorTests
 
         return (process.ExitCode, await stdout, await stderr);
     }
+
+    /// <summary>
+    /// Runs the image's own entrypoint under a bash PID 1 that outlives it, for containers expected
+    /// to exit. The entrypoint pipes its output through <c>tee</c>, and as PID 1 its exit kills the
+    /// container before <c>tee</c> writes the last lines - the refusal these tests assert. Under CPU
+    /// load that lost the message in 5 of 30 runs; this waits (at most 5s) for <c>tee</c> to finish.
+    /// </summary>
+    private static string[] KeepingLastLogLines(string image) =>
+    [
+        "--entrypoint", "/bin/bash", image, "-c",
+        "/home/documentdb/gateway/scripts/emulator_entrypoint.sh; status=$?; " +
+        "for _ in $(seq 50); do grep -qx tee /proc/[0-9]*/comm 2>/dev/null || break; sleep 0.1; done; exit $status",
+    ];
 
     private static async Task<string> WaitForLogAsync(string containerName, string expected)
     {
