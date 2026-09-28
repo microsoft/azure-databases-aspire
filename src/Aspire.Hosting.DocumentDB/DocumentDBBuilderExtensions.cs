@@ -4000,8 +4000,10 @@ public static class DocumentDBBuilderExtensions
     /// token in that position is an operand rather than a possible <c>--data-path</c>.
     /// </summary>
     /// <remarks>
-    /// Taken from the entrypoint's own argument loop, which has carried the same set from
-    /// <c>0.112.0</c> through <c>0.116.0</c>. Options that take no operand (<c>-h</c>,
+    /// Taken from the entrypoint's own argument loop from <c>0.112.0</c> through <c>0.117.0</c>.
+    /// <c>--toast-compression</c> exists only in <c>0.116.0</c>; <c>0.117.0</c> rejects it as an
+    /// unexpected argument, so keeping it here only affects which token is read as its operand.
+    /// Options that take no operand (<c>-h</c>,
     /// <c>--help</c>, <c>--skip-init-data</c>, <c>--disable-extended-rum</c>) are deliberately
     /// absent: the token after one of those is read as the next option name. An option a future
     /// image adds is absent too, which fails the deferred token closed — the safe direction.
@@ -4243,7 +4245,7 @@ public static class DocumentDBBuilderExtensions
     /// <see cref="WithoutSampleData"/> so the default initialization does not require the skipped
     /// credentials.
     /// <para>
-    /// For images from <c>0.113.0</c> onward, including <c>0.116.0</c>, built-in sample
+    /// For images from <c>0.113.0</c> onward, including <c>0.117.0</c>, built-in sample
     /// initialization does not run unless requested. A fresh container can therefore remain
     /// running with user creation disabled when no initialization requiring those credentials is
     /// requested. The generated connection strings still will not authenticate unless the user
@@ -5446,7 +5448,7 @@ public static class DocumentDBBuilderExtensions
     /// <remarks>
     /// The bundled PostgreSQL instance creates the default <c>documentdb</c> role. A custom value
     /// must name a role that already exists, such as the owner of an externally managed
-    /// PostgreSQL instance. DocumentDB <c>0.116.0</c> aborts explicitly while creating the
+    /// PostgreSQL instance. DocumentDB <c>0.116.0</c> and later abort explicitly while creating the
     /// DocumentDB admin user when the configured role does not exist. Earlier images also fail
     /// startup, but only later while waiting for the gateway to start.
     /// </remarks>
