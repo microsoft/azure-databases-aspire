@@ -10,12 +10,9 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// Reads the telemetry section of the gateway's "Starting server with configuration" log line.
 /// </summary>
 /// <remarks>
-/// The gateway prints that section as a Rust <c>Debug</c> value, and its shape depends on the image:
-/// <c>0.116.0</c> prints a typed struct (<c>telemetry_options: Some(TelemetryOptions { service_name:
-/// Some("x"), ..., metrics: None, tracing: Some(TracingOptions { enabled: Some(false), ...</c>),
-/// while <c>0.117.0</c> prints the raw JSON it read (<c>telemetry_provider_options: Some(Object
-/// {"ServiceName": String("x"), "Tracing": Object {"Enabled": Bool(false), ...</c>). Both carry the
-/// same facts, so tests ask for the facts rather than matching either spelling.
+/// From <c>0.117.0</c> the gateway prints the JSON it read as a Rust <c>Debug</c> value:
+/// <c>telemetry_provider_options: Some(Object {"ServiceName": String("x"), "Tracing": Object
+/// {"Enabled": Bool(false), ...}}), telemetry_settings: ...</c>.
 /// </remarks>
 internal sealed partial class GatewayTelemetryConfigurationLog
 {
@@ -26,62 +23,33 @@ internal sealed partial class GatewayTelemetryConfigurationLog
     public static GatewayTelemetryConfigurationLog Parse(string logs)
     {
         var match = SectionRegex().Match(logs);
-        Assert.True(match.Success, $"No gateway telemetry configuration was logged:{Environment.NewLine}{logs}");
+        Assert.True(match.Success, $"No complete gateway telemetry configuration was logged:{Environment.NewLine}{logs}");
         return new GatewayTelemetryConfigurationLog(match.Value);
     }
 
-    /// <summary>Whether the configuration file still carries a <c>Metrics</c> object.</summary>
-    public bool HasMetricsSection =>
-        _section.Contains("metrics: Some(", StringComparison.Ordinal) ||
-        _section.Contains("\"Metrics\":", StringComparison.Ordinal);
+    public bool HasMetricsSection => _section.Contains("\"Metrics\":", StringComparison.Ordinal);
 
-    public string? ServiceName => ReadString(TypedServiceNameRegex(), JsonServiceNameRegex());
+    public string? ServiceName => Read(ServiceNameRegex());
 
-    public string? ServiceVersion => ReadString(TypedServiceVersionRegex(), JsonServiceVersionRegex());
+    public string? ServiceVersion => Read(ServiceVersionRegex());
 
-    /// <summary>The configuration file's <c>Tracing.Enabled</c>, or <see langword="null"/> when absent.</summary>
-    public bool? TracingEnabled
-    {
-        get
-        {
-            var value = ReadString(TypedTracingEnabledRegex(), JsonTracingEnabledRegex());
-            return value is null ? null : bool.Parse(value);
-        }
-    }
+    public bool? TracingEnabled => Read(TracingEnabledRegex()) is { } value ? bool.Parse(value) : null;
 
     public override string ToString() => _section;
 
-    private string? ReadString(Regex typed, Regex json)
-    {
-        var match = typed.Match(_section);
-        if (!match.Success)
-        {
-            match = json.Match(_section);
-        }
+    private string? Read(Regex regex) => regex.Match(_section) is { Success: true } match ? match.Groups["v"].Value : null;
 
-        return match.Success ? match.Groups["v"].Value : null;
-    }
-
-    // Must end at the field that follows telemetry in both versions, so a truncated line fails to
-    // parse instead of reading as a configuration with every setting removed.
-    [GeneratedRegex(@"telemetry(?:_provider)?_options: (?:None|Some\([^\r\n]*?\))(?=, telemetry_settings:|, enable_pg_file_settings_refresh:)")]
+    // Must end at the next field, so a truncated line fails to parse instead of reading as a
+    // configuration with every setting removed.
+    [GeneratedRegex(@"telemetry_provider_options: (?:None|Some\([^\r\n]*?\))(?=, telemetry_settings:)")]
     private static partial Regex SectionRegex();
 
-    [GeneratedRegex(@"service_name: Some\(""(?<v>[^""]*)""\)")]
-    private static partial Regex TypedServiceNameRegex();
-
     [GeneratedRegex(@"""ServiceName"": String\(""(?<v>[^""]*)""\)")]
-    private static partial Regex JsonServiceNameRegex();
-
-    [GeneratedRegex(@"service_version: Some\(""(?<v>[^""]*)""\)")]
-    private static partial Regex TypedServiceVersionRegex();
+    private static partial Regex ServiceNameRegex();
 
     [GeneratedRegex(@"""ServiceVersion"": String\(""(?<v>[^""]*)""\)")]
-    private static partial Regex JsonServiceVersionRegex();
-
-    [GeneratedRegex(@"tracing: Some\(TracingOptions \{ enabled: Some\((?<v>true|false)\)")]
-    private static partial Regex TypedTracingEnabledRegex();
+    private static partial Regex ServiceVersionRegex();
 
     [GeneratedRegex(@"""Tracing"": Object \{""Enabled"": Bool\((?<v>true|false)\)")]
-    private static partial Regex JsonTracingEnabledRegex();
+    private static partial Regex TracingEnabledRegex();
 }
