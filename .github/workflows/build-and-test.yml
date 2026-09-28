@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # nuget-publish.yml runs the same sharded suite before it publishes.
+  workflow_call:
+    inputs:
+      release:
+        type: boolean
+        default: false
 
 concurrency:
   group: build-test-${{ github.event.pull_request.number || github.ref }}
@@ -74,6 +80,8 @@ jobs:
 
   # Pilot: not a ci-gate dependency until it has a green, fast week behind it.
   unit-test-pilot:
+    # A failing pilot would otherwise fail the caller's needs and block a release.
+    if: ${{ !inputs.release }}
     strategy:
       fail-fast: false
       matrix:
