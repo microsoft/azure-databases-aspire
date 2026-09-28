@@ -136,7 +136,7 @@ public class DocumentDBStorageBehaviorTests
             // Same volume, second container: the lock is held, so this one must exit instead of
             // opening a second PostgreSQL instance on the same data directory.
             var (secondExit, _) = await RunDockerAsync(
-                ["run", "--name", secondContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, s_candidateImage]);
+                ["run", "--name", secondContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
             Assert.NotEqual(0, secondExit);
 
             var logs = await GetContainerLogsAsync(secondContainer);
@@ -203,7 +203,7 @@ public class DocumentDBStorageBehaviorTests
             Assert.Equal(0, createExit);
 
             var (firstExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", firstContainer, .. storage, .. s_credentialEnvironment, s_candidateImage]);
+                ["run", "-d", "--name", firstContainer, .. storage, .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
             Assert.Equal(0, firstExit);
 
             Assert.NotEqual(0, await WaitForContainerExitCodeAsync(firstContainer));
@@ -266,7 +266,7 @@ public class DocumentDBStorageBehaviorTests
                 Assert.Equal(0, createExit);
 
                 var (runExit, _) = await RunDockerAsync(
-                    ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, s_candidateImage]);
+                    ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
                 Assert.Equal(0, runExit);
 
                 // The banner a user actually notices blames PostgreSQL start-up timing, and only
@@ -532,7 +532,7 @@ public class DocumentDBStorageBehaviorTests
             try
             {
                 var (runExit, _) = await RunDockerAsync(
-                    ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, s_candidateImage]);
+                    ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
                 Assert.Equal(0, runExit);
 
                 var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
@@ -717,6 +717,19 @@ public class DocumentDBStorageBehaviorTests
 
         return (process.ExitCode, await stdout, await stderr);
     }
+
+    /// <summary>
+    /// Runs the image's own entrypoint under a bash PID 1 that outlives it, for containers expected
+    /// to exit. The entrypoint pipes its output through <c>tee</c>, and as PID 1 its exit kills the
+    /// container before <c>tee</c> writes the last lines - the refusal these tests assert. Under CPU
+    /// load that lost the message in 5 of 30 runs; this waits (at most 5s) for <c>tee</c> to finish.
+    /// </summary>
+    private static string[] KeepingLastLogLines(string image) =>
+    [
+        "--entrypoint", "/bin/bash", image, "-c",
+        "/home/documentdb/gateway/scripts/emulator_entrypoint.sh; status=$?; " +
+        "for _ in $(seq 50); do grep -qx tee /proc/[0-9]*/comm 2>/dev/null || break; sleep 0.1; done; exit $status",
+    ];
 
     private static async Task<string> WaitForLogAsync(string containerName, string expected)
     {
