@@ -20,10 +20,6 @@
     <PackageReference Include="Npgsql" />
     <PackageReference Include="xunit.abstractions" />
     <PackageReference Include="xunit" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Include="$(RepoRoot)src\Aspire.Hosting.DocumentDB\DocumentDBContainerImageTags.cs" />
-    <Compile Include="$(RepoRoot)src\Aspire.Hosting.DocumentDB\DocumentDBContainerRuntimeArguments.cs" />
+    <PackageReference Include="YamlDotNet" />
   </ItemGroup>
 </Project>

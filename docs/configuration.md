@@ -1086,6 +1086,8 @@ The supplied `userName`/`password` (default `admin` + auto-generated) are usable
 
 The `DocumentDBVersion` enum is the **curated, append-only** list of versions known to this build of the package. New entries are added by the `check-documentdb-version` GitHub Actions workflow only when the version is published as a non-prerelease GitHub Release on [`documentdb/documentdb`](https://github.com/documentdb/documentdb/releases) AND the `pg15-X.Y.Z`, `pg16-X.Y.Z`, `pg17-X.Y.Z`, and `pg18-X.Y.Z` container tags all exist on GHCR. Existing entries are never renamed, removed, or renumbered.
 
+The package pulls these images by tag, and GHCR tags are mutable: the digests recorded when a version is adopted (`eng/documentdb-image-digests.json`) are checked in this repository's CI, not at your pull — pin with `WithImageSHA256(...)` if you need immutable bytes.
+
 You can enumerate the full list at runtime via `DocumentDBVersions.All`, and read the newest version known to the current package build via `DocumentDBVersions.Latest` (a property, not a `const`, so it is re-resolved after a package upgrade rather than inlined).
 
 | Symbol | Notes |

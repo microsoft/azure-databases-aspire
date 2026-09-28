@@ -6,6 +6,8 @@ Run from the repository root with the standard library only (no pip dependencies
 
     python -m unittest discover -s eng/scripts/tests
 
+One test compiles the rewritten DocumentDBVersion.cs, so it needs `dotnet` on PATH.
+
 These tests cover the parts of the script that only execute when a *new* upstream version is
 detected — in particular that the generated CHANGELOG line derives its container-tag list from
 ``REQUIRED_PG_SET`` rather than hardcoding pg15/pg16/pg17, which is how it silently drifted when
@@ -14,13 +16,22 @@ detected — in particular that the generated CHANGELOG line derives its contain
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import http.server
 import importlib.util
+import json
 import io
+import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +39,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = REPO_ROOT / "eng" / "scripts" / "check-documentdb-versions.py"
 REAL_VERSIONS_FILE = REPO_ROOT / "src" / "Aspire.Hosting.DocumentDB" / "DocumentDBVersion.cs"
 REAL_CHANGELOG_FILE = REPO_ROOT / "CHANGELOG.md"
+REAL_PUBLIC_API_DIR = REPO_ROOT / "src" / "Aspire.Hosting.DocumentDB"
+REAL_DIGEST_LOCK_FILE = REPO_ROOT / "eng" / "documentdb-image-digests.json"
 
 # Models the expected production layout: the auto-generated block lives at the end of the
 # [Unreleased] section, so regenerated notes never land inside a released section.
@@ -63,6 +76,17 @@ script = _load_script()
 def _semver(text: str):
     major, minor, patch = (int(part) for part in text.split("."))
     return script.SemVer(major, minor, patch)
+
+
+def _fake_digests(tag: str, salt: str = "") -> dict:
+    """Deterministic, well-formed lock entry for a tag."""
+    def digest(kind: str) -> str:
+        return "sha256:" + hashlib.sha256(f"{tag}{kind}{salt}".encode()).hexdigest()
+    return {"index": digest("index"), "linux/amd64": digest("amd64"), "linux/arm64": None}
+
+
+def _fake_resolver(image_path, tags):
+    return {tag: _fake_digests(tag) for tag in tags}
 
 
 def _full_variants(*versions: str) -> dict:
@@ -134,23 +158,36 @@ public static class DocumentDBVersions
         self.versions_file.write_text(self.VERSIONS_FIXTURE, encoding="utf-8")
         self.changelog_file = self.root / "CHANGELOG.md"
         self.changelog_file.write_text(CHANGELOG_TEMPLATE, encoding="utf-8")
+        self.unshipped_file = self.versions_file.parent / "PublicAPI.Unshipped.txt"
+        self.unshipped_file.write_text("#nullable enable\n", encoding="utf-8")
+        self.lock_file = self.root / "eng" / "documentdb-image-digests.json"
+        self.lock_file.parent.mkdir()
+        self.lock_file.write_text("{}\n", encoding="utf-8")
 
-    def run_main(self, gh_versions, ghcr_map, *, github_actions: bool = False) -> tuple[int, str, str]:
+    def run_main(self, gh_versions, ghcr_map, *, github_actions: bool = False,
+                 github_output: str = "", real_fetchers: bool = False) -> tuple[int, str, str]:
         """Run main() against this fake repo; returns (exit_code, stdout, stderr).
 
         ``GITHUB_ACTIONS`` is blanked unless a test asks for it, so the workflow-command output
         of `emit_github_annotation` is opt-in: the Python suite itself runs inside Actions, and
         an annotation emitted from a test would show up on the build summary as a real one.
+        ``real_fetchers`` leaves the network functions in place for a test that serves them.
         """
         stdout, stderr = io.StringIO(), io.StringIO()
-        env = {"GITHUB_OUTPUT": "", "GITHUB_ACTIONS": "true" if github_actions else ""}
-        with mock.patch.object(script, "REPO_ROOT", self.root), \
-                mock.patch.object(script, "VERSIONS_FILE", self.versions_file), \
-                mock.patch.object(script, "CHANGELOG_FILE", self.changelog_file), \
-                mock.patch.object(script, "fetch_github_releases", return_value=gh_versions), \
-                mock.patch.object(script, "fetch_ghcr_pg_tags", return_value=ghcr_map), \
-                mock.patch.dict(script.os.environ, env), \
-                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        env = {"GITHUB_OUTPUT": github_output, "GITHUB_ACTIONS": "true" if github_actions else ""}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(script, "REPO_ROOT", self.root))
+            stack.enter_context(mock.patch.object(script, "VERSIONS_FILE", self.versions_file))
+            stack.enter_context(mock.patch.object(script, "CHANGELOG_FILE", self.changelog_file))
+            stack.enter_context(mock.patch.object(script, "PUBLIC_API_UNSHIPPED_FILE", self.unshipped_file))
+            stack.enter_context(mock.patch.object(script, "DIGEST_LOCK_FILE", self.lock_file))
+            stack.enter_context(mock.patch.object(script, "resolve_image_digests", side_effect=_fake_resolver))
+            if not real_fetchers:
+                stack.enter_context(mock.patch.object(script, "fetch_github_releases", return_value=gh_versions))
+                stack.enter_context(mock.patch.object(script, "fetch_ghcr_pg_tags", return_value=ghcr_map))
+            stack.enter_context(mock.patch.dict(script.os.environ, env))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
             code = script.main()
         return code, stdout.getvalue(), stderr.getvalue()
 
@@ -268,6 +305,46 @@ class UpdateChangelogTests(ScriptTestCase):
         self.assertIn("`pg18-0.116.0`", text)
         self.assertIn("## [0.114.0] - 2026-07-20", text)
         self.assertIn("hand-written release notes", text)
+
+
+class UpdatePublicApiTests(ScriptTestCase):
+    def test_adoption_appends_enum_member_and_constant(self):
+        repo = self.make_repo()
+
+        code, _, _ = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "#nullable enable\n"
+            f"Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_102_0 = {FakeRepo.NEXT_VALUE}"
+            " -> Aspire.Hosting.ApplicationModel.DocumentDBVersion\n"
+            'const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_102_0 = "0.102.0" -> string!\n',
+            repo.unshipped_file.read_text(encoding="utf-8"),
+        )
+
+    def test_existing_lines_are_not_duplicated(self):
+        path = self.temp_file("PublicAPI.Unshipped.txt", "#nullable enable")
+        version = _semver("0.102.0")
+
+        script.update_public_api(path, {version: 3}, [version])
+        script.update_public_api(path, {version: 3}, [version])
+
+        self.assertEqual(3, len(path.read_text(encoding="utf-8").splitlines()))
+
+    def test_rendered_lines_match_the_analyzer_files_for_every_shipped_version(self):
+        # Guards the line format against what PublicApiAnalyzers actually recorded, so a
+        # format drift fails here rather than as RS0016 on the next auto-PR.
+        declared = set()
+        for name in ("PublicAPI.Shipped.txt", "PublicAPI.Unshipped.txt"):
+            declared.update((REAL_PUBLIC_API_DIR / name).read_text(encoding="utf-8").splitlines())
+        assignments = script.parse_known_versions(REAL_VERSIONS_FILE)
+        path = self.temp_file("PublicAPI.Unshipped.txt", "")
+
+        script.update_public_api(path, assignments, sorted(assignments))
+
+        rendered = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(2 * len(assignments), len(rendered))
+        self.assertEqual([], [line for line in rendered if line not in declared])
 
 
 class BackfillHandlingTests(ScriptTestCase):
@@ -897,6 +974,291 @@ class AutoGeneratedRegionCountTests(ScriptTestCase):
             script.write_versions_file(source, dict(source.values))
 
         self.assertIn("found 5", str(ctx.exception))
+
+
+class DigestLockTests(ScriptTestCase):
+    """The lock is append-only: adoption adds tags, and a recorded mapping is never replaced."""
+
+    def lock_with(self, entries: dict) -> Path:
+        return self.temp_file("lock.json", json.dumps(entries))
+
+    def test_adoption_records_every_required_variant_in_tag_order(self):
+        repo = self.make_repo()
+        new = "0.102.0"
+
+        code, _, _ = repo.run_main([_semver(new)], _full_variants(new))
+
+        self.assertEqual(code, 0)
+        lock = json.loads(repo.lock_file.read_text(encoding="utf-8"))
+        self.assertEqual(list(lock), [f"pg{pg}-{new}" for pg in sorted(script.REQUIRED_PG_SET)])
+        self.assertEqual(lock[f"pg17-{new}"], _fake_digests(f"pg17-{new}"))
+
+    def test_resolution_failure_writes_nothing(self):
+        repo = self.make_repo()
+        before = repo.versions_text()
+        new = "0.102.0"
+
+        with mock.patch.object(script, "update_digest_lock", side_effect=RuntimeError("down")):
+            code, _, stderr = repo.run_main([_semver(new)], _full_variants(new))
+
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR recording image digests: down", stderr)
+        self.assertEqual(repo.versions_text(), before)
+
+    def test_changed_mapping_is_refused_and_the_lock_is_left_alone(self):
+        lock_file = self.lock_with({"pg17-0.1.0": _fake_digests("pg17-0.1.0", salt="old")})
+        before = lock_file.read_text(encoding="utf-8")
+
+        with mock.patch.object(script, "resolve_image_digests", side_effect=_fake_resolver), \
+                self.assertRaisesRegex(RuntimeError, "never replaced automatically"):
+            script.update_digest_lock(lock_file, "img", ["pg17-0.1.0", "pg17-0.2.0"])
+
+        self.assertEqual(lock_file.read_text(encoding="utf-8"), before)
+
+    def test_unchanged_mapping_is_kept_and_new_tags_are_appended_in_order(self):
+        lock_file = self.lock_with({"pg17-0.10.0": _fake_digests("pg17-0.10.0")})
+
+        with mock.patch.object(script, "resolve_image_digests", side_effect=_fake_resolver):
+            added = script.update_digest_lock(lock_file, "img", ["pg17-0.10.0", "pg15-0.9.0"])
+
+        self.assertEqual(added, ["pg15-0.9.0"])
+        self.assertEqual(list(json.loads(lock_file.read_text(encoding="utf-8"))), ["pg15-0.9.0", "pg17-0.10.0"])
+
+    def test_missing_tag_is_refused(self):
+        lock_file = self.lock_with({})
+
+        with mock.patch.object(script, "resolve_image_digests", return_value={"pg17-0.1.0": None}), \
+                self.assertRaisesRegex(RuntimeError, "no manifest"):
+            script.update_digest_lock(lock_file, "img", ["pg17-0.1.0"])
+
+    def test_malformed_lock_is_a_hard_error(self):
+        with self.assertRaisesRegex(RuntimeError, "well-formed index digest"):
+            script.load_digest_lock(self.lock_with({"pg17-0.1.0": {"index": "sha256:abc"}}))
+        with self.assertRaisesRegex(RuntimeError, "not a pgNN-X.Y.Z tag"):
+            script.load_digest_lock(self.lock_with({"latest": _fake_digests("latest")}))
+
+    def verify(self, lock: dict, resolved: dict) -> tuple[int, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(script, "DIGEST_LOCK_FILE", self.lock_with(lock)), \
+                mock.patch.object(script, "resolve_image_digests", return_value=resolved), \
+                mock.patch.dict(script.os.environ, {"GITHUB_ACTIONS": "true"}), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = script.main(["--verify-digests"])
+        return code, stdout.getvalue() + stderr.getvalue()
+
+    def test_verify_passes_when_every_tag_still_matches(self):
+        entry = _fake_digests("pg17-0.1.0")
+        code, output = self.verify({"pg17-0.1.0": entry}, {"pg17-0.1.0": entry})
+        self.assertEqual(code, 0)
+        self.assertIn("Verified 1 of 1", output)
+
+    def test_verify_fails_on_drift_and_on_a_missing_tag(self):
+        lock = {"pg17-0.1.0": _fake_digests("pg17-0.1.0"), "pg17-0.2.0": _fake_digests("pg17-0.2.0")}
+        resolved = {"pg17-0.1.0": _fake_digests("pg17-0.1.0", salt="repushed"), "pg17-0.2.0": None}
+
+        code, output = self.verify(lock, resolved)
+
+        self.assertEqual(code, 1)
+        self.assertIn("::error title=DocumentDB image digest drift::pg17-0.1.0 drifted", output)
+        self.assertIn("pg17-0.2.0 is no longer published", output)
+
+    def test_unknown_argument_is_a_usage_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(script.main(["--verify"]), 2)
+
+    def test_resolver_hashes_the_served_bytes_and_reads_platforms(self):
+        body = json.dumps({"manifests": [
+            {"digest": "sha256:" + "a" * 64, "platform": {"os": "linux", "architecture": "amd64"}},
+            {"digest": "sha256:" + "b" * 64, "platform": {"os": "unknown", "architecture": "unknown"}},
+        ]}).encode()
+
+        def get(url, headers):
+            if url.endswith("/pg17-0.2.0"):
+                raise script.urllib.error.HTTPError(url, 404, "not found", {}, None)
+            return body
+
+        with mock.patch.object(script, "_ghcr_token", return_value="t"), \
+                mock.patch.object(script, "_http_get_bytes", side_effect=get):
+            resolved = script.resolve_image_digests("img", ["pg17-0.1.0", "pg17-0.2.0"])
+
+        self.assertEqual(resolved["pg17-0.1.0"], {
+            "index": "sha256:" + hashlib.sha256(body).hexdigest(),
+            "linux/amd64": "sha256:" + "a" * 64,
+            "linux/arm64": None,
+        })
+        self.assertIsNone(resolved["pg17-0.2.0"])
+
+    def test_real_lock_is_well_formed_and_ordered(self):
+        lock = script.load_digest_lock(REAL_DIGEST_LOCK_FILE)
+        self.assertEqual(list(lock), sorted(lock, key=script._lock_sort_key))
+
+
+class GitHubOutputTests(ScriptTestCase):
+    """The adoption workflow composes its PR from these lines, so write them to a real file."""
+
+    def test_adoption_appends_new_and_all_versions(self):
+        repo = self.make_repo()
+        output = self.temp_file("github_output", "existing=1\n")
+
+        code, _, _ = repo.run_main(
+            [_semver("0.102.0")], _full_variants("0.102.0"), github_output=str(output))
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "existing=1\nnew_versions=0.102.0\nall_versions=0.100.0,0.101.0,0.102.0\n",
+            output.read_text(encoding="utf-8"),
+        )
+
+    def test_a_no_op_run_writes_nothing(self):
+        repo = self.make_repo()
+        output = self.temp_file("github_output", "")
+
+        repo.run_main([_semver("0.101.0")], _full_variants("0.101.0"), github_output=str(output))
+
+        self.assertEqual("", output.read_text(encoding="utf-8"))
+
+
+class _Upstream(http.server.BaseHTTPRequestHandler):
+    """Serves GitHub and GHCR from ``server.routes``: path-with-query -> (status, body, headers)."""
+
+    def do_GET(self):  # noqa: N802 - http.server's naming
+        self.server.requests.append((self.path, dict(self.headers)))
+        status, body, headers = self.server.routes.get(self.path, (404, {"message": "Not Found"}, {}))
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+class LocalUpstreamTests(ScriptTestCase):
+    """The real fetchers against a local HTTP server, so paging and HTTP errors are exercised."""
+
+    RELEASES = f"/repos/{script.GH_OWNER}/{script.GH_REPO}/releases?per_page=100"
+    TAGS = f"/v2/{script.GHCR_IMAGE_PATH}/tags/list?n=500"
+    TOKEN = f"/token?service=ghcr.io&scope=repository:{script.GHCR_IMAGE_PATH}:pull"
+
+    def setUp(self):
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
+        self.server.routes = {}
+        self.server.requests = []
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+        # Everything the script fetches goes to the local server, keeping path and query.
+        host = f"127.0.0.1:{self.server.server_address[1]}"
+        real_urlopen = urllib.request.urlopen
+
+        def urlopen(request, timeout=None):
+            parts = urllib.parse.urlsplit(request.full_url)
+            local = urllib.parse.urlunsplit(("http", host, parts.path, parts.query, ""))
+            return real_urlopen(urllib.request.Request(local, headers=dict(request.header_items())), timeout=timeout)
+
+        patcher = mock.patch.object(script.urllib.request, "urlopen", urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def serve(self, path, body, status=200, headers=None):
+        self.server.routes[path] = (status, body, headers or {})
+
+    def test_releases_are_paged_until_a_short_page(self):
+        # A full page of 100 means "there may be more"; drafts, prereleases and odd tags are
+        # skipped on every page.
+        first = [{"tag_name": f"v0.{minor}-0"} for minor in range(1, 98)]
+        first += [{"tag_name": "v0.98-0", "draft": True},
+                  {"tag_name": "v0.99-0", "prerelease": True},
+                  {"tag_name": "nightly"}]
+        self.serve(f"{self.RELEASES}&page=1", first)
+        self.serve(f"{self.RELEASES}&page=2", [{"tag_name": "v0.120-1"}])
+
+        with mock.patch.dict(script.os.environ, {"GITHUB_TOKEN": "gh-token"}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            versions = script.fetch_github_releases(script.GH_OWNER, script.GH_REPO)
+
+        self.assertEqual(98, len(versions))
+        self.assertIn(_semver("0.120.1"), versions)
+        self.assertNotIn(_semver("0.98.0"), versions)
+        self.assertNotIn(_semver("0.99.0"), versions)
+        self.assertEqual(2, len(self.server.requests))
+        self.assertTrue(all(h.get("Authorization") == "Bearer gh-token" for _, h in self.server.requests))
+
+    def test_ghcr_tags_follow_the_link_header_with_the_issued_token(self):
+        self.serve(self.TOKEN, {"token": "ghcr-token"})
+        self.serve(self.TAGS, {"tags": ["pg17-0.116.0", "pg16-0.116.0", "latest"]},
+                   headers={"Link": f'<{self.TAGS}&last=pg16-0.116.0>; rel="next"'})
+        self.serve(f"{self.TAGS}&last=pg16-0.116.0", {"tags": ["pg18-0.116.0", "pg17-0.114.0"]})
+
+        tags = script.fetch_ghcr_pg_tags(script.GHCR_IMAGE_PATH)
+
+        self.assertEqual({_semver("0.116.0"): {16, 17, 18}, _semver("0.114.0"): {17}}, tags)
+        tag_requests = [h for path, h in self.server.requests if path.startswith("/v2/")]
+        self.assertEqual(2, len(tag_requests))
+        self.assertTrue(all(h.get("Authorization") == "Bearer ghcr-token" for h in tag_requests))
+
+    def test_an_http_error_from_either_upstream_fails_the_run(self):
+        for broken in ("releases", "ghcr"):
+            with self.subTest(broken=broken):
+                self.server.routes.clear()
+                self.serve(f"{self.RELEASES}&page=1", [{"tag_name": "v0.102-0"}])
+                self.serve(self.TOKEN, {"token": "ghcr-token"})
+                self.serve(self.TAGS, {"tags": ["pg17-0.102.0"]})
+                if broken == "releases":
+                    self.serve(f"{self.RELEASES}&page=1", {"message": "boom"}, status=500)
+                else:
+                    self.serve(self.TOKEN, {"message": "denied"}, status=401)
+                repo = self.make_repo()
+                before = repo.versions_text()
+
+                code, _, stderr = repo.run_main(None, None, real_fetchers=True)
+
+                self.assertEqual(2, code)
+                self.assertIn("ERROR fetching", stderr)
+                self.assertEqual(before, repo.versions_text())
+
+
+class RealVersionsFileCompileTests(ScriptTestCase):
+    """The synthetic fixture cannot prove the rewrite still compiles against the real file's shape."""
+
+    def test_adopting_a_version_into_a_copy_of_the_real_file_still_compiles(self):
+        dotnet = shutil.which("dotnet")
+        self.assertIsNotNone(dotnet, "dotnet must be on PATH to compile the rewritten DocumentDBVersion.cs")
+
+        repo = self.make_repo()
+        shutil.copyfile(REAL_VERSIONS_FILE, repo.versions_file)
+        newest = max(script.parse_known_versions(REAL_VERSIONS_FILE))
+        candidate = script.SemVer(newest.major, newest.minor + 1, 0)
+
+        code, _, _ = repo.run_main([candidate], _full_variants(str(candidate)))
+        self.assertEqual(0, code)
+        member = candidate.enum_member
+        self.assertIn(f"DocumentDBVersion.{member} => {member},", repo.versions_text())
+
+        # Outside the repository, so none of its Directory.Build.* or package settings apply.
+        project = self.make_temp_dir()
+        sdk_major = subprocess.run([dotnet, "--version"], capture_output=True, text=True, check=True).stdout.split(".")[0]
+        (project / "Probe.csproj").write_text(
+            '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+            f"<TargetFramework>net{sdk_major}.0</TargetFramework>"
+            "<Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>"
+            "<TreatWarningsAsErrors>true</TreatWarningsAsErrors>"
+            "</PropertyGroup></Project>",
+            encoding="utf-8",
+        )
+        shutil.copyfile(repo.versions_file, project / "DocumentDBVersion.cs")
+
+        build = subprocess.run(
+            [dotnet, "build", str(project / "Probe.csproj"), "-nologo", "-v", "q"],
+            capture_output=True, text=True, cwd=project,
+            env={**os.environ, "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "DOTNET_NOLOGO": "1"},
+        )
+        self.assertEqual(0, build.returncode, build.stdout + build.stderr)
 
 
 if __name__ == "__main__":

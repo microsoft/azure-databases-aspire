@@ -212,6 +212,8 @@ class NuGetPackageValidationTests(unittest.TestCase):
         package_id: str = "Aspire.Hosting.DocumentDB",
         version: str = "1.2.3",
         filename: str | None = None,
+        metadata: str = "",
+        files: tuple[str, ...] = (),
     ) -> Path:
         package = self.artifacts / (filename or f"{package_id}.{version}.nupkg")
         nuspec = f"""<?xml version="1.0"?>
@@ -219,12 +221,78 @@ class NuGetPackageValidationTests(unittest.TestCase):
   <metadata>
     <id>{package_id}</id>
     <version>{version}</version>
+    {metadata}
   </metadata>
 </package>
 """
         with zipfile.ZipFile(package, "w") as archive:
             archive.writestr(f"{package_id}.nuspec", nuspec)
+            for name in files:
+                archive.writestr(name, "x")
         return package
+
+    def create_project(self) -> Path:
+        project_dir = self.artifacts / "project"
+        project_dir.mkdir()
+        (self.artifacts / "Directory.Build.props").write_text(
+            "<Project><PropertyGroup><DefaultTargetFramework>net10.0</DefaultTargetFramework>"
+            "</PropertyGroup></Project>",
+            encoding="utf-8",
+        )
+        project = project_dir / "Pkg.csproj"
+        project.write_text(
+            """<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>$(DefaultTargetFramework)</TargetFramework>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="$(SharedDir)icon.png" Pack="true" PackagePath="\\" />
+    <None Include="README.md" Pack="true" PackagePath="\\" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="\\" />
+    <None Include="../../docs/**/*.md" Pack="true" PackagePath="docs/" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting" />
+    <PackageReference Include="MinVer" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
+""",
+            encoding="utf-8",
+        )
+        return project
+
+    def create_complete_package(
+        self, *, version: str = "1.2.3", replace: dict[str, str] | None = None, drop: str = ""
+    ) -> Path:
+        metadata = {
+            "license": '<license type="expression">MIT</license>',
+            "icon": "<icon>icon.png</icon>",
+            "readme": "<readme>README.md</readme>",
+            "dependencies": (
+                '<dependencies><group targetFramework="net10.0">'
+                '<dependency id="Aspire.Hosting" version="1.0.0" />'
+                "</group></dependencies>"
+            ),
+        } | (replace or {})
+        files = (
+            "lib/net10.0/Aspire.Hosting.DocumentDB.dll",
+            "lib/net10.0/Aspire.Hosting.DocumentDB.xml",
+            "icon.png",
+            "README.md",
+            "LICENSE",
+        )
+        return self.create_package(
+            version=version,
+            metadata="".join(metadata.values()),
+            files=tuple(name for name in files if name != drop),
+        )
+
+    def assert_contents_rejected(self, package: Path, message: str) -> None:
+        with self.assertRaisesRegex(script.ValidationError, message):
+            script.validate_package_contents(package, "Aspire.Hosting.DocumentDB", self.create_project())
 
     def test_accepts_package_style_tag_matching_nuspec_version(self):
         package = self.create_package()
@@ -271,14 +339,88 @@ class NuGetPackageValidationTests(unittest.TestCase):
             script.validate_package(self.artifacts)
 
     def test_empty_tag_is_a_successful_non_publishing_validation(self):
-        self.create_package(version="0.0.0-alpha.1")
+        self.create_complete_package(version="0.0.0-alpha.1")
+        project = self.create_project()
         stdout = io.StringIO()
 
         with contextlib.redirect_stdout(stdout):
-            exit_code = script.main(["--artifacts", str(self.artifacts), "--tag", ""])
+            exit_code = script.main(
+                ["--artifacts", str(self.artifacts), "--tag", "", "--project", str(project)]
+            )
 
         self.assertEqual(0, exit_code)
         self.assertIn("publishing remains disabled", stdout.getvalue())
+
+
+    def test_complete_package_contents_are_accepted(self):
+        package = self.create_complete_package()
+
+        script.validate_package_contents(package, "Aspire.Hosting.DocumentDB", self.create_project())
+
+    def test_missing_xml_documentation_is_rejected(self):
+        self.assert_contents_rejected(
+            self.create_complete_package(drop="lib/net10.0/Aspire.Hosting.DocumentDB.xml"),
+            r"missing lib/net10\.0/Aspire\.Hosting\.DocumentDB\.xml",
+        )
+
+    def test_missing_packed_root_file_is_rejected(self):
+        self.assert_contents_rejected(
+            self.create_complete_package(drop="LICENSE"), "missing packed file 'LICENSE'"
+        )
+
+    def test_readme_not_referenced_by_nuspec_is_rejected(self):
+        self.assert_contents_rejected(
+            self.create_complete_package(replace={"readme": ""}), "nuspec readme is None"
+        )
+
+    def test_license_other_than_project_expression_is_rejected(self):
+        self.assert_contents_rejected(
+            self.create_complete_package(
+                replace={"license": '<license type="file">LICENSE</license>'}
+            ),
+            "nuspec license must be the expression 'MIT'",
+        )
+
+    def test_missing_public_dependency_is_rejected(self):
+        self.assert_contents_rejected(
+            self.create_complete_package(
+                replace={"dependencies": '<dependencies><group targetFramework="net10.0" /></dependencies>'}
+            ),
+            "dependency 'Aspire.Hosting' is missing",
+        )
+
+    def test_private_dependency_must_not_ship(self):
+        self.assert_contents_rejected(
+            self.create_complete_package(
+                replace={
+                    "dependencies": (
+                        '<dependencies><group targetFramework="net10.0">'
+                        '<dependency id="Aspire.Hosting" version="1.0.0" />'
+                        '<dependency id="MinVer" version="7.0.0" />'
+                        "</group></dependencies>"
+                    )
+                }
+            ),
+            "private dependency 'MinVer' must not ship",
+        )
+
+    def test_unexpected_target_framework_is_rejected(self):
+        package = self.create_complete_package()
+        with zipfile.ZipFile(package, "a") as archive:
+            archive.writestr("lib/net9.0/Aspire.Hosting.DocumentDB.dll", "x")
+
+        self.assert_contents_rejected(package, "lib/ must contain exactly 'net10.0'")
+
+    def test_expectations_are_read_from_the_real_project(self):
+        expected = script.read_project_expectations(
+            REPO_ROOT / "src" / "Aspire.Hosting.DocumentDB" / "Aspire.Hosting.DocumentDB.csproj"
+        )
+
+        self.assertRegex(expected["tfm"], r"^net\d+\.\d+$")
+        self.assertEqual("MIT", expected["license"])
+        self.assertIn("Aspire.Hosting", expected["public_dependencies"])
+        self.assertIn("MinVer", expected["private_dependencies"])
+        self.assertTrue({"README.md", "LICENSE", expected["icon"]} <= expected["root_files"])
 
 
 class NuGetPublishWorkflowTests(unittest.TestCase):

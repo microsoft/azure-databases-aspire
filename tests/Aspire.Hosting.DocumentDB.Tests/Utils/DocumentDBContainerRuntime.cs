@@ -37,6 +37,13 @@ internal sealed record ContainerRuntimeDescription(string OperatingSystem, bool 
 /// </remarks>
 internal static class DocumentDBContainerRuntime
 {
+    /// <summary>
+    /// The CLI the helpers shell out to: the runtime Aspire is told to use, so a Podman run never
+    /// has half its containers created by Docker.
+    /// </summary>
+    public static string Executable { get; } =
+        Environment.GetEnvironmentVariable("DOTNET_ASPIRE_CONTAINER_RUNTIME") is { Length: > 0 } runtime ? runtime : "docker";
+
     /// <summary>The value Docker Desktop puts in <c>docker info</c>'s <c>OperatingSystem</c> field.</summary>
     internal const string DockerDesktopOperatingSystem = "Docker Desktop";
 

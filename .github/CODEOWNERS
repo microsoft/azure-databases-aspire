@@ -1,0 +1,9 @@
+# What decides whether a change is gated: workflows, test selection, coverage floors, API baselines.
+/.github/                                        @guanzhousongmicrosoft
+/eng/                                            @guanzhousongmicrosoft
+/tests/Aspire.Hosting.DocumentDB.Tests/*.csproj  @guanzhousongmicrosoft
+/tests/Aspire.Hosting.DocumentDB.Tests/TestSelectionGuardTests.cs  @guanzhousongmicrosoft
+/tests/Aspire.Hosting.DocumentDB.Tests/WorkflowContractTests.cs  @guanzhousongmicrosoft
+/src/Aspire.Hosting.DocumentDB/PublicAPI.*.txt   @guanzhousongmicrosoft
+/Directory.Build.*                               @guanzhousongmicrosoft
+/Directory.Packages.props                        @guanzhousongmicrosoft

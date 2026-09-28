@@ -7,16 +7,44 @@ on:
   workflow_dispatch:
 
 permissions:
+  checks: read
   contents: write
+
+# Never cancel a release midway; a second run for the same ref waits instead.
+concurrency:
+  group: nuget-publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Verify release evidence
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error title=Release refused::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main."
+            exit 1
+          fi
+          passed=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=ci-gate" \
+            --jq '[.check_runs[] | select(.status == "completed" and .conclusion == "success")] | length')
+          if [ "$passed" -eq 0 ]; then
+            echo "::error title=Release refused::$GITHUB_SHA has no successful ci-gate check run. Re-run this workflow once Build and Test passes on it."
+            exit 1
+          fi
+
+      - name: Extract release notes
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: python3 eng/scripts/extract-release-notes.py --changelog CHANGELOG.md --tag "$GITHUB_REF_NAME" --output release-notes.md
 
       - name: Setup .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
@@ -55,37 +83,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          tag = os.environ["GITHUB_REF_NAME"]
-          version = tag.removeprefix("v")
-          lines = Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
-
-          start = None
-          heading = re.compile(rf"^## \[{re.escape(version)}\](?: - .*)?$")
-          next_heading = re.compile(r"^## \[")
-          for index, line in enumerate(lines):
-              if heading.match(line):
-                  start = index + 1
-                  break
-
-          notes = []
-          if start is not None:
-              for line in lines[start:]:
-                  if next_heading.match(line):
-                      break
-                  notes.append(line)
-
-          notes_text = "\n".join(notes).strip()
-          if not notes_text:
-              notes_text = f"Release {tag}."
-
-          Path("release-notes.md").write_text(notes_text + "\n", encoding="utf-8")
-          PY
-
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
           else
