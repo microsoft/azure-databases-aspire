@@ -16,7 +16,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-and-test.yml
+    with:
+      release: true
+
+  # Not in the ci-gate suite, so run it here rather than drop it from releases.
+  nightly-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Nightly tests
+        run: >-
+          dotnet test tests/Aspire.Hosting.DocumentDB.Tests/Aspire.Hosting.DocumentDB.Tests.csproj
+          --filter "Category=Nightly" --logger trx --results-directory TestResults
+
+      - name: Check test results
+        run: python3 eng/scripts/check-test-results.py TestResults
+
   publish:
+    needs: [test, nightly-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -56,9 +87,6 @@ jobs:
 
       - name: Build
         run: dotnet build azure-databases-aspire.sln -c Release --no-restore
-
-      - name: Test
-        run: dotnet test azure-databases-aspire.sln -c Release --no-build
 
       - name: Pack
         run: dotnet pack src/Aspire.Hosting.DocumentDB/Aspire.Hosting.DocumentDB.csproj -c Release --no-build -o ./artifacts
