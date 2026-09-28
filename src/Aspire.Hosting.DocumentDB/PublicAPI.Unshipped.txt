@@ -1,1 +1,3 @@
 #nullable enable
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_117_0 = 8 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_117_0 = "0.117.0" -> string!

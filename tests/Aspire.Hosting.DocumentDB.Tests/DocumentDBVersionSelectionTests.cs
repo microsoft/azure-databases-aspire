@@ -39,6 +39,7 @@ public class DocumentDBVersionSelectionTests
         { DocumentDBVersion.V0_113_0, "pg17-0.113.0" },
         { DocumentDBVersion.V0_114_0, "pg17-0.114.0" },
         { DocumentDBVersion.V0_116_0, "pg17-0.116.0" },
+        { DocumentDBVersion.V0_117_0, "pg17-0.117.0" },
     };
 
     [Fact]

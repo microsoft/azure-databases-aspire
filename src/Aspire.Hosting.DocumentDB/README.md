@@ -122,7 +122,7 @@ configured through `WithInitData(...)`.
 For curated images 0.112.0 and older, built-in sample initialization is enabled
 by default, so `WithoutUserCreation()` must be paired with
 `WithoutSampleData()` on a fresh container. From 0.113.0 onward, including
-0.116.0, built-in sample initialization is opt-in and a fresh container can
+0.117.0, built-in sample initialization is opt-in and a fresh container can
 remain running without creating the user when no initialization requiring those
 credentials is requested. Generated connection strings still will not
 authenticate unless that user already exists, typically in persisted storage

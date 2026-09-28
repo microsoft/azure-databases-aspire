@@ -20,7 +20,7 @@ docker info
 **Symptom:** Timeout or network error pulling `ghcr.io/documentdb/documentdb/documentdb-local`.
 
 **Solution:**
-1. Verify network connectivity: `docker pull ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0`
+1. Verify network connectivity: `docker pull ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0`
 2. Check if you need to authenticate to GitHub Container Registry (public images should not require auth)
 3. If behind a corporate proxy, configure Docker's proxy settings
 
@@ -42,7 +42,7 @@ Common causes:
 - Port already in use (see [Port conflicts](#port-conflicts) below)
 - Insufficient Docker resources (memory, disk)
 - Corrupted data volume (remove the volume and restart)
-- A username beginning with a reserved DocumentDB `0.116.0` prefix (`documentdb`, `citus`, `pg`, or `internal_role`)
+- A username beginning with a prefix DocumentDB `0.116.0` and later reserve (`documentdb`, `citus`, `pg`, or `internal_role`)
 
 ### The container image changed after it was sealed
 
@@ -53,7 +53,7 @@ DocumentDB resource 'documentdb' changed the container image it will run after t
 package sealed it: the image reference it will run changed. Aspire snapshots a
 container's image into the DCP container spec while it prepares resources, ...
 Sealed reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.111.0'.
-Current reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0'.
+Current reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0'.
 ```
 
 The clause after the colon says what changed: `the image reference it will run changed`,
@@ -106,7 +106,7 @@ manifest is written from the model as usual.
 **Symptom:** `UseTls(false)` is set, but the client or health check cannot connect to the container.
 
 **Causes and solutions:**
-1. **Container image is older than `0.114.0`.** Images up to and including `0.113.0` always enforced TLS on the gateway and rejected plain connections, regardless of the `TLS_MODE` setting. Use the default (`0.116.0`) image tag, another `0.114.0` or newer image, or keep TLS enabled in the connection string.
+1. **Container image is older than `0.114.0`.** Images up to and including `0.113.0` always enforced TLS on the gateway and rejected plain connections, regardless of the `TLS_MODE` setting. Use the default (`0.117.0`) image tag, another `0.114.0` or newer image, or keep TLS enabled in the connection string.
 2. **`TLS_MODE` is set to `requireTLS`.** This makes the container reject plain connections by design, which contradicts `UseTls(false)`. Remove the environment variable to fall back to the default `allowTLS` (accepts both plain and TLS connections), or re-enable TLS with `UseTls(true)`.
 
    ```csharp
@@ -127,7 +127,7 @@ manifest is written from the model as usual.
 
 > [!IMPORTANT]
 > This integration registers an authenticated MongoDB `ping` health check. It proves that the
-> gateway is accepting authenticated requests, but on DocumentDB `0.116.0` the gateway can become
+> gateway is accepting authenticated requests, but from DocumentDB `0.116.0` the gateway can become
 > reachable before one-shot custom or sample initialization has completed. A dependent resource
 > that requires seeded data should still retry that data access rather than treating `WaitFor` as
 > proof that initialization scripts have finished.
@@ -244,9 +244,10 @@ entrypoint.
 1. Confirm the collector is reachable from *inside* the container network and that you passed an
    explicit `endpoint:`. The gateway default (`http://localhost:4317`) resolves to the DocumentDB
    container itself.
-2. Check the gateway startup line in the container logs. It prints the resolved configuration; on
-   `0.116.0` and later a working setup shows `metrics: None` inside `telemetry_options`, meaning
-   the JSON no longer pins anything about metrics and the environment decides.
+2. Check the gateway startup line in the container logs. It prints the configuration file it read.
+   A working setup has no metrics section there, meaning the JSON no longer pins anything about
+   metrics and the environment decides: `metrics: None` inside `telemetry_options` on `0.116.0`,
+   and no `"Metrics"` key inside `telemetry_provider_options` from `0.117.0`.
 3. `aspire-documentdb -- ...` on the first lines of the container log means the wrapper could not
    read the gateway configuration or could not find `jq`. The wrapper only ever applies to the
    official `documentdb/documentdb-local` image path, so this means a mirror or re-tag reuses that
@@ -519,7 +520,7 @@ then never becomes healthy and exits `1` about a minute later with `PostgreSQL f
 
 **Symptom:** A custom initialization script mounted with `WithInitData(...)` failed or was corrected, but later runs log `Custom data already initialized ...; skipping` or `a previous custom data initialization was attempted but its success was not recorded` and the data never appears.
 
-**Cause:** DocumentDB `0.116.0` makes initialization one-shot per data directory. Markers under `<data-path>/.documentdb-local/` (`custom_data_attempted`, `custom_data_succeeded`, `sample_data_initialized`) live inside the persisted data, so they survive restarts, `docker compose down && up`, host reboots, and volume backups. The attempt marker is written *before* the first user script runs, so a non-idempotent script that failed part way is never retried — re-running it against half-seeded data caused restart loops.
+**Cause:** From `0.116.0`, DocumentDB makes initialization one-shot per data directory. Markers under `<data-path>/.documentdb-local/` (`custom_data_attempted`, `custom_data_succeeded`, `sample_data_initialized`) live inside the persisted data, so they survive restarts, `docker compose down && up`, host reboots, and volume backups. The attempt marker is written *before* the first user script runs, so a non-idempotent script that failed part way is never retried — re-running it against half-seeded data caused restart loops.
 
 **Solution:** Fix the scripts, then start against a **fresh** data directory — a new volume name, or `docker volume rm <name>` / an emptied bind-mount directory. Editing script contents alone never re-triggers initialization. Writing idempotent scripts avoids the problem in the first place.
 
@@ -587,7 +588,7 @@ DocumentDB container logs can help diagnose startup and runtime issues:
 ## Known limitations
 
 - **Health readiness is gateway readiness.** The built-in authenticated MongoDB health check does
-  not prove that DocumentDB `0.116.0` one-shot initialization scripts have completed.
+  not prove that DocumentDB `0.116.0`-and-later one-shot initialization scripts have completed.
 - **`WithDataBindMount()` does not restart on Docker Desktop.** Docker Desktop's host file sharing applies ownership changes to bind-mounted paths asynchronously — measured on macOS/VirtioFS, and expected on its other hosts — and PostgreSQL reads the stale owner and refuses the data directory. Use `WithDataVolume()` there — see [Bind-mounted data fails to restart on Docker Desktop](#bind-mounted-data-fails-to-restart-on-docker-desktop).
 - **No built-in backup/restore.** For development data, use `WithDataVolume()` for persistence. For important data, use `mongodump` / `mongorestore` manually.
 - **Single server only.** The extension does not support replica sets or sharded clusters. It runs a single DocumentDB container intended for local development.

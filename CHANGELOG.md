@@ -10,6 +10,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
+## [0.117.0] - 2026-09-28
+
+### Added
+- `DocumentDBVersion.V0_117_0` curated enum member and `DocumentDBVersions.V0_117_0 = "0.117.0"` constant.
+
+### Changed
+- `DocumentDBVersions.Latest` and the default `documentdb-local` image now resolve to `0.117.0` and `ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0`. Upstream user-visible changes include collation-aware `$group` keys and `$min`/`$max` expressions, a fix for a backend crash in parallel `$min`/`$max`/`$first`/`$last` aggregation, and several RUM index vacuum and scan fixes. The `0.116.0` data-directory lock, `/data` image volume, one-shot initialization, and reserved username prefixes carry over unchanged.
+- Upstream cut `v0.117-0` from a branch that does not contain `0.116.0`'s `lz4` TOAST default. New out-of-line values go back to PostgreSQL's `pglz`; values `0.116.0` already wrote with `lz4` stay readable. The `--toast-compression` argument and `DOCUMENTDB_TOAST_COMPRESSION` variable are gone too: on `0.117.0` the argument stops the container with `Unknown option --toast-compression`, and the variable is ignored. Remove them, or pin `DocumentDBVersion.V0_116_0` to keep lz4.
+- The gateway metric `db.client.operation.duration.total`, a summed counter, is now the histogram `db.client.operation.duration`. Dashboards or alerts built on the old name need updating.
+- Built-in sample data, when requested with `INIT_DATA=true`, now loads the `StoreData` database (`stores`, 41,505 documents, and `ratings`) instead of `sampledb`.
+- Documented that a persisted data directory moved to a newer image keeps its old DocumentDB extension catalog until `ALTER EXTENSION ... UPDATE` is run. See [Moving persisted data to a newer image](docs/configuration.md#moving-persisted-data-to-a-newer-image). Docker-backed tests cover the move from `0.114.0` and `0.116.0` to `0.117.0`, including the catalog update.
+
 ## [0.116.0] - 2026-09-01
 
 ### Added

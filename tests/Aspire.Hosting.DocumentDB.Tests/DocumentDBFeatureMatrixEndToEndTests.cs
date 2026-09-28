@@ -36,7 +36,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Collection(DocumentDBFeatureMatrixAppHostCollection.Name)]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
-    private const string ReleasedVersion = DocumentDBVersions.V0_116_0;
+    private const string ReleasedVersion = DocumentDBVersions.V0_117_0;
     private const string QuietWindowControlMarker = "[ASPIRE-TEST] quiet-window-control";
     private static readonly Regex GatewayDebugInsertRegex = new(
         @"DEBUG[^\r\n]*documentdb_api\.insert",
@@ -338,11 +338,17 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     private const string UpgradeIndexName = "version_unique";
 
-    [Fact]
+    [Theory]
     [Trait("Shard", "2")]
-    public async Task PersistedPg17DataUpgradesFrom0114To0116()
+    // 0.116.0 compressed large values with lz4, which 0.117.0 no longer defaults to.
+    [InlineData("0.114.0", "pglz")]
+    [InlineData("0.116.0", "lz4")]
+    public async Task PersistedPg17DataUpgradesToTheReleasedVersion(string sourceVersion, string sourceCompression)
     {
         RequireDocker();
+
+        // Large and compressible, so PostgreSQL stores it compressed rather than inline.
+        var payload = string.Concat(Enumerable.Repeat("documentdb-", 20_000));
 
         using var cts = CreateEndToEndTimeoutSource();
         var volumeName = $"aspire-documentdb-upgrade-{Guid.NewGuid():N}";
@@ -352,7 +358,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             using (var scenario = new EnvironmentScope(
                        (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
-                       (AppHost.ImageTagEnvironmentVariable, "pg17-0.114.0")))
+                       (AppHost.ImageTagEnvironmentVariable, $"pg17-{sourceVersion}")))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
@@ -365,8 +371,21 @@ public class DocumentDBFeatureMatrixEndToEndTests
                         new CreateIndexOptions { Name = UpgradeIndexName, Unique = true }),
                     cancellationToken: cts.Token);
                 await collection.InsertOneAsync(
-                    new BsonDocument { ["_id"] = "pre-upgrade", ["version"] = "0.114.0" },
+                    new BsonDocument { ["_id"] = "pre-upgrade", ["version"] = sourceVersion, ["payload"] = payload },
                     cancellationToken: cts.Token);
+
+                var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+                var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+                var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+                var collectionId = await QueryBundledPostgresAsync(
+                    containerId,
+                    "SELECT collection_id FROM documentdb_api_catalog.collections " +
+                    "WHERE database_name = 'appdb' AND collection_name = 'upgrade'");
+                Assert.Equal(
+                    sourceCompression,
+                    await QueryBundledPostgresAsync(
+                        containerId,
+                        $"SELECT pg_column_compression(document) FROM documentdb_data.documents_{int.Parse(collectionId)}"));
 
                 await app.StopAsync(cts.Token);
             }
@@ -381,25 +400,42 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
                 var collection = database.GetCollection<BsonDocument>("upgrade");
 
-                var existing = await collection
-                    .Find(Builders<BsonDocument>.Filter.Eq("_id", "pre-upgrade"))
-                    .SingleOrDefaultAsync(cts.Token);
-                Assert.NotNull(existing);
+                await AssertPayloadAsync(collection, payload, cts.Token);
 
                 await collection.InsertOneAsync(
                     new BsonDocument { ["_id"] = "post-upgrade", ["version"] = ReleasedVersion },
                     cancellationToken: cts.Token);
+
+                // The image never updates the SQL catalog of an existing cluster, so the new
+                // binaries serve the old catalog until someone runs ALTER EXTENSION ... UPDATE.
+                // That is the step the docs tell users to take; prove it works on real data.
+                var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+                var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
+                var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
+                Assert.Equal(
+                    ToCatalogVersion(sourceVersion),
+                    await QueryBundledPostgresAsync(containerId, "SELECT extversion FROM pg_extension WHERE extname = 'documentdb'"));
+
+                await QueryBundledPostgresAsync(
+                    containerId,
+                    "ALTER EXTENSION documentdb_core UPDATE; ALTER EXTENSION documentdb UPDATE; " +
+                    "ALTER EXTENSION documentdb_extended_rum UPDATE;");
+                Assert.Equal(
+                    ToCatalogVersion(ReleasedVersion),
+                    await QueryBundledPostgresAsync(containerId, "SELECT extversion FROM pg_extension WHERE extname = 'documentdb'"));
+
+                await AssertPayloadAsync(collection, payload, cts.Token);
                 Assert.Equal(
                     2,
                     await collection.CountDocumentsAsync(FilterDefinition<BsonDocument>.Empty, cancellationToken: cts.Token));
 
-                // The secondary index made on 0.114.0 survives the upgrade and is still enforced.
+                // The secondary index made before the upgrade survives it and is still enforced.
                 using var indexes = await collection.Indexes.ListAsync(cts.Token);
                 Assert.Contains(
                     await indexes.ToListAsync(cts.Token),
                     index => index["name"].AsString == UpgradeIndexName && index["unique"].ToBoolean());
                 var duplicate = await Assert.ThrowsAsync<MongoWriteException>(() => collection.InsertOneAsync(
-                    new BsonDocument { ["_id"] = "duplicate", ["version"] = "0.114.0" },
+                    new BsonDocument { ["_id"] = "duplicate", ["version"] = sourceVersion },
                     cancellationToken: cts.Token));
                 Assert.Equal(ServerErrorCategory.DuplicateKey, duplicate.WriteError.Category);
 
@@ -410,11 +446,41 @@ public class DocumentDBFeatureMatrixEndToEndTests
         {
             await RemoveVolumeAsync(volumeName);
         }
+
+        static async Task AssertPayloadAsync(IMongoCollection<BsonDocument> collection, string expected, CancellationToken cancellationToken)
+        {
+            var document = await collection
+                .Find(Builders<BsonDocument>.Filter.Eq("_id", "pre-upgrade"))
+                .SingleOrDefaultAsync(cancellationToken);
+            Assert.NotNull(document);
+            Assert.True(document["payload"].AsString == expected, "The persisted payload changed across the upgrade.");
+        }
+    }
+
+    // "0.117.0" is catalog version "0.117-0".
+    private static string ToCatalogVersion(string version)
+    {
+        var parsed = Version.Parse(version);
+        return $"{parsed.Major}.{parsed.Minor}-{parsed.Build}";
+    }
+
+    /// <summary>
+    /// Runs SQL against the container's own PostgreSQL as the bundled owner role and returns the
+    /// last output line, so a caller does not need a published PostgreSQL endpoint.
+    /// </summary>
+    private static async Task<string> QueryBundledPostgresAsync(string containerId, string sql)
+    {
+        var (exitCode, output) = await RunDockerAsync(
+            "exec", containerId,
+            "psql", "-X", "-v", "ON_ERROR_STOP=1", "-p", "9712", "-h", "localhost", "-U", "documentdb",
+            "-d", "postgres", "-tA", "-c", sql);
+        Assert.True(exitCode == 0, $"psql failed with exit code {exitCode}: {output}");
+        return output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault() ?? string.Empty;
     }
 
     [Fact]
     [Trait("Shard", "2")]
-    public async Task CustomInitializationRunsOnlyOnceForAPersisted0116Volume()
+    public async Task CustomInitializationRunsOnlyOnceForAPersistedReleasedVolume()
     {
         RequireDocker();
 
@@ -517,9 +583,8 @@ public class DocumentDBFeatureMatrixEndToEndTests
         string scenarioName,
         string expectedTag)
     {
-        // The pinned 0.116 theory below covers the released PG15-PG18 matrix. These explicit
-        // 0.114 pins preserve the legacy controls that existed before 0.116 became the default,
-        // proving the older PG15/PG16 images still exist and serve traffic.
+        // The released-version theory below covers the PG15-PG18 matrix. These explicit 0.114
+        // pins keep proving that older PG15/PG16 images still exist and serve traffic.
         RequireDocker();
 
         using var cts = CreateEndToEndTimeoutSource();
@@ -550,7 +615,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [InlineData(AppHost.Pg16Scenario, 16)]
     [InlineData(AppHost.Pg17Scenario, 17)]
     [InlineData(AppHost.Pg18Scenario, 18)]
-    public async Task Every0116PostgresVariantResolvesToARealImageAndServesTraffic(string scenarioName, int postgresVersion)
+    public async Task EveryReleasedPostgresVariantResolvesToARealImageAndServesTraffic(string scenarioName, int postgresVersion)
     {
         RequireDocker();
 
@@ -650,7 +715,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [Theory]
     [Trait("Shard", "3")]
     [InlineData("pg17-0.114.0", "pg17-0.114.0")]
-    [InlineData(null, "pg17-0.116.0")]
+    [InlineData(null, "pg17-0.117.0")]
     public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
     {
         RequireDocker();
@@ -700,7 +765,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Fact]
     [Trait("Shard", "3")]
-    public async Task QuietLogLevelSuppresses0116GatewayOutput()
+    public async Task QuietLogLevelSuppressesReleasedGatewayOutput()
     {
         RequireDocker();
 
@@ -750,7 +815,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Fact]
     [Trait("Shard", "1")]
-    public async Task OpenTelemetryMetricsAreExportedFrom0116()
+    public async Task OpenTelemetryMetricsAreExportedFromTheReleasedImage()
     {
         RequireDocker();
 
@@ -801,7 +866,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             Assert.DoesNotContain(".TelemetryOptions.Metrics.", command[1], StringComparison.Ordinal);
 
             // Without the wrapper the shipped SetupConfiguration.json would still pin metrics off,
-            // and the gateway would report telemetry_options carrying a Metrics section.
+            // and the gateway would report a Metrics section in its telemetry configuration.
             var gatewayLogs = await WaitForContainerLogAsync(
                 containerId,
                 "Starting server with configuration",
@@ -809,10 +874,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
             // The metrics object is gone from the JSON entirely, so the OTEL_* variables decide;
             // the identity keys go with it because the scenario supplies serviceName and
             // serviceVersion explicitly.
-            Assert.Contains(
-                "service_name: None, service_version: None, metrics: None",
-                gatewayLogs,
-                StringComparison.Ordinal);
+            var telemetry = GatewayTelemetryConfigurationLog.Parse(gatewayLogs);
+            Assert.False(telemetry.HasMetricsSection, telemetry.ToString());
+            Assert.Null(telemetry.ServiceName);
+            Assert.Null(telemetry.ServiceVersion);
 
             // The round trip above is what produces the per-operation metrics, and they have to
             // arrive under the configured service identity, not merely somewhere in the file.
@@ -847,7 +912,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var cts = CreateEndToEndTimeoutSource();
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryWrapperArgumentOrderScenario),
-            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -897,7 +962,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryAliasedTemporaryRootScenario),
             (AppHost.BindMountPathEnvironmentVariable, bindMountPath),
-            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         try
         {
@@ -1309,7 +1374,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryTemporaryDataPathScenario),
             (AppHost.OtelEnabledEnvironmentVariable, enabled.ToString()),
-            (AppHost.ImageTagEnvironmentVariable, "pg17-0.116.0"));
+            (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)));
 
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cts.Token);
         await using var app = await appHost.BuildAsync(cts.Token);
@@ -1471,17 +1536,13 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
             // The published entrypoint has to leave the gateway with no JSON metrics pin, while
             // the tracing block this package does not manage stays exactly as shipped.
-            Assert.Contains("metrics: None", logs, StringComparison.Ordinal);
-            Assert.Contains("tracing: Some(TracingOptions { enabled: Some(false)", logs, StringComparison.Ordinal);
+            var telemetry = GatewayTelemetryConfigurationLog.Parse(logs);
+            Assert.False(telemetry.HasMetricsSection, telemetry.ToString());
+            Assert.False(telemetry.TracingEnabled, telemetry.ToString());
 
             // Identity is only taken from the caller when the caller asked for it; otherwise the
             // configuration file keeps the value it shipped with.
-            Assert.Contains(
-                serviceName is null
-                    ? "service_name: Some(\"documentdb_gateway\")"
-                    : "service_name: None",
-                logs,
-                StringComparison.Ordinal);
+            Assert.Equal(serviceName is null ? "documentdb_gateway" : null, telemetry.ServiceName);
 
             // gateway.starts is emitted once the gateway is ready, so it needs no database
             // traffic and cannot be produced by anything other than a live metrics pipeline.
@@ -1640,11 +1701,12 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
             // The caller's file really is the source the wrapper derived from: its service name
             // survives because no serviceName override was supplied.
-            Assert.Contains("service_name: Some(\"aspire-custom-config\")", logs, StringComparison.Ordinal);
+            var telemetry = GatewayTelemetryConfigurationLog.Parse(logs);
+            Assert.Equal("aspire-custom-config", telemetry.ServiceName);
 
             // ...and the Metrics object that declared Enabled: true is gone, so the environment
             // decides.
-            Assert.Contains("metrics: None", logs, StringComparison.Ordinal);
+            Assert.False(telemetry.HasMetricsSection, telemetry.ToString());
 
             await WaitForContainerLogAsync(containerName, "Gateway is ready", cts.Token);
 
@@ -1788,17 +1850,20 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [Trait("Shard", "3")]
     public async Task PostgresEndpointOn0114HonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
     {
-        await AssertPostgresExtrasAsync("pg17-0.114.0", assertLz4: false);
+        await AssertPostgresExtrasAsync("pg17-0.114.0");
     }
 
-    [Fact]
+    [Theory]
     [Trait("Shard", "3")]
-    public async Task PostgresEndpointOn0116UsesLz4ToastCompression()
+    // 0.116.0 defaulted TOAST compression to lz4; 0.117.0 was cut without that change.
+    [InlineData("pg17-0.116.0", "lz4")]
+    [InlineData("pg17-0.117.0", "pglz")]
+    public async Task PostgresEndpointReportsTheImageToastCompressionDefault(string imageTag, string expected)
     {
-        await AssertPostgresExtrasAsync(ReleasedTag(17), assertLz4: true);
+        await AssertPostgresExtrasAsync(imageTag, expected);
     }
 
-    private static async Task AssertPostgresExtrasAsync(string? imageTag, bool assertLz4)
+    private static async Task AssertPostgresExtrasAsync(string? imageTag, string? expectedToastCompression = null)
     {
         RequireDocker();
 
@@ -1847,19 +1912,19 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         Assert.Equal(0L, Convert.ToInt64(accessMethods));
 
-        if (assertLz4)
+        if (expectedToastCompression is not null)
         {
             var toastCompression = await QueryPostgresAsync(
                 postgresConnectionString!,
                 "SHOW default_toast_compression",
                 cts.Token);
-            Assert.Equal("lz4", Convert.ToString(toastCompression));
+            Assert.Equal(expectedToastCompression, Convert.ToString(toastCompression));
         }
     }
 
     [Fact]
     [Trait("Shard", "3")]
-    public async Task ReservedUserNameFailsBefore0116Starts()
+    public async Task ReservedUserNameFailsBeforeTheReleasedImageStarts()
     {
         RequireDocker();
 

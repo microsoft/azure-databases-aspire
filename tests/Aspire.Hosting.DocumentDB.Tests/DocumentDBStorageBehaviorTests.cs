@@ -4,6 +4,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
+using Aspire.Hosting.ApplicationModel;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using Xunit;
@@ -13,7 +14,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 
 /// <summary>
 /// Container-level proof for the storage claims the package's guards and documentation rest on:
-/// DocumentDB <c>0.116.0</c> declares <c>/data</c> as an image volume, refuses to share a data
+/// DocumentDB <c>0.116.0</c> and later declare <c>/data</c> as an image volume, refuse to share a data
 /// directory with a second container, and cannot run against a read-only one.
 /// </summary>
 /// <remarks>
@@ -30,6 +31,11 @@ public class DocumentDBStorageBehaviorTests
     private const string BaselineVersion = "0.114.0";
 
     private static readonly string s_candidateImage = DocumentDBImageDigestLock.PinnedReference($"pg17-{CandidateVersion}");
+
+    /// <summary>The first image with the storage contract, and the newest one this build knows.</summary>
+    public static TheoryData<string> InterlockedVersions => new() { CandidateVersion, DocumentDBVersions.Latest };
+
+    private static string InterlockedImage(string version) => DocumentDBImageDigestLock.PinnedReference($"pg17-{version}");
 
     private static readonly string s_baselineImage = DocumentDBImageDigestLock.PinnedReference($"pg17-{BaselineVersion}");
 
@@ -57,14 +63,16 @@ public class DocumentDBStorageBehaviorTests
     /// container-runtime-managed anonymous volume. That is what <c>WithDataVolume()</c> suppresses
     /// by mounting on the same path, and what a non-default target path cannot suppress.
     /// </summary>
-    [Fact]
-    public async Task ImageDeclaresDataVolumeAndUnmountedRunsGetAnAnonymousVolume()
+    [Theory]
+    [MemberData(nameof(InterlockedVersions))]
+    public async Task ImageDeclaresDataVolumeAndUnmountedRunsGetAnAnonymousVolume(string version)
     {
         RequireDocker();
-        await EnsureImageAsync(s_candidateImage);
+        var image = InterlockedImage(version);
+        await EnsureImageAsync(image);
 
         var (inspectExit, declared) = await RunDockerAsync(
-            "image", "inspect", s_candidateImage, "--format", "{{json .Config.Volumes}}");
+            "image", "inspect", image, "--format", "{{json .Config.Volumes}}");
         Assert.Equal(0, inspectExit);
         Assert.Contains("/data", declared, StringComparison.Ordinal);
 
@@ -72,7 +80,7 @@ public class DocumentDBStorageBehaviorTests
         try
         {
             var (runExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", containerName, .. s_credentialEnvironment, s_candidateImage]);
+                ["run", "-d", "--name", containerName, .. s_credentialEnvironment, image]);
             Assert.Equal(0, runExit);
 
             var (mountsExit, mountsJson) = await RunDockerAsync(
@@ -105,11 +113,13 @@ public class DocumentDBStorageBehaviorTests
     /// A persisted data directory backs exactly one running container: the entrypoint takes an
     /// exclusive lock on it, and the second container refuses to start rather than corrupting it.
     /// </summary>
-    [Fact]
-    public async Task DataDirectoryIsClaimedByOneContainerAtATime()
+    [Theory]
+    [MemberData(nameof(InterlockedVersions))]
+    public async Task DataDirectoryIsClaimedByOneContainerAtATime(string version)
     {
         RequireDocker();
-        await EnsureImageAsync(s_candidateImage);
+        var image = InterlockedImage(version);
+        await EnsureImageAsync(image);
 
         using var cts = CreateEndToEndTimeoutSource();
         var volumeName = UniqueName("lock-vol");
@@ -122,7 +132,7 @@ public class DocumentDBStorageBehaviorTests
             Assert.Equal(0, createExit);
 
             var (firstExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", firstContainer, "-v", $"{volumeName}:/data", .. s_publishGateway, .. s_credentialEnvironment, s_candidateImage]);
+                ["run", "-d", "--name", firstContainer, "-v", $"{volumeName}:/data", .. s_publishGateway, .. s_credentialEnvironment, image]);
             Assert.Equal(0, firstExit);
 
             await WaitForLogAsync(firstContainer, "database system is ready to accept connections");
@@ -136,7 +146,7 @@ public class DocumentDBStorageBehaviorTests
             // Same volume, second container: the lock is held, so this one must exit instead of
             // opening a second PostgreSQL instance on the same data directory.
             var (secondExit, _) = await RunDockerAsync(
-                ["run", "--name", secondContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
+                ["run", "--name", secondContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
             Assert.NotEqual(0, secondExit);
 
             var logs = await GetContainerLogsAsync(secondContainer);
@@ -251,11 +261,13 @@ public class DocumentDBStorageBehaviorTests
         /// failure is also slow and misattributed, which is why the package rejects the configuration
         /// at build time instead of letting the container run.
         /// </summary>
-        [Fact]
-        public async Task ReadOnlyDataDirectoryFailsInitializationWithAMisleadingTimeout()
+        [Theory]
+        [MemberData(nameof(InterlockedVersions), MemberType = typeof(DocumentDBStorageBehaviorTests))]
+        public async Task ReadOnlyDataDirectoryFailsInitializationWithAMisleadingTimeout(string version)
         {
             RequireDocker();
-            await EnsureImageAsync(s_candidateImage);
+            var image = InterlockedImage(version);
+            await EnsureImageAsync(image);
 
             var volumeName = UniqueName("ro-vol");
             var containerName = UniqueName("ro");
@@ -266,7 +278,7 @@ public class DocumentDBStorageBehaviorTests
                 Assert.Equal(0, createExit);
 
                 var (runExit, _) = await RunDockerAsync(
-                    ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
+                    ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
                 Assert.Equal(0, runExit);
 
                 // The banner a user actually notices blames PostgreSQL start-up timing, and only
@@ -482,18 +494,20 @@ public class DocumentDBStorageBehaviorTests
     /// is the same as no <c>DATA_PATH</c>: the image's own default applies. That is why the guard
     /// judges an empty value as <c>/data</c> instead of rejecting it.
     /// </summary>
-    [Fact]
-    public async Task AnEmptyDataPathFallsBackToTheImageDefault()
+    [Theory]
+    [MemberData(nameof(InterlockedVersions))]
+    public async Task AnEmptyDataPathFallsBackToTheImageDefault(string version)
     {
         RequireDocker();
-        await EnsureImageAsync(s_candidateImage);
+        var image = InterlockedImage(version);
+        await EnsureImageAsync(image);
 
         var containerName = UniqueName("empty-data-path");
 
         try
         {
             var (runExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", containerName, "-e", "DATA_PATH=", .. s_credentialEnvironment, s_candidateImage]);
+                ["run", "-d", "--name", containerName, "-e", "DATA_PATH=", .. s_credentialEnvironment, image]);
             Assert.Equal(0, runExit);
 
             var logs = await WaitForLogAsync(containerName, "Using data path:");
@@ -517,11 +531,13 @@ public class DocumentDBStorageBehaviorTests
         /// the same misleading 60-second banner. One stray dot-file — a <c>.gitkeep</c> committed to
         /// keep the directory in source control, or a <c>.DS_Store</c> the host wrote — is enough.
         /// </summary>
-        [Fact]
-        public async Task ANonEmptyDataDirectoryWithoutAClusterIsRefusedAndLeftIntact()
+        [Theory]
+        [MemberData(nameof(InterlockedVersions), MemberType = typeof(DocumentDBStorageBehaviorTests))]
+        public async Task ANonEmptyDataDirectoryWithoutAClusterIsRefusedAndLeftIntact(string version)
         {
             RequireDocker();
-            await EnsureImageAsync(s_candidateImage);
+            var image = InterlockedImage(version);
+            await EnsureImageAsync(image);
             await EnsureImageAsync(s_probeImage);
 
             var hostDirectory = Path.Combine(AppContext.BaseDirectory, UniqueName("stray"));
@@ -532,7 +548,7 @@ public class DocumentDBStorageBehaviorTests
             try
             {
                 var (runExit, _) = await RunDockerAsync(
-                    ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
+                    ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
                 Assert.Equal(0, runExit);
 
                 var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");

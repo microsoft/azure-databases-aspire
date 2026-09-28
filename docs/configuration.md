@@ -492,6 +492,27 @@ prefer upserts over blind inserts, and do not assume an empty collection. `Witho
 stops the built-in sample import from being replayed. There is no failed-attempt marker either: a
 script that failed part way is simply run again on the next start.
 
+### Moving persisted data to a newer image
+
+Updating this package moves the default image forward, and a persisted data directory follows it.
+The newer image serves the existing cluster, but it never updates the DocumentDB extensions inside
+it: the catalog keeps the version that created it until you update it yourself.
+
+```sql
+SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'documentdb%';
+
+ALTER EXTENSION documentdb_core UPDATE;
+ALTER EXTENSION documentdb UPDATE;
+ALTER EXTENSION documentdb_extended_rum UPDATE; -- only if installed
+```
+
+Run it as `documentdb`, the role that owns the extensions in the bundled PostgreSQL. The
+generated connection strings, including the `WithPostgresEndpoint()` one, log in as your DocumentDB
+user, which PostgreSQL refuses with `must be owner of extension documentdb`. Inside the container:
+`docker exec <container> psql -X -p 9712 -h localhost -U documentdb -d postgres -c "..."`. Upstream
+ships no downgrade scripts, so an older image on an updated catalog is unsupported. If you may need
+to go back, pin the older version with `WithDocumentDBVersion(...)` or keep a copy of the volume.
+
 ## WithLogLevel
 
 Sets both the gateway's canonical `DOCUMENTDB_LOG_LEVEL` environment variable and the legacy
@@ -549,6 +570,9 @@ var server = builder.AddDocumentDB("documentdb")
 This sets `INIT_DATA=false` and `SKIP_INIT_DATA=true` on the container, matching
 the canonical `--skip-init-data` option.
 
+From `0.117.0` the built-in dataset is `StoreData` (`stores`, with 41,505 documents, and
+`ratings`) instead of `sampledb`. Loading it adds several seconds to the first start.
+
 ## WithoutExtendedRum
 
 Disables the `extended_rum` index access method in the DocumentDB Local container. Extended RUM is enabled by default starting with DocumentDB v0.111-0.
@@ -570,7 +594,7 @@ by default. On a fresh container, `WithoutUserCreation()` must be paired with
 `WithoutSampleData()` so the default initialization does not require the
 skipped credentials.
 
-For images from 0.113.0 onward, including 0.116.0, built-in sample
+For images from 0.113.0 onward, including 0.117.0, built-in sample
 initialization does not run unless requested. A fresh container can therefore
 remain running with `CREATE_USER=false` when no initialization requiring those
 credentials is requested. The generated connection strings still will not
@@ -653,7 +677,7 @@ var server = builder.AddDocumentDB("documentdb")
 | `enabled` | `bool` | `true` | Whether metrics export is enabled. Sets `OTEL_METRICS_ENABLED`. The container default is `false`; calling this method flips it on unless `enabled: false` is passed. |
 | `exportInterval` | `TimeSpan?` | `null` | How often the gateway flushes metrics. When provided, sets `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds, integer, invariant culture). Must be non-negative. |
 | `timeout` | `TimeSpan?` | `null` | Per-export request timeout. When provided, sets `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` (milliseconds, integer, invariant culture). Must be non-negative. |
-| `serviceName` | `string?` | `null` | Logical service name attached to the metrics. When provided, sets `OTEL_SERVICE_NAME`. Must be non-empty when provided. For the default official `0.116.0` image, omitting it preserves the image default of `documentdb_gateway`. |
+| `serviceName` | `string?` | `null` | Logical service name attached to the metrics. When provided, sets `OTEL_SERVICE_NAME`. Must be non-empty when provided. For official `0.116.0`-or-later images, omitting it preserves the image default of `documentdb_gateway`. |
 | `serviceVersion` | `string?` | `null` | Logical service version attached to the metrics. When provided, sets `OTEL_SERVICE_VERSION`. Must be non-empty when provided. |
 
 When `endpoint` is omitted, the gateway falls back to the standard OTLP/gRPC default
@@ -893,7 +917,7 @@ var server = builder.AddDocumentDB("documentdb")
 
 The bundled PostgreSQL instance creates the default `documentdb` role. A custom owner must already
 exist, which is primarily useful with an externally managed PostgreSQL instance. DocumentDB
-`0.116.0` aborts explicitly while creating the DocumentDB admin user when the configured role is
+`0.116.0` and later abort explicitly while creating the DocumentDB admin user when the configured role is
 absent. Earlier images also fail startup, but only later while waiting for the gateway to start.
 
 ## UseTls
@@ -1142,11 +1166,11 @@ What remains must be `documentdb/documentdb-local` exactly. So all of these are 
 builder.AddDocumentDB("documentdb");                                   // ghcr.io/documentdb + documentdb/documentdb-local
 
 builder.AddDocumentDB("documentdb")
-       .WithImage("ghcr.io/documentdb/documentdb/documentdb-local", "pg17-0.116.0")
+       .WithImage("ghcr.io/documentdb/documentdb/documentdb-local", "pg17-0.117.0")
        .WithImageRegistry(null);                                       // the whole reference in one field
 
 builder.AddDocumentDB("documentdb")
-       .WithImage("documentdb/documentdb/documentdb-local", "pg17-0.116.0")
+       .WithImage("documentdb/documentdb/documentdb-local", "pg17-0.117.0")
        .WithImageRegistry("ghcr.io");                                  // the boundary moved one segment
 ```
 
@@ -1177,7 +1201,7 @@ A digest is read whether it arrives through `WithImageSHA256(...)` or inline as
 `repository@sha256:...`, and a `:` is a tag only in the last path segment, so a registry port is
 never mistaken for one.
 
-**A digest beats every tag.** A reference can carry both — `repository:pg17-0.116.0@sha256:...`, or
+**A digest beats every tag.** A reference can carry both — `repository:pg17-0.117.0@sha256:...`, or
 an inline tag beside a `WithImageSHA256(...)` digest, or the reverse — and the runtime resolves the
 digest and ignores the tag. The version is therefore unknown for such a reference no matter what the
 tag reads, so no version-dependent behaviour is applied to it: no declared-`/data`-volume warning,
@@ -1193,7 +1217,7 @@ it; a digest on a repository this package does not publish is left alone as any 
 Aspire to *build* the resource's container image instead of pulling one. Aspire keeps the
 resource's `ContainerImageAnnotation` when you do that, and you can set it yourself afterwards, so
 a Dockerfile-built resource may be labelled
-`ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.116.0` while running something else
+`ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0` while running something else
 entirely. The published manifest makes this explicit: it emits a `build` object and no `image` at
 all.
 
@@ -1203,7 +1227,7 @@ unknown version — whatever its repository, tag or digest says, and whatever th
 
 - version floors are not enforced: `WithPostgresEndpoint()` warns once instead of failing, and the
   `Pg18` publish floor stays silent;
-- `0.116.0`-only storage behaviour is not assumed. There is no declared-`/data`-volume warning, and
+- `0.116.0`-and-later storage behaviour is not assumed. There is no declared-`/data`-volume warning, and
   a data directory shared with another DocumentDB resource stays a hard failure instead of being
   downgraded to a warning by `WithExplicitStart()`, because nothing establishes that your image
   still claims the directory with an exclusive `flock`;
@@ -1282,7 +1306,7 @@ guarantee every publisher matches the RFC 3986 escaping described above.
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.116.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.117.0`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
