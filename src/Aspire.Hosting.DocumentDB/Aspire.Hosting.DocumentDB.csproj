@@ -27,7 +27,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Remove="api/**/*" />
+    <InternalsVisibleTo Include="Aspire.Hosting.DocumentDB.Tests" />
   </ItemGroup>
 
   <ItemGroup>
@@ -42,5 +42,6 @@
     <PackageReference Include="Aspire.Hosting" />
     <PackageReference Include="AspNetCore.HealthChecks.MongoDb" />
     <PackageReference Include="MinVer" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="all" />
   </ItemGroup>
 </Project>

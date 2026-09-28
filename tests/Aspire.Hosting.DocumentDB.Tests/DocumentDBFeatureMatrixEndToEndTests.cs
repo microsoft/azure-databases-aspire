@@ -31,7 +31,9 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// actually honours it — which is a different claim, and the one that breaks when an image
 /// changes underneath the package.
 /// </remarks>
+// Sharded per method: as one shard this class would outlast every other shard.
 [Trait("Category", "Integration")]
+[Collection(DocumentDBFeatureMatrixAppHostCollection.Name)]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
     private const string ReleasedVersion = DocumentDBVersions.V0_116_0;
@@ -55,6 +57,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task CustomCredentialParametersAuthenticateAndBothDatabasesWork()
     {
         RequireDocker();
@@ -112,6 +115,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task DataVolumeSurvivesTheContainerBeingReplaced()
     {
         RequireDocker();
@@ -161,6 +165,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "2")]
     public async Task DataBindMountWritesToTheHostPathAndSurvivesARestartExceptOnDockerDesktop()
     {
         RequireDocker();
@@ -249,6 +254,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     /// strict rule and a macOS host running a native-semantics runtime would not.
     /// </summary>
     [Fact]
+    [Trait("Shard", "3")]
     public async Task TheContainerRuntimeIdentifiesItselfToTheRestartPolicy()
     {
         RequireDocker();
@@ -330,7 +336,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
+    private const string UpgradeIndexName = "version_unique";
+
     [Fact]
+    [Trait("Shard", "2")]
     public async Task PersistedPg17DataUpgradesFrom0114To0116()
     {
         RequireDocker();
@@ -349,7 +358,13 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
                 var database = await ConnectAsync(connectionString!, "appdb", cts.Token);
 
-                await database.GetCollection<BsonDocument>("upgrade").InsertOneAsync(
+                var collection = database.GetCollection<BsonDocument>("upgrade");
+                await collection.Indexes.CreateOneAsync(
+                    new CreateIndexModel<BsonDocument>(
+                        Builders<BsonDocument>.IndexKeys.Ascending("version"),
+                        new CreateIndexOptions { Name = UpgradeIndexName, Unique = true }),
+                    cancellationToken: cts.Token);
+                await collection.InsertOneAsync(
                     new BsonDocument { ["_id"] = "pre-upgrade", ["version"] = "0.114.0" },
                     cancellationToken: cts.Token);
 
@@ -378,6 +393,16 @@ public class DocumentDBFeatureMatrixEndToEndTests
                     2,
                     await collection.CountDocumentsAsync(FilterDefinition<BsonDocument>.Empty, cancellationToken: cts.Token));
 
+                // The secondary index made on 0.114.0 survives the upgrade and is still enforced.
+                using var indexes = await collection.Indexes.ListAsync(cts.Token);
+                Assert.Contains(
+                    await indexes.ToListAsync(cts.Token),
+                    index => index["name"].AsString == UpgradeIndexName && index["unique"].ToBoolean());
+                var duplicate = await Assert.ThrowsAsync<MongoWriteException>(() => collection.InsertOneAsync(
+                    new BsonDocument { ["_id"] = "duplicate", ["version"] = "0.114.0" },
+                    cancellationToken: cts.Token));
+                Assert.Equal(ServerErrorCategory.DuplicateKey, duplicate.WriteError.Category);
+
                 await app.StopAsync(cts.Token);
             }
         }
@@ -388,6 +413,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "2")]
     public async Task CustomInitializationRunsOnlyOnceForAPersisted0116Volume()
     {
         RequireDocker();
@@ -484,6 +510,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Theory]
+    [Trait("Shard", "2")]
     [InlineData(AppHost.Pg15Scenario, "pg15-0.114.0")]
     [InlineData(AppHost.Pg16Scenario, "pg16-0.114.0")]
     public async Task Pg15AndPg16On0114RemainRunnableAsLegacyControls(
@@ -518,6 +545,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Theory]
+    [Trait("Shard", "2")]
     [InlineData(AppHost.Pg15Scenario, 15)]
     [InlineData(AppHost.Pg16Scenario, 16)]
     [InlineData(AppHost.Pg17Scenario, 17)]
@@ -550,6 +578,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task AnOlderCuratedDocumentDBVersionStillRuns()
     {
         // WithDocumentDBVersion is only meaningful if the older curated members still resolve to
@@ -581,6 +610,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task LogLevelOwnerAndOpenTelemetryMetricsReachThe0114ControlContainer()
     {
         RequireDocker();
@@ -618,6 +648,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Theory]
+    [Trait("Shard", "3")]
     [InlineData("pg17-0.114.0", "pg17-0.114.0")]
     [InlineData(null, "pg17-0.116.0")]
     public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
@@ -668,6 +699,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task QuietLogLevelSuppresses0116GatewayOutput()
     {
         RequireDocker();
@@ -717,6 +749,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task OpenTelemetryMetricsAreExportedFrom0116()
     {
         RequireDocker();
@@ -781,11 +814,17 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 gatewayLogs,
                 StringComparison.Ordinal);
 
+            // The round trip above is what produces the per-operation metrics, and they have to
+            // arrive under the configured service identity, not merely somewhere in the file.
             var metrics = await WaitForFileContainingAsync(
                 Path.Combine(otelOutputPath, "metrics.json"),
-                "aspire-documentdb-e2e",
+                "db.client.documents.inserted",
                 cts.Token);
-            Assert.Contains("gateway", metrics, StringComparison.OrdinalIgnoreCase);
+            var exported = ReadExportedMetrics(metrics, "aspire-documentdb-e2e", "1.2.3");
+            Assert.Equal("sum", exported.GetValueOrDefault("gateway.starts"));
+            Assert.Equal("sum", exported.GetValueOrDefault("db.client.operations"));
+            Assert.Equal("sum", exported.GetValueOrDefault("db.client.documents.inserted"));
+            Assert.Equal("sum", exported.GetValueOrDefault("db.client.documents.deleted"));
         }
         finally
         {
@@ -800,6 +839,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     /// This starts the real thing and requires it to become healthy.
     /// </summary>
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryWrapperStaysFirstWhenALaterCallbackPrepends()
     {
         RequireDocker();
@@ -845,6 +885,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     /// state at all is the assertion.
     /// </summary>
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryWrapperAvoidsATemporaryRootBoundToTheDataDirectory()
     {
         RequireDocker();
@@ -901,6 +942,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     /// daemon, so both container mount points expose one directory.
     /// </summary>
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryWrapperAvoidsASymlinkAliasOfTheDataDirectory()
     {
         RequireDocker();
@@ -971,6 +1013,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     /// <c>/tmp</c>.
     /// </summary>
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryWrapperRejectsARawRuntimeMountOfTheDataVolume()
     {
         RequireDocker();
@@ -1020,6 +1063,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryRuntimeDiagnosticDoesNotExposeASecretParameterOperand()
     {
         RequireDocker();
@@ -1058,6 +1102,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryRuntimeDiagnosticDoesNotExposeACredentialReferenceOperand()
     {
         RequireDocker();
@@ -1097,6 +1142,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryWrapperFailsClearlyWhenEveryBindCandidateIsUnprovable()
     {
         RequireDocker();
@@ -1148,6 +1194,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Theory]
+    [Trait("Shard", "1")]
     [InlineData("null")]
     [InlineData("false")]
     public async Task TelemetryWrapperRunsWithNullOrFalseShellExecution(string shellExecution)
@@ -1179,6 +1226,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryWrapperRejectsShellExecutionBeforeContainerCreation()
     {
         RequireDocker();
@@ -1215,6 +1263,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task TelemetryWrapperRejectsShellExecutionEnabledAfterCommandCaching()
     {
         RequireDocker();
@@ -1249,6 +1298,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Theory]
+    [Trait("Shard", "1")]
     [InlineData(true)]
     [InlineData(false)]
     public async Task TelemetryWrapperDoesNotContaminateTmpDataPath(bool enabled)
@@ -1290,6 +1340,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Theory]
+    [Trait("Shard", "1")]
     // No serviceName override: the shipped TelemetryOptions.ServiceName must survive.
     [InlineData(null, "documentdb_gateway")]
     // Explicit serviceName override: the shared JSON identity is removed so the variable wins.
@@ -1465,6 +1516,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "1")]
     public async Task DisabledOpenTelemetryMetricsBeatAConfigurationFileThatEnablesThem()
     {
         // The gateway resolves telemetry as JSON > environment, so a configuration file the caller
@@ -1534,6 +1586,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         {
             "run", "--detach", "--name", containerName, "--network", networkName,
             "--volume", $"{configPath}:/custom-config:ro",
+            "--publish", "127.0.0.1::10260",
             "--entrypoint", entrypoint!,
         };
 
@@ -1595,13 +1648,32 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
             await WaitForContainerLogAsync(containerName, "Gateway is ready", cts.Token);
 
+            // Traffic, so the per-operation metrics would exist if metrics were on.
+            var (portExitCode, hostPort) = await RunDockerAsync("port", containerName, "10260/tcp");
+            Assert.Equal(0, portExitCode);
+            var userName = environment["USERNAME"]!.GetValue<string>();
+            await AssertRoundTripAsync(
+                $"mongodb://{userName}:Aspire-Disabled-Pass1@{hostPort.Split('\n')[0].Trim()}/?tls=true&tlsInsecure=true&directConnection=true",
+                "appdb",
+                "otel",
+                "metric-source",
+                cts.Token);
+
             // Well past the 1s export interval the file exporter has still written nothing:
             // metrics really are off.
             await Task.Delay(TimeSpan.FromSeconds(20), cts.Token);
+            var exported = File.Exists(metricsPath) ? await File.ReadAllTextAsync(metricsPath, cts.Token) : string.Empty;
             Assert.False(
-                File.Exists(metricsPath) &&
-                (await File.ReadAllTextAsync(metricsPath, cts.Token)).Contains("gateway.starts", StringComparison.Ordinal),
+                exported.Contains("gateway.starts", StringComparison.Ordinal) ||
+                exported.Contains("db.client.operations", StringComparison.Ordinal),
                 "Metrics were exported even though WithOpenTelemetryMetrics(enabled: false) was configured.");
+
+            // An absent file only means "off" if the collector was there to receive: the same
+            // collector configuration receives metrics in the enabled tests.
+            var (collectorStateExitCode, collectorRunning) = await RunDockerAsync(
+                "inspect", collectorName, "--format", "{{.State.Running}}");
+            Assert.Equal(0, collectorStateExitCode);
+            Assert.Equal("true", collectorRunning.Trim());
 
             // Teardown is asserted on the success path only: an assertion inside finally would
             // replace whatever the test was actually diagnosing.
@@ -1626,6 +1698,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task WithoutUserCreationKeepsFreshCandidateContainerRunningWhenInitializationIsDisabled()
     {
         RequireDocker();
@@ -1663,10 +1736,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var failure = await Record.ExceptionAsync(
             () => PingOnceAsync(connectionString!, "appdb", CancellationToken.None));
 
-        Assert.NotNull(failure);
-        Assert.True(
-            failure is TimeoutException or MongoException,
-            $"Expected authentication against a container with no provisioned user to fail, but got: {failure}");
+        // The user is missing, not the server: anything but an authentication failure (a refused
+        // or dropped connection, a timeout with no server at all) would pass a looser check.
+        Assert.IsType<MongoAuthenticationException>(failure);
     }
 
     // ------------------------------------------------------------------
@@ -1674,6 +1746,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task AllowInsecureTlsFalseRejectsTheContainersSelfSignedCertificate()
     {
         // AllowInsecureTls defaults to true for a reason: the container serves a self-signed
@@ -1702,10 +1775,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var failure = await Record.ExceptionAsync(
             () => PingOnceAsync(strictConnectionString!, "appdb", CancellationToken.None));
 
-        Assert.NotNull(failure);
-        Assert.True(
-            failure is TimeoutException or MongoException,
-            $"Expected strict TLS validation to reject the self-signed certificate, but got: {failure}");
+        // Server selection wraps the handshake failure, so the reason is only in its description.
+        Assert.IsType<TimeoutException>(failure);
+        Assert.Contains("The remote certificate is invalid", failure.Message, StringComparison.Ordinal);
     }
 
     // ------------------------------------------------------------------
@@ -1713,12 +1785,14 @@ public class DocumentDBFeatureMatrixEndToEndTests
     // ------------------------------------------------------------------
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task PostgresEndpointOn0114HonoursAnExplicitPortAndWithoutExtendedRumDisablesTheAccessMethod()
     {
         await AssertPostgresExtrasAsync("pg17-0.114.0", assertLz4: false);
     }
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task PostgresEndpointOn0116UsesLz4ToastCompression()
     {
         await AssertPostgresExtrasAsync(ReleasedTag(17), assertLz4: true);
@@ -1784,6 +1858,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task ReservedUserNameFailsBefore0116Starts()
     {
         RequireDocker();
@@ -1813,6 +1888,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     [Fact]
+    [Trait("Shard", "3")]
     public async Task PostgresEndpointOnAnImageBelowTheFloorFailsAtStartup()
     {
         // The 0.112.0 floor for WithPostgresEndpoint, exercised through a real orchestrator run
@@ -1985,7 +2061,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             $"Last logs:{Environment.NewLine}{logs}");
     }
 
-    private static async Task<DistributedApplication> BuildAndStartAsync(CancellationToken cancellationToken)
+    internal static async Task<DistributedApplication> BuildAndStartAsync(CancellationToken cancellationToken)
     {
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<AppHost>(cancellationToken);
         var app = await appHost.BuildAsync(cancellationToken);
@@ -1995,7 +2071,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     private static string ReleasedTag(int postgresVersion) => $"pg{postgresVersion}-{ReleasedVersion}";
 
-    private static async Task WaitForDocumentAsync(
+    internal static async Task WaitForDocumentAsync(
         IMongoDatabase database,
         string collectionName,
         string id,
@@ -2020,7 +2096,43 @@ public class DocumentDBFeatureMatrixEndToEndTests
             $"Document '{id}' was not created in collection '{collectionName}' before the timeout.");
     }
 
-    private static async Task<string> WaitForFileContainingAsync(
+    /// <summary>
+    /// Reads the collector's file-exporter output (one OTLP JSON batch per line) and returns each
+    /// metric exported under the given service identity, mapped to its OTLP data type.
+    /// </summary>
+    private static Dictionary<string, string> ReadExportedMetrics(string exportedLines, string serviceName, string serviceVersion)
+    {
+        var metrics = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var line in exportedLines.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            foreach (var resourceMetrics in JsonNode.Parse(line)!["resourceMetrics"]!.AsArray())
+            {
+                var attributes = resourceMetrics!["resource"]?["attributes"]?.AsArray() ?? [];
+                string? Attribute(string key) => attributes
+                    .FirstOrDefault(attribute => attribute!["key"]!.GetValue<string>() == key)?["value"]?["stringValue"]?.GetValue<string>();
+
+                if (Attribute("service.name") != serviceName || Attribute("service.version") != serviceVersion)
+                {
+                    continue;
+                }
+
+                foreach (var scopeMetrics in resourceMetrics["scopeMetrics"]!.AsArray())
+                {
+                    foreach (var metric in scopeMetrics!["metrics"]!.AsArray())
+                    {
+                        metrics[metric!["name"]!.GetValue<string>()] = metric.AsObject()
+                            .Select(property => property.Key)
+                            .First(key => key is "sum" or "gauge" or "histogram" or "exponentialHistogram" or "summary");
+                    }
+                }
+            }
+        }
+
+        return metrics;
+    }
+
+    internal static async Task<string> WaitForFileContainingAsync(
         string path,
         string expectedSubstring,
         CancellationToken cancellationToken)
@@ -2082,7 +2194,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
-    private static async Task<object?> QueryPostgresAsync(string postgresqlUri, string sql, CancellationToken cancellationToken)
+    internal static async Task<object?> QueryPostgresAsync(string postgresqlUri, string sql, CancellationToken cancellationToken)
     {
         // Npgsql does not parse postgresql:// URIs; convert to key/value form.
         var uri = new Uri(postgresqlUri);
@@ -2134,7 +2246,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         return ((IPEndPoint)listener.LocalEndpoint).Port;
     }
 
-    private static void TryDeleteDirectory(string path)
+    internal static void TryDeleteDirectory(string path)
     {
         try
         {

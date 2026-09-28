@@ -26,26 +26,26 @@ What this script does:
      member (`[Obsolete("...")]`, which the enum's own XML docs prescribe for retiring a member)
      are parsed and re-emitted, so re-rendering never strips them.
   5. If the intersection contains versions not in the current list, rewrites the auto-generated
-     regions in DocumentDBVersion.cs (only) and replace-in-place updates the auto-generated
-     CHANGELOG block. Candidates OLDER than the newest shipped version ("backfill") are skipped
+     regions in DocumentDBVersion.cs, appends the new enum members and constants to
+     PublicAPI.Unshipped.txt (the PublicApiAnalyzers build fails without them, and the lines
+     are reviewed on the auto-PR like any other API change), and replace-in-place updates the
+     auto-generated CHANGELOG block. Candidates OLDER than the newest shipped version ("backfill") are skipped
      with a warning rather than adopted, because numeric enum values must never shift; newer
      candidates in the same run are still adopted.
   6. Checks on EVERY run - adoption or not - that the CHANGELOG marker block still sits inside
      the `## [Unreleased]` section, and refuses to adopt anything while it does not, rather than
      filing the generated notes under an already-released version.
+  7. Appends the adopted tags' GHCR digests to `eng/documentdb-image-digests.json` (never
+     replacing a recorded one). `--verify-digests` re-resolves every recorded tag and fails on
+     drift instead of adopting anything.
 
 What this script does NOT do (deliberately):
-  - It does not edit `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs`. That
-    file is the public-API baseline, kept as an independent guard against unintentional public
-    API changes; the maintainer reviewing the auto-PR appends new `DocumentDBVersion.V0_X_Y`
-    members to it by hand. `VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember`
-    (in tests/Aspire.Hosting.DocumentDB.Tests) fails until that hand-edit lands.
   - It does not bump the NuGet package version. That is a manual step (Git `v*` tag + MinVer).
   - It does not merge anything. The companion workflow opens a PR for human review.
 
 Trust assumption: GHCR tags are mutable. "Version supported" here means "tag exists at the
-time of this check", not "image bytes are immutable". Pinning by digest is a future
-enhancement.
+time of this check"; the digest lock records the bytes seen at adoption (trust on first use) so
+a later re-push is detected rather than prevented.
 
 Exit status: 0 always when invoked normally (success / no-op / new-versions-detected). Non-zero
 only on unrecoverable errors (network failures, malformed source files). Because a stalled
@@ -55,6 +55,7 @@ green scheduled run is still visibly annotated instead of hiding the stall in th
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -69,6 +70,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VERSIONS_FILE = REPO_ROOT / "src" / "Aspire.Hosting.DocumentDB" / "DocumentDBVersion.cs"
 CHANGELOG_FILE = REPO_ROOT / "CHANGELOG.md"
+PUBLIC_API_UNSHIPPED_FILE = REPO_ROOT / "src" / "Aspire.Hosting.DocumentDB" / "PublicAPI.Unshipped.txt"
+DIGEST_LOCK_FILE = REPO_ROOT / "eng" / "documentdb-image-digests.json"
 
 GH_OWNER = "documentdb"
 GH_REPO = "documentdb"
@@ -95,6 +98,14 @@ ACKNOWLEDGED_SKIPS: frozenset[str] = frozenset()
 
 GH_TAG_RE = re.compile(r"^v(\d+)\.(\d+)-(\d+)$")
 GHCR_TAG_RE = re.compile(r"^pg(\d+)-(\d+)\.(\d+)\.(\d+)$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+LOCKED_PLATFORMS = ("linux/amd64", "linux/arm64")
 ENUM_MEMBER_LINE_RE = re.compile(r"^V(\d+)_(\d+)_(\d+)\s*=\s*(\d+)\s*,?$")
 CONST_MEMBER_LINE_RE = re.compile(r'^public const string V(\d+)_(\d+)_(\d+)\s*=\s*"[^"]*"\s*;$')
 # A single-line attribute applied to the member below it, e.g. `[Obsolete("Use V0_110_0.")]`.
@@ -248,8 +259,7 @@ def fetch_github_releases(owner: str, repo: str) -> list[SemVer]:
     return versions
 
 
-def fetch_ghcr_pg_tags(image_path: str) -> dict[SemVer, set[int]]:
-    """Return {version: {pg_variants}} for every pgN-X.Y.Z tag on the image."""
+def _ghcr_token(image_path: str) -> str:
     token_url = (
         "https://ghcr.io/token?service=ghcr.io"
         f"&scope=repository:{image_path}:pull"
@@ -260,6 +270,12 @@ def fetch_ghcr_pg_tags(image_path: str) -> dict[SemVer, set[int]]:
     token = token_payload.get("token") or token_payload.get("access_token")
     if not token:
         raise RuntimeError("GHCR token endpoint returned no token")
+    return token
+
+
+def fetch_ghcr_pg_tags(image_path: str) -> dict[SemVer, set[int]]:
+    """Return {version: {pg_variants}} for every pgN-X.Y.Z tag on the image."""
+    token = _ghcr_token(image_path)
 
     tags: list[object] = []
     list_url: str | None = f"https://ghcr.io/v2/{image_path}/tags/list?n=500"
@@ -297,6 +313,110 @@ def fetch_ghcr_pg_tags(image_path: str) -> dict[SemVer, set[int]]:
               "DocumentDBPostgresVersion is not auto-extended.", file=sys.stderr)
 
     return by_version
+
+
+def _http_get_bytes(url: str, headers: dict[str, str]) -> bytes:
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read()
+
+
+def resolve_image_digests(image_path: str, tags: list[str]) -> dict[str, dict[str, str | None] | None]:
+    """Return {tag: {"index": digest, "linux/amd64": digest|None, ...}}, or None for a missing tag.
+
+    The index digest is computed from the bytes served rather than read from a response header.
+    """
+    token = _ghcr_token(image_path)
+    headers = {"Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT}
+    resolved: dict[str, dict[str, str | None] | None] = {}
+    for tag in tags:
+        try:
+            body = _http_get_bytes(f"https://ghcr.io/v2/{image_path}/manifests/{tag}", headers)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                resolved[tag] = None
+                continue
+            raise
+        entry: dict[str, str | None] = {
+            "index": "sha256:" + hashlib.sha256(body).hexdigest(),
+            **{platform: None for platform in LOCKED_PLATFORMS},
+        }
+        # A single-platform manifest has no platform list, so only its index digest is recorded.
+        for child in json.loads(body).get("manifests") or []:
+            platform = child.get("platform") or {}
+            key = f"{platform.get('os')}/{platform.get('architecture')}"
+            if key in LOCKED_PLATFORMS:
+                entry[key] = child.get("digest")
+        resolved[tag] = entry
+    return resolved
+
+
+def lock_tags(versions: list[SemVer], pg_variants) -> list[str]:
+    return [f"pg{pg}-{v}" for v in versions for pg in sorted(pg_variants)]
+
+
+def _lock_sort_key(tag: str) -> tuple[int, int, int, int]:
+    match = GHCR_TAG_RE.match(tag)
+    if not match:
+        raise RuntimeError(f"Digest lock key {tag!r} is not a pgNN-X.Y.Z tag.")
+    return (int(match[2]), int(match[3]), int(match[4]), int(match[1]))
+
+
+def load_digest_lock(lock_file: Path) -> dict[str, dict[str, str | None]]:
+    lock = json.loads(lock_file.read_text(encoding="utf-8")) if lock_file.exists() else {}
+    if not isinstance(lock, dict):
+        raise RuntimeError(f"{lock_file.name} must be a JSON object keyed by tag.")
+    for tag, entry in lock.items():
+        _lock_sort_key(tag)
+        if not isinstance(entry, dict) or not DIGEST_RE.match(str(entry.get("index"))):
+            raise RuntimeError(f"{lock_file.name} entry {tag!r} has no well-formed index digest.")
+    return lock
+
+
+def update_digest_lock(lock_file: Path, image_path: str, tags: list[str]) -> list[str]:
+    """Append digests for `tags` and return the ones added.
+
+    Raises before writing anything if a tag is missing or an already-recorded tag now resolves
+    differently: a recorded mapping is never replaced automatically.
+    """
+    lock = load_digest_lock(lock_file)
+    resolved = resolve_image_digests(image_path, tags)
+    added = []
+    for tag in tags:
+        entry = resolved.get(tag)
+        if entry is None:
+            raise RuntimeError(f"GHCR has no manifest for {image_path}:{tag}.")
+        if tag in lock:
+            if lock[tag] != entry:
+                raise RuntimeError(
+                    f"{tag} no longer matches {lock_file.name}: recorded {lock[tag]}, GHCR now "
+                    f"serves {entry}. A recorded mapping is never replaced automatically."
+                )
+            continue
+        lock[tag] = entry
+        added.append(tag)
+    if added:
+        ordered = {tag: lock[tag] for tag in sorted(lock, key=_lock_sort_key)}
+        lock_file.write_text(json.dumps(ordered, indent=2) + "\n", encoding="utf-8")
+    return added
+
+
+def verify_digest_lock(lock_file: Path, image_path: str) -> int:
+    """Re-resolve every locked tag; nonzero (with an ::error annotation) on drift or a missing tag."""
+    lock = load_digest_lock(lock_file)
+    resolved = resolve_image_digests(image_path, list(lock))
+    problems = []
+    for tag, recorded in lock.items():
+        current = resolved.get(tag)
+        if current is None:
+            problems.append(f"{tag} is no longer published on GHCR.")
+        elif current != recorded:
+            problems.append(f"{tag} drifted: recorded {recorded}, GHCR now serves {current}.")
+    for problem in problems:
+        print(f"ERROR: {problem}", file=sys.stderr)
+        emit_github_annotation("error", "DocumentDB image digest drift", problem)
+    print(f"Verified {len(lock) - len(problems)} of {len(lock)} locked tag(s).")
+    return 1 if problems else 0
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +803,28 @@ def check_changelog_placement(changelog_file: Path) -> bool:
     return warn_if_markers_outside_unreleased(changelog_file, text, match.start())
 
 
+def update_public_api(
+    unshipped_file: Path, assignments: dict[SemVer, int], new_versions: list[SemVer]
+) -> None:
+    """Append the PublicApiAnalyzers entries for each adopted enum member and constant."""
+    text = unshipped_file.read_text(encoding="utf-8")
+    existing = set(text.splitlines())
+    lines = []
+    for v in new_versions:
+        lines += [
+            f"Aspire.Hosting.ApplicationModel.DocumentDBVersion.{v.enum_member} = {assignments[v]}"
+            " -> Aspire.Hosting.ApplicationModel.DocumentDBVersion",
+            f'const Aspire.Hosting.ApplicationModel.DocumentDBVersions.{v.enum_member} = "{v}"'
+            " -> string!",
+        ]
+    lines = [line for line in lines if line not in existing]
+    if not lines:
+        return
+    if text and not text.endswith("\n"):
+        text += "\n"
+    unshipped_file.write_text(text + "\n".join(lines) + "\n", encoding="utf-8")
+
+
 def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
     """Replace-in-place the auto-generated DocumentDB versions block in CHANGELOG.md.
 
@@ -705,12 +847,6 @@ def update_changelog(changelog_file: Path, new_versions: list[SemVer]) -> None:
             f"- DocumentDB `{v}` upstream release detected on {today} "
             f"(container tags {tag_list})."
         )
-    body_lines.append("")
-    body_lines.append(
-        "_Maintainer: append the matching `DocumentDBVersion.V0_X_Y` enum members and "
-        "`public const string V0_X_Y = \"X.Y.Z\";` lines to "
-        "`src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` before merging._"
-    )
     body = "\n".join(body_lines)
 
     text = changelog_file.read_text(encoding="utf-8")
@@ -849,7 +985,17 @@ def report_unadopted_versions(
     return blocked, backfill
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    if argv:
+        if argv != ["--verify-digests"]:
+            print(f"usage: {Path(__file__).name} [--verify-digests]", file=sys.stderr)
+            return 2
+        try:
+            return verify_digest_lock(DIGEST_LOCK_FILE, GHCR_IMAGE_PATH)
+        except (urllib.error.URLError, RuntimeError, ValueError) as e:
+            print(f"ERROR verifying image digests: {e}", file=sys.stderr)
+            return 2
+
     print(f"Checking upstream DocumentDB releases at {datetime.now(timezone.utc).isoformat()}")
     print(f"  REPO_ROOT       = {REPO_ROOT}")
     print(f"  VERSIONS_FILE   = {VERSIONS_FILE}")
@@ -943,11 +1089,22 @@ def main() -> int:
 
     target_assignments = assign_numeric_values(known_assignments, new_versions)
 
+    # First, because it is the only write that can still fail on the network.
+    try:
+        update_digest_lock(DIGEST_LOCK_FILE, GHCR_IMAGE_PATH, lock_tags(new_versions, REQUIRED_PG_SET))
+    except (urllib.error.URLError, RuntimeError, ValueError) as e:
+        print(f"ERROR recording image digests: {e}", file=sys.stderr)
+        return 2
+    print(f"Updated {DIGEST_LOCK_FILE.relative_to(REPO_ROOT)}")
+
     # The append-only guard lives inside write_versions_file, which applies it to the RENDERED
     # text rather than to `target_assignments`: checking the dict here could never fail, because
     # assign_numeric_values starts from a copy of `known_assignments` and only adds keys.
     write_versions_file(versions_source, target_assignments)
     print(f"Updated {VERSIONS_FILE.relative_to(REPO_ROOT)}")
+
+    update_public_api(PUBLIC_API_UNSHIPPED_FILE, target_assignments, new_versions)
+    print(f"Updated {PUBLIC_API_UNSHIPPED_FILE.relative_to(REPO_ROOT)}")
 
     update_changelog(CHANGELOG_FILE, new_versions)
     print(f"Updated {CHANGELOG_FILE.relative_to(REPO_ROOT)}")
@@ -963,4 +1120,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

@@ -19,6 +19,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 /// with the model" is asserted against Docker rather than assumed.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Shard", "5")]
 [Collection(DocumentDBStorageGuardAppHostCollection.Name)]
 public class DocumentDBRuntimeAuthorityEndToEndTests
 {

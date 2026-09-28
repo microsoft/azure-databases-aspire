@@ -37,6 +37,9 @@ public class Program
     public const string ScratchBindMountPathEnvironmentVariable = "DOCUMENTDB_FEATURE_SCRATCH_BINDMOUNT";
     public const string ShellExecutionEnvironmentVariable = "DOCUMENTDB_FEATURE_SHELL_EXECUTION";
     public const string RuntimeOperandValueEnvironmentVariable = "DOCUMENTDB_FEATURE_RUNTIME_OPERAND";
+    public const string DocumentDBVersionEnvironmentVariable = "DOCUMENTDB_FEATURE_DOCUMENTDB_VERSION";
+    public const string PostgresVersionEnvironmentVariable = "DOCUMENTDB_FEATURE_POSTGRES_VERSION";
+    public const string PostgresEndpointEnvironmentVariable = "DOCUMENTDB_FEATURE_POSTGRES_ENDPOINT";
 
     /// <summary>Custom credential parameters, two databases, one with a distinct database name.</summary>
     public const string CustomCredentialsMultiDbScenario = "custom-credentials-multi-db";
@@ -128,6 +131,18 @@ public class Program
     /// <summary>A username rejected by the v0.116 reserved-prefix validation.</summary>
     public const string ReservedUserNameScenario = "reserved-username";
 
+    /// <summary>
+    /// One (DocumentDBVersion, DocumentDBPostgresVersion) cell of the curated catalog, selected
+    /// through the typed API, optionally with the PostgreSQL endpoint.
+    /// </summary>
+    public const string CatalogCellScenario = "catalog-cell";
+
+    /// <summary>
+    /// A non-default PostgreSQL backend with everything that touches it at once: the PostgreSQL
+    /// endpoint, a named data volume, custom initialization and OTLP metrics export.
+    /// </summary>
+    public const string BackendCompactScenario = "backend-compact";
+
     public const string CustomUserName = "aspireuser";
     public const string CustomPassword = "AspirePass123";
     public const string ReservedUserName = "pgadmin";
@@ -172,7 +187,8 @@ public class Program
             DataBindMountScenario or
             InitDataVolumeScenario or
             ReservedUserNameScenario or
-            TelemetryCredentialRuntimeOperandScenario;
+            TelemetryCredentialRuntimeOperandScenario or
+            BackendCompactScenario;
 
         IResourceBuilder<ParameterResource>? pinnedUser = null;
         IResourceBuilder<ParameterResource>? pinnedPassword = null;
@@ -221,17 +237,8 @@ public class Program
 
                 if (!string.IsNullOrWhiteSpace(otelOutputPath))
                 {
-                    var otelConfigPath = CreateOtelCollectorConfiguration(otelOutputPath);
-                    collector = builder.AddContainer(
-                            "otel-collector",
-                            "otel/opentelemetry-collector-contrib",
-                            "0.130.1")
-                        .WithBindMount(otelConfigPath, "/etc/otelcol-contrib/config.yaml", isReadOnly: true)
-                        .WithBindMount(otelOutputPath, "/var/lib/otel")
-                        .WithContainerRuntimeArgs("--user", "0:0")
-                        .WithArgs("--config=/etc/otelcol-contrib/config.yaml")
-                        .WithEndpoint(targetPort: 4317, name: "grpc");
-                    otelEndpoint = "http://otel-collector:4317";
+                    collector = AddOtelCollector(builder, otelOutputPath);
+                    otelEndpoint = OtelCollectorEndpoint;
                 }
 
                 documentDB.WithLogLevel(DocumentDBLogLevel.Debug);
@@ -414,6 +421,31 @@ public class Program
             case ReservedUserNameScenario:
                 break;
 
+            case CatalogCellScenario:
+                documentDB
+                    .WithDocumentDBVersion(Enum.Parse<DocumentDBVersion>(GetRequired(DocumentDBVersionEnvironmentVariable)))
+                    .WithPostgresVersion(Enum.Parse<DocumentDBPostgresVersion>(GetRequired(PostgresVersionEnvironmentVariable)));
+
+                if (bool.Parse(GetRequired(PostgresEndpointEnvironmentVariable)))
+                {
+                    documentDB.WithPostgresEndpoint();
+                }
+                break;
+
+            case BackendCompactScenario:
+                var backendCollector = AddOtelCollector(builder, GetRequired(OtelOutputPathEnvironmentVariable));
+                documentDB
+                    .WithPostgresVersion(Enum.Parse<DocumentDBPostgresVersion>(GetRequired(PostgresVersionEnvironmentVariable)))
+                    .WithPostgresEndpoint()
+                    .WithDataVolume(GetRequired(VolumeNameEnvironmentVariable))
+                    .WithInitData(GetRequired(InitDataPathEnvironmentVariable))
+                    .WithOpenTelemetryMetrics(
+                        endpoint: OtelCollectorEndpoint,
+                        exportInterval: TimeSpan.FromSeconds(1),
+                        serviceName: "aspire-documentdb-backend")
+                    .WaitFor(backendCollector);
+                break;
+
             default:
                 throw new InvalidOperationException(
                     $"{ScenarioEnvironmentVariable} must name a known scenario, but was '{scenario}'.");
@@ -443,6 +475,22 @@ public class Program
         return string.IsNullOrWhiteSpace(value)
             ? throw new InvalidOperationException($"{variable} must be set.")
             : value;
+    }
+
+    private const string OtelCollectorEndpoint = "http://otel-collector:4317";
+
+    private static IResourceBuilder<ContainerResource> AddOtelCollector(IDistributedApplicationBuilder builder, string outputPath)
+    {
+        var otelConfigPath = CreateOtelCollectorConfiguration(outputPath);
+        return builder.AddContainer(
+                "otel-collector",
+                "otel/opentelemetry-collector-contrib",
+                "0.130.1")
+            .WithBindMount(otelConfigPath, "/etc/otelcol-contrib/config.yaml", isReadOnly: true)
+            .WithBindMount(outputPath, "/var/lib/otel")
+            .WithContainerRuntimeArgs("--user", "0:0")
+            .WithArgs("--config=/etc/otelcol-contrib/config.yaml")
+            .WithEndpoint(targetPort: 4317, name: "grpc");
     }
 
     private static string CreateOtelCollectorConfiguration(string outputPath)

@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
+using Aspire.Hosting.DocumentDB.Tests;
 
 namespace Aspire.Hosting.Utils;
 
@@ -16,7 +17,7 @@ public sealed class DockerUtils
                 Thread.Sleep(1000);
             }
 
-            if (Process.Start("docker", $"volume rm {volumeName}") is { } process)
+            if (Process.Start(DocumentDBContainerRuntime.Executable, $"volume rm {volumeName}") is { } process)
             {
                 var exited = process.WaitForExit(TimeSpan.FromSeconds(3));
                 var done = exited && process.ExitCode == 0;
@@ -32,7 +33,7 @@ public sealed class DockerUtils
 
         if (throwOnFailure)
         {
-            if (Process.Start("docker", $"volume inspect {volumeName}") is { } process)
+            if (Process.Start(DocumentDBContainerRuntime.Executable, $"volume inspect {volumeName}") is { } process)
             {
                 var exited = process.WaitForExit(TimeSpan.FromSeconds(3));
                 var exitCode = process.ExitCode;

@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 PACKAGE_TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MSBUILD_PROPERTY = re.compile(r"\$\(([A-Za-z_][A-Za-z0-9_]*)\)")
 
 
 class ValidationError(Exception):
@@ -106,6 +108,112 @@ def validate_package(artifacts: Path, tag: str | None = None) -> tuple[Path, str
     return package, package_id, package_version
 
 
+def _local(element: ET.Element) -> str:
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def _msbuild_property(project: Path, name: str, depth: int = 0) -> str | None:
+    """Reads a property from the project or the nearest Directory.Build.props; enough for plain values."""
+    candidates = [project]
+    for directory in project.parents:
+        props = directory / "Directory.Build.props"
+        if props.is_file():
+            candidates.append(props)
+            break
+    for candidate in candidates:
+        for element in ET.parse(candidate).getroot().iter():
+            if _local(element) == name and element.text and element.text.strip():
+                value = element.text.strip()
+                if depth < 5:
+                    value = MSBUILD_PROPERTY.sub(
+                        lambda m: _msbuild_property(project, m.group(1), depth + 1) or m.group(0), value
+                    )
+                return value
+    return None
+
+
+def read_project_expectations(project: Path) -> dict:
+    """What the packed package must contain, derived from the project file itself."""
+    if not project.is_file():
+        raise ValidationError(f"Project file {project} does not exist.")
+
+    root = ET.parse(project).getroot()
+    public, private = set(), set()
+    root_files = set()
+    for element in root.iter():
+        if _local(element) == "PackageReference" and element.get("Include"):
+            private_assets = element.get("PrivateAssets") or _element_text(element, "PrivateAssets") or ""
+            (private if private_assets.lower() == "all" else public).add(element.get("Include"))
+        elif (
+            _local(element) == "None"
+            and (element.get("Pack") or "").lower() == "true"
+            and element.get("PackagePath") in ("\\", "/", "")
+            and "*" not in (element.get("Include") or "*")
+        ):
+            root_files.add(re.split(r"[\\/)]", element.get("Include"))[-1])
+
+    return {
+        "tfm": _msbuild_property(project, "TargetFramework"),
+        "license": _msbuild_property(project, "PackageLicenseExpression"),
+        "icon": _msbuild_property(project, "PackageIcon"),
+        "readme": _msbuild_property(project, "PackageReadmeFile"),
+        "root_files": root_files,
+        "public_dependencies": public,
+        "private_dependencies": private,
+    }
+
+
+def validate_package_contents(package: Path, package_id: str, project: Path) -> None:
+    expected = read_project_expectations(project)
+    tfm = expected["tfm"]
+    if not tfm or "$(" in tfm:
+        raise ValidationError(f"Could not resolve TargetFramework from {project}.")
+
+    with zipfile.ZipFile(package) as archive:
+        names = set(archive.namelist())
+        nuspec_name = next(n for n in names if "/" not in n and n.lower().endswith(".nuspec"))
+        nuspec = ET.fromstring(archive.read(nuspec_name))
+    problems = []
+
+    lib_folders = {PurePosixPath(name).parts[1] for name in names if name.startswith("lib/")}
+    if lib_folders != {tfm}:
+        problems.append(f"lib/ must contain exactly {tfm!r}; found {sorted(lib_folders)}.")
+    for extension in ("dll", "xml"):
+        if f"lib/{tfm}/{package_id}.{extension}" not in names:
+            problems.append(f"missing lib/{tfm}/{package_id}.{extension}.")
+
+    for name in sorted(expected["root_files"]):
+        if name not in names:
+            problems.append(f"missing packed file {name!r}.")
+
+    for element_name in ("icon", "readme"):
+        value = _element_text(nuspec, element_name)
+        if value != expected[element_name]:
+            problems.append(f"nuspec {element_name} is {value!r}, expected {expected[element_name]!r}.")
+        elif value not in names:
+            problems.append(f"nuspec {element_name} {value!r} is not in the package.")
+
+    license_element = next((e for e in nuspec.iter() if _local(e) == "license"), None)
+    if (
+        license_element is None
+        or license_element.get("type") != "expression"
+        or (license_element.text or "").strip() != expected["license"]
+    ):
+        problems.append(f"nuspec license must be the expression {expected['license']!r}.")
+
+    groups = [e for e in nuspec.iter() if _local(e) == "group"]
+    if [g.get("targetFramework") for g in groups] != [tfm]:
+        problems.append(f"nuspec must have exactly one dependency group for {tfm!r}.")
+    dependencies = {d.get("id") for g in groups for d in g if _local(d) == "dependency"}
+    for missing in sorted(expected["public_dependencies"] - dependencies):
+        problems.append(f"dependency {missing!r} is missing.")
+    for leaked in sorted(expected["private_dependencies"] & dependencies):
+        problems.append(f"private dependency {leaked!r} must not ship.")
+
+    if problems:
+        raise ValidationError(f"Package {package.name} contents are wrong: " + " ".join(problems))
+
+
 def _fail(message: str) -> int:
     print(f"NuGet publish validation failed: {message}", file=sys.stderr)
     if os.environ.get("GITHUB_ACTIONS") == "true":
@@ -127,10 +235,17 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Release tag to require, or empty for non-publishing validation",
     )
+    parser.add_argument(
+        "--project",
+        type=Path,
+        help="Project the package was packed from (default: src/<package id>/<package id>.csproj)",
+    )
     args = parser.parse_args(argv)
 
     try:
         package, package_id, version = validate_package(args.artifacts, args.tag or None)
+        project = args.project or REPO_ROOT / "src" / package_id / f"{package_id}.csproj"
+        validate_package_contents(package, package_id, project)
     except ValidationError as error:
         return _fail(str(error))
 

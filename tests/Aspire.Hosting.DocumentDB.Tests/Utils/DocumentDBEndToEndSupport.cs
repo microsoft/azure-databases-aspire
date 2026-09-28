@@ -300,7 +300,7 @@ internal static class DocumentDBEndToEndSupport
         TimeSpan commandTimeout,
         params string[] arguments)
     {
-        var startInfo = new ProcessStartInfo("docker")
+        var startInfo = new ProcessStartInfo(DocumentDBContainerRuntime.Executable)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -565,7 +565,7 @@ internal static class DocumentDBEndToEndSupport
         await RunDockerAsync(
             "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh",
             "-v", isReadOnly ? $"{hostPath}:/probe:ro" : $"{hostPath}:/probe",
-            $"{DocumentDBContainerImageTags.Registry}/{DocumentDBContainerImageTags.Image}:{DocumentDBContainerImageTags.Tag}",
+            DocumentDBImageDigestLock.PinnedReference(DocumentDBContainerImageTags.Tag),
             "-c", shellCommand);
 
     /// <summary>Lists the entries of a bind-mounted host directory from inside a container.</summary>

@@ -5,21 +5,18 @@ Repository automation scripts.
 ## `check-documentdb-versions.py`
 
 Detects new upstream DocumentDB releases and rewrites
-`src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs` plus the auto-generated block in
-`CHANGELOG.md`. Intentionally does **not** edit
-`src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` — that file is the public API
-baseline and must be updated by hand on the auto-PR before merging, so it stays an independent,
-human-reviewed record of public-API changes. The unit test
-`VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` enforces this for the
-generated surface: CI fails on the auto-PR until every new enum member (and its string constant)
-is present in the baseline. It checks nothing else — no analyzer compares the rest of the
-baseline, so any other public-API change relies on PR review.
+`src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs`, the auto-generated block in `CHANGELOG.md`,
+and `src/Aspire.Hosting.DocumentDB/PublicAPI.Unshipped.txt` (the new enum members and string
+constants, which PublicApiAnalyzers otherwise rejects with RS0016). The rest of the public API is
+guarded by the same analyzer: any change to it fails the build until `PublicAPI.*.txt` records it.
 
 ### Usage
 
 ```bash
 # From the repo root.
 python3 eng/scripts/check-documentdb-versions.py
+# Re-resolve every tag in eng/documentdb-image-digests.json; nonzero on drift.
+python3 eng/scripts/check-documentdb-versions.py --verify-digests
 ```
 
 Optional: set `GITHUB_TOKEN` to use authenticated GitHub API requests (avoids the 60/hr
@@ -93,7 +90,7 @@ the Guard column names a test, that test fails until you do — the rows marked 
 |---|---|
 | `DocumentDBPostgresVersion` in `src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs` (append-only; numeric value is the PG major) | compile-time |
 | `WithPostgresVersion` validation message in `src/Aspire.Hosting.DocumentDB/DocumentDBBuilderExtensions.cs` | none — check by hand |
-| Public API baseline `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` | `VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` |
+| The new `DocumentDBPostgresVersion.PgNN` line in `src/Aspire.Hosting.DocumentDB/PublicAPI.Unshipped.txt` | PublicApiAnalyzers (RS0016) |
 | `REQUIRED_PG_SET` here in the script — or `DEFERRED_PG_SET` if upstream has not published the tag for every version you intend to adopt yet — and the matching docstring line | `VersionAutomationScriptTests.EveryPgVariantIsRequiredOrExplicitlyDeferred`, `RequiredPgSetIsASubsetOfDocumentDBPostgresVersion`, `ProseRestatementsOfRequiredPgSetMatchTheConstant` |
 | The `` `{15, 16, 17, 18}` `` restatement in [Output rules](#output-rules) above | `ProseRestatementsOfRequiredPgSetMatchTheConstant` |
 | The expected set in `eng/scripts/tests/test_check_documentdb_versions.py` (`RequiredPgSetTests`) | itself |
@@ -120,10 +117,11 @@ rewritten. The rest is deliberately manual, and CI stays red until it is done:
 
 | Place | Guard |
 |---|---|
-| Public API baseline `src/Aspire.Hosting.DocumentDB/api/Aspire.Hosting.DocumentDB.cs` (new enum member + string constant) | `VersionAutomationScriptTests.ApiBaselineListsEveryPublicEnumMember` |
 | `WithImageTag("pgNN-X.Y.Z")` pin in `tests/Aspire.Hosting.DocumentDB.PostgresEndToEndApp/Program.cs`, plus the comments quoting it in `DocumentDBIntegrationTests.cs` | `VersionAutomationScriptTests.PostgresEndToEndAppPinsTheCurrentLatestVersion` |
 | `\| Image tag \|` row in `docs/configuration.md` and the `docker pull` example in `docs/troubleshooting.md` | `VersionAutomationScriptTests.DocsQuoteTheCurrentDefaultImageTag` |
 | Release notes: move the generated block's content into a dated `## [X.Y.Z]` section when you cut the package release, and reset the block body to its "nothing detected" placeholder line | `test_unreleased_block_does_not_restate_an_already_released_version` (Python suite) — a version left in both places fails it |
+| Release cut: move the lines of `src/Aspire.Hosting.DocumentDB/PublicAPI.Unshipped.txt` (below `#nullable enable`) into `PublicAPI.Shipped.txt` | none |
+| After the release is on nuget.org: advance `PackageValidationBaselineVersion` in the `package` job of `.github/workflows/build-and-test.yml` to it | none |
 | Release cut: keep a `## [Unreleased]` heading above the markers after renaming the old one | `test_repo_changelog_markers_live_in_the_unreleased_section` (Python suite); every detection run also warns, annotates, and refuses to adopt until it is fixed |
 | Optional: an `InlineData` case in `DocumentDBVersionSelectionTests.WithDocumentDBVersionAloneSetsExpectedTag` | none — the drift guard in that file already covers correctness |
 
@@ -152,8 +150,10 @@ Two caveats:
 
 ### Trust assumption
 
-GHCR tags are mutable. "Version supported" here means "tag exists at the time of the check",
-not "image bytes are immutable". Pinning by digest is a future enhancement.
+GHCR tags are mutable. "Version supported" here means "tag exists at the time of the check".
+`eng/documentdb-image-digests.json` records each adopted tag's index and platform digests as
+first seen (trust on first use): adoption only appends to it, refuses a tag whose recorded
+digests changed, and `--verify-digests` reports any later re-push.
 
 ### Tests
 
@@ -181,7 +181,30 @@ standard-library suite.
 
 The companion C# drift guard
 `VersionAutomationScriptTests` (in `tests/Aspire.Hosting.DocumentDB.Tests`) covers what only .NET
-can see: that `REQUIRED_PG_SET` stays a subset of `DocumentDBPostgresVersion`, that the public API
-baseline lists every shipped enum member, and that the hand-maintained variant lists in the
+can see: that `REQUIRED_PG_SET` stays a subset of `DocumentDBPostgresVersion` and that the
+hand-maintained variant lists in the
 documentation match the enum. Behavioral assertions about the script itself belong in the Python
 suite, which executes the real functions.
+
+## `check-coverage.py`
+
+Fails CI when line or branch coverage in a Cobertura report falls below the committed baseline
+in `eng/coverage/*.json`. The baselines only move up, by hand: when the check prints that
+coverage is well above baseline, raise the number in the same PR. `--package` scopes the
+measurement to one assembly; `--require-file` fails if a source file is missing from the report.
+
+## Accepted risks
+
+Not gated by CI, by decision; owner @guanzhousongmicrosoft:
+
+- Upstream DocumentDB query semantics (collation, RUM indexes, parallel aggregates), docs prose,
+  load/soak testing, and Docker Desktop behaviour.
+- Consumer image pulls stay mutable: the package pulls by tag, so
+  `eng/documentdb-image-digests.json` only verifies this repository's own pulls.
+- Style rules left at suggestion level in `.editorconfig` stay suggestions.
+
+Not gated yet:
+
+- The 0.117 TOAST contract test waits for PR #134 (DocumentDB 0.117) to merge.
+- Telemetry log parser fixtures wait for PR #134, which adds the parser.
+- `unit-test-pilot` (Windows, macOS) joins `ci-gate` only after a green week.

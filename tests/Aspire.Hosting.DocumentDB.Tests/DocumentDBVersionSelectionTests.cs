@@ -26,14 +26,32 @@ public class DocumentDBVersionSelectionTests
         Assert.Equal($"pg17-{DocumentDBVersions.Latest}", DocumentDBContainerImageTags.Tag);
     }
 
+    /// <summary>
+    /// Hand-written literals, deliberately not derived from the production map, so a wrong
+    /// mapping cannot agree with itself.
+    /// </summary>
+    public static TheoryData<DocumentDBVersion, string> ExpectedTags { get; } = new()
+    {
+        { DocumentDBVersion.V0_109_0, "pg17-0.109.0" },
+        { DocumentDBVersion.V0_110_0, "pg17-0.110.0" },
+        { DocumentDBVersion.V0_111_0, "pg17-0.111.0" },
+        { DocumentDBVersion.V0_112_0, "pg17-0.112.0" },
+        { DocumentDBVersion.V0_113_0, "pg17-0.113.0" },
+        { DocumentDBVersion.V0_114_0, "pg17-0.114.0" },
+        { DocumentDBVersion.V0_116_0, "pg17-0.116.0" },
+    };
+
+    [Fact]
+    public void ExpectedTagsCoverEveryDocumentDBVersion()
+    {
+        // A newly adopted member must get a literal row above, not just pass through the
+        // lockstep checks that read the production map.
+        var covered = ExpectedTags.Select(row => (DocumentDBVersion)row[0]).Order();
+        Assert.Equal(Enum.GetValues<DocumentDBVersion>().Order(), covered);
+    }
+
     [Theory]
-    [InlineData(DocumentDBVersion.V0_109_0, "pg17-0.109.0")]
-    [InlineData(DocumentDBVersion.V0_110_0, "pg17-0.110.0")]
-    [InlineData(DocumentDBVersion.V0_111_0, "pg17-0.111.0")]
-    [InlineData(DocumentDBVersion.V0_112_0, "pg17-0.112.0")]
-    [InlineData(DocumentDBVersion.V0_113_0, "pg17-0.113.0")]
-    [InlineData(DocumentDBVersion.V0_114_0, "pg17-0.114.0")]
-    [InlineData(DocumentDBVersion.V0_116_0, "pg17-0.116.0")]
+    [MemberData(nameof(ExpectedTags))]
     public void WithDocumentDBVersionAloneSetsExpectedTag(DocumentDBVersion version, string expectedTag)
     {
         var appBuilder = DistributedApplication.CreateBuilder();
