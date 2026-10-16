@@ -91,7 +91,8 @@ public class Program
             return;
         }
 
-        var documentDB = builder.AddDocumentDB(ResourceName);
+        // Test containers must not report usage telemetry; a CI runner's variables never reach them.
+        var documentDB = builder.AddDocumentDB(ResourceName).WithoutUsageTelemetry();
 
         switch (scenario)
         {

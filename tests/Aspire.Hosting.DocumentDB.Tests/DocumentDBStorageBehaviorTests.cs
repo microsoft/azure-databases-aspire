@@ -37,6 +37,9 @@ public class DocumentDBStorageBehaviorTests
 
     private static string InterlockedImage(string version) => DocumentDBImageDigestLock.PinnedReference($"pg17-{version}");
 
+    /// <summary>From <c>1.0.0</c> a data directory the image cannot use stops it at once with an explicit error.</summary>
+    private static bool FailsFast(string version) => Version.Parse(version) >= new Version(1, 0, 0);
+
     private static readonly string s_baselineImage = DocumentDBImageDigestLock.PinnedReference($"pg17-{BaselineVersion}");
 
     /// <summary>
@@ -53,6 +56,7 @@ public class DocumentDBStorageBehaviorTests
         "-e", $"USERNAME={ProbeUserName}",
         "-e", $"PASSWORD={ProbePassword}",
         "-e", "SKIP_INIT_DATA=true",
+        "-e", "DOCUMENTDB_USAGE_TELEMETRY=false",
     ];
 
     /// <summary>Publishes the gateway on a random loopback port, for tests that talk to it.</summary>
@@ -257,13 +261,13 @@ public class DocumentDBStorageBehaviorTests
     public class ReadOnlyDataDirectory
     {
         /// <summary>
-        /// A read-only data directory cannot work: <c>initdb</c> has to take ownership of it. The
-        /// failure is also slow and misattributed, which is why the package rejects the configuration
-        /// at build time instead of letting the container run.
+        /// A read-only data directory cannot work: <c>initdb</c> has to take ownership of it. Before
+        /// <c>1.0.0</c> the failure is also slow and misattributed, which is why the package rejects
+        /// the configuration at build time instead of letting the container run.
         /// </summary>
         [Theory]
         [MemberData(nameof(InterlockedVersions), MemberType = typeof(DocumentDBStorageBehaviorTests))]
-        public async Task ReadOnlyDataDirectoryFailsInitializationWithAMisleadingTimeout(string version)
+        public async Task ReadOnlyDataDirectoryFailsInitialization(string version)
         {
             RequireDocker();
             var image = InterlockedImage(version);
@@ -281,16 +285,24 @@ public class DocumentDBStorageBehaviorTests
                     ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
                 Assert.Equal(0, runExit);
 
-                // The banner a user actually notices blames PostgreSQL start-up timing, and only
-                // appears a full minute after the container already knew it could not proceed.
-                var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
+                if (FailsFast(version))
+                {
+                    var logs = await WaitForLogAsync(containerName, "Error: cannot set permissions on data directory /data.");
+                    Assert.Contains("chmod: changing permissions of '/data': Read-only file system", logs, StringComparison.Ordinal);
+                }
+                else
+                {
+                    // The banner a user actually notices blames PostgreSQL start-up timing, and only
+                    // appears a full minute after the container already knew it could not proceed.
+                    var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
 
-                // The real causes are individual lines inside interleaved log streams.
-                Assert.Contains("chown: changing ownership of '/data': Read-only file system", logs, StringComparison.Ordinal);
-                Assert.Contains(
-                    "initdb: error: could not change permissions of directory \"/data\": Read-only file system",
-                    logs,
-                    StringComparison.Ordinal);
+                    // The real causes are individual lines inside interleaved log streams.
+                    Assert.Contains("chown: changing ownership of '/data': Read-only file system", logs, StringComparison.Ordinal);
+                    Assert.Contains(
+                        "initdb: error: could not change permissions of directory \"/data\": Read-only file system",
+                        logs,
+                        StringComparison.Ordinal);
+                }
 
                 // The banner is logged before the entrypoint unwinds, so the exit code is only stable
                 // once the container has actually stopped.
@@ -551,7 +563,9 @@ public class DocumentDBStorageBehaviorTests
                     ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
                 Assert.Equal(0, runExit);
 
-                var logs = await WaitForLogAsync(containerName, "PostgreSQL failed to start within 60 seconds");
+                var logs = await WaitForLogAsync(
+                    containerName,
+                    FailsFast(version) ? "Error: start_oss_server.sh failed (status 1)" : "PostgreSQL failed to start within 60 seconds");
 
                 Assert.Contains(
                     "Directory /data exists but doesn't appear to contain a valid PostgreSQL data directory",

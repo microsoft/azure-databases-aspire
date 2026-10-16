@@ -66,6 +66,7 @@ Then inject `IMongoClient` wherever you need it. The connection string is resolv
 | `.WithDocumentDBVersion(version)` | Pin a curated DocumentDB version (default: latest known to this build) |
 | `.WithPostgresVersion(pgVersion)` | Choose PG15/16/17/18 backend variant (default: Pg17) |
 | `.WithPostgresEndpoint(port?)` | Also expose the PostgreSQL backend port (9712) and enable `PostgresConnectionStringExpression` |
+| `.WithoutUsageTelemetry()` | Turn off the DocumentDB `1.0.0`+ image's usage telemetry, which is on by default ([details](docs/configuration.md#withoutusagetelemetry)) |
 
 See the [Configuration Reference](docs/configuration.md) for details, code examples, and default values.
 

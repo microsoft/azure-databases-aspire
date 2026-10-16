@@ -17,8 +17,14 @@ public class Program
         // new DocumentDB version. The v0.112-0 floor is enforced by WithPostgresEndpoint()
         // itself; see https://github.com/microsoft/azure-databases-aspire/issues/71.
         builder.AddDocumentDB("documentdb")
-            .WithImageTag("pg17-0.117.0")
+            .WithImageTag("pg17-1.0.0")
             .WithPostgresEndpoint();
+
+        // Test containers must not report usage telemetry; a CI runner's variables never reach them.
+        foreach (var server in builder.Resources.OfType<Aspire.Hosting.ApplicationModel.DocumentDBServerResource>().ToList())
+        {
+            builder.CreateResourceBuilder(server).WithoutUsageTelemetry();
+        }
 
         var app = builder.Build();
 

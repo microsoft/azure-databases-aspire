@@ -195,6 +195,7 @@ public static class DocumentDBBuilderExtensions
     private const string OwnerEnvVarName = "OWNER";
     private const string DataPathEnvVarName = "DATA_PATH";
     private const string DisableExtendedRumEnvVarName = "DISABLE_EXTENDED_RUM";
+    private const string UsageTelemetryEnvVarName = "DOCUMENTDB_USAGE_TELEMETRY";
     private const string CreateUserEnvVarName = "CREATE_USER";
     private const string AllowExternalConnectionsEnvVarName = "ALLOW_EXTERNAL_CONNECTIONS";
 
@@ -214,7 +215,7 @@ public static class DocumentDBBuilderExtensions
     private const string GatewayValueTakingOptionsShellPattern =
         "--allow-external-connections|--cert-path|--create-user|--documentdb-port|--enable-telemetry|" +
         "--init-data|--init-data-path|--key-file|--log-level|--owner|--password|--pg-port|--start-pg|" +
-        "--tlsMode|--toast-compression|--username";
+        "--tlsMode|--toast-compression|--usage-telemetry|--username";
 
     /// <summary>
     /// Builds the wrapper script that makes the OpenTelemetry environment variables this package
@@ -1810,8 +1811,9 @@ public static class DocumentDBBuilderExtensions
     /// <para>
     /// The data directory must be writable. The entrypoint takes ownership of it (the container's
     /// <c>documentdb</c> runtime user) and PostgreSQL initialises and writes WAL there, so
-    /// <paramref name="isReadOnly"/> is rejected rather than being allowed to fail a minute into
-    /// startup behind a misleading "PostgreSQL failed to start within 60 seconds" banner.
+    /// <paramref name="isReadOnly"/> is rejected rather than being allowed to fail at startup; before
+    /// <c>1.0.0</c> that failure came a minute in, behind a misleading "PostgreSQL failed to start
+    /// within 60 seconds" banner.
     /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder.</param>
@@ -1874,12 +1876,13 @@ public static class DocumentDBBuilderExtensions
     /// A directory that contains anything else (a stray <c>.gitkeep</c> or <c>.DS_Store</c> is
     /// enough) is refused, not cleaned: the container logs <c>Directory /data exists but doesn't
     /// appear to contain a valid PostgreSQL data directory</c>, never starts PostgreSQL, and exits
-    /// non-zero a minute later behind the "PostgreSQL failed to start within 60 seconds" banner.
+    /// non-zero; before <c>1.0.0</c> only a minute later, behind the "PostgreSQL failed to start
+    /// within 60 seconds" banner.
     /// </para>
     /// <para>
     /// <paramref name="isReadOnly"/> is rejected: PostgreSQL cannot initialise or run against a
-    /// read-only data directory, and the container would otherwise spend a minute failing with a
-    /// misleading "PostgreSQL failed to start within 60 seconds" banner.
+    /// read-only data directory, and before <c>1.0.0</c> the container would spend a minute failing
+    /// with a misleading "PostgreSQL failed to start within 60 seconds" banner.
     /// </para>
     /// <para>
     /// A bind mount only carries a PostgreSQL data directory on a container runtime that applies
@@ -1931,10 +1934,11 @@ public static class DocumentDBBuilderExtensions
     private static string ReadOnlyDataMountMessage(string methodName, string targetPath) =>
         $"{methodName}(isReadOnly: true) is not supported: DocumentDB requires a writable data " +
         $"directory. The container entrypoint takes ownership of '{targetPath}' and lets " +
-        $"PostgreSQL initialise and write WAL there, so a read-only mount fails about a minute " +
-        $"into startup behind the misleading banner 'PostgreSQL failed to start within 60 " +
-        $"seconds' (the real cause, 'initdb: error: could not change permissions of directory " +
-        $"\"{targetPath}\": Read-only file system', is buried in interleaved container logs). " +
+        $"PostgreSQL initialise and write WAL there, so a read-only mount fails at startup. " +
+        $"DocumentDB 1.0.0 stops with 'Error: cannot set permissions on data directory'; older " +
+        $"images fail about a minute in behind the misleading banner 'PostgreSQL failed to start " +
+        $"within 60 seconds' (the real cause, 'initdb: error: could not change permissions of " +
+        $"directory \"{targetPath}\": Read-only file system', is buried in interleaved container logs). " +
         $"Recovery: mount the data directory writable, and mount read-only content elsewhere — " +
         $"for example WithInitData(...), which mounts seed scripts read-only at " +
         $"'{InitDataMountPath}'.";
@@ -2211,8 +2215,8 @@ public static class DocumentDBBuilderExtensions
     /// silently clamps it, so the mount lands somewhere other than the path that was
     /// written;</description></item>
     /// <item><description>a read-only mount backing the data path — PostgreSQL cannot initialise
-    /// or write there, and the container burns 60 seconds before reporting an unrelated-looking
-    /// timeout;</description></item>
+    /// or write there, and before <c>1.0.0</c> the container burns 60 seconds before reporting an
+    /// unrelated-looking timeout;</description></item>
     /// <item><description>two mounts on the same backing target — the container runtime rejects
     /// duplicate mount targets;</description></item>
     /// <item><description>a data directory shared with another DocumentDB resource's data
@@ -3344,10 +3348,11 @@ public static class DocumentDBBuilderExtensions
         return
             $"DocumentDB resource '{resource.Name}' mounts {backing} read-only. DocumentDB requires " +
             $"a writable data directory: the container entrypoint takes ownership of it and " +
-            $"PostgreSQL initialises and writes WAL there. The container would run for about a " +
-            $"minute and then fail with the misleading banner 'PostgreSQL failed to start within 60 " +
-            $"seconds', hiding the real cause ('initdb: error: could not change permissions of " +
-            $"directory \"{dataPath}\": Read-only file system'). Recovery: mount {source} writable, " +
+            $"PostgreSQL initialises and writes WAL there. DocumentDB 1.0.0 would stop with 'Error: " +
+            $"cannot set permissions on data directory'; older images run for about a minute and " +
+            $"then fail with the misleading banner 'PostgreSQL failed to start within 60 seconds', " +
+            $"hiding the real cause ('initdb: error: could not change permissions of directory " +
+            $"\"{dataPath}\": Read-only file system'). Recovery: mount {source} writable, " +
             $"or use WithDataVolume()/WithDataBindMount(...), which reject read-only data storage " +
             $"up front.";
     }
@@ -4000,11 +4005,12 @@ public static class DocumentDBBuilderExtensions
     /// token in that position is an operand rather than a possible <c>--data-path</c>.
     /// </summary>
     /// <remarks>
-    /// Taken from the entrypoint's own argument loop from <c>0.112.0</c> through <c>0.117.0</c>.
-    /// <c>--toast-compression</c> exists only in <c>0.116.0</c>; <c>0.117.0</c> rejects it as an
-    /// unexpected argument, so keeping it here only affects which token is read as its operand.
-    /// Options that take no operand (<c>-h</c>,
-    /// <c>--help</c>, <c>--skip-init-data</c>, <c>--disable-extended-rum</c>) are deliberately
+    /// Taken from the entrypoint's own argument loop from <c>0.112.0</c> through <c>1.0.0</c>.
+    /// <c>--toast-compression</c> exists in <c>0.116.0</c> and from <c>1.0.0</c>, and
+    /// <c>--usage-telemetry</c> from <c>1.0.0</c>; older images reject them as unexpected
+    /// arguments, so keeping them here only affects which token is read as the operand.
+    /// Options that take no operand (<c>-h</c>, <c>--help</c>, <c>--skip-init-data</c>,
+    /// <c>--disable-extended-rum</c>, <c>--disable-usage-telemetry</c>) are deliberately
     /// absent: the token after one of those is read as the next option name. An option a future
     /// image adds is absent too, which fails the deferred token closed — the safe direction.
     /// </remarks>
@@ -4025,6 +4031,7 @@ public static class DocumentDBBuilderExtensions
         "--start-pg",
         "--tlsMode",
         "--toast-compression",
+        "--usage-telemetry",
         "--username",
     };
 
@@ -4220,8 +4227,9 @@ public static class DocumentDBBuilderExtensions
     /// by setting <c>DISABLE_EXTENDED_RUM=true</c>.
     /// </summary>
     /// <remarks>
-    /// Available in DocumentDB <c>v0.111-0</c> and later. On older container images the
-    /// environment variable is ignored.
+    /// Available in DocumentDB <c>v0.111-0</c> through <c>v0.117-0</c>. Older images ignore the
+    /// environment variable, and from <c>v1.0-0</c> the image ignores it with a deprecation
+    /// warning and always installs <c>documentdb_extended_rum</c> on a new data volume.
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
@@ -4236,6 +4244,27 @@ public static class DocumentDBBuilderExtensions
     }
 
     /// <summary>
+    /// Turns off the DocumentDB Local container's usage telemetry by setting
+    /// <c>DOCUMENTDB_USAGE_TELEMETRY=false</c>.
+    /// </summary>
+    /// <remarks>
+    /// From <c>v1.0-0</c> the image reports its version, platform and CPU architecture at
+    /// startup and hourly unless told not to. Older images ignore the variable. This is separate
+    /// from the gateway's OpenTelemetry metrics configured by <see cref="WithOpenTelemetryMetrics"/>.
+    /// </remarks>
+    /// <param name="builder">The resource builder for DocumentDB.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    public static IResourceBuilder<DocumentDBServerResource> WithoutUsageTelemetry(this IResourceBuilder<DocumentDBServerResource> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithDocumentDBEnvironment(context =>
+        {
+            context.EnvironmentVariables[UsageTelemetryEnvVarName] = "false";
+        });
+    }
+
+    /// <summary>
     /// Disables the DocumentDB Local container's automatic user creation by setting the
     /// upstream <c>CREATE_USER=false</c> environment variable.
     /// </summary>
@@ -4245,7 +4274,7 @@ public static class DocumentDBBuilderExtensions
     /// <see cref="WithoutSampleData"/> so the default initialization does not require the skipped
     /// credentials.
     /// <para>
-    /// For images from <c>0.113.0</c> onward, including <c>0.117.0</c>, built-in sample
+    /// For images from <c>0.113.0</c> onward, including <c>1.0.0</c>, built-in sample
     /// initialization does not run unless requested. A fresh container can therefore remain
     /// running with user creation disabled when no initialization requiring those credentials is
     /// requested. The generated connection strings still will not authenticate unless the user

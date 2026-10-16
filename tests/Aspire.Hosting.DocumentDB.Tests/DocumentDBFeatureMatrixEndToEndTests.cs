@@ -36,7 +36,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Collection(DocumentDBFeatureMatrixAppHostCollection.Name)]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
-    private const string ReleasedVersion = DocumentDBVersions.V0_117_0;
+    private const string ReleasedVersion = DocumentDBVersions.V1_0_0;
     private const string QuietWindowControlMarker = "[ASPIRE-TEST] quiet-window-control";
     private static readonly Regex GatewayDebugInsertRegex = new(
         @"DEBUG[^\r\n]*documentdb_api\.insert",
@@ -340,9 +340,9 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Theory]
     [Trait("Shard", "2")]
-    // 0.116.0 compressed large values with lz4, which 0.117.0 no longer defaults to.
-    [InlineData("0.114.0", "pglz")]
+    // 0.116.0 compressed large values with lz4, which 0.117.0 did not default to.
     [InlineData("0.116.0", "lz4")]
+    [InlineData("0.117.0", "pglz")]
     public async Task PersistedPg17DataUpgradesToTheReleasedVersion(string sourceVersion, string sourceCompression)
     {
         RequireDocker();
@@ -457,7 +457,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
-    // "0.117.0" is catalog version "0.117-0".
+    // "0.117.0" is catalog version "0.117-0", "1.0.0" is "1.0-0".
     private static string ToCatalogVersion(string version)
     {
         var parsed = Version.Parse(version);
@@ -715,7 +715,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [Theory]
     [Trait("Shard", "3")]
     [InlineData("pg17-0.114.0", "pg17-0.114.0")]
-    [InlineData(null, "pg17-0.117.0")]
+    [InlineData(null, "pg17-1.0.0")]
     public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
     {
         RequireDocker();
@@ -1437,7 +1437,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
         {
-            var documentDB = appBuilder.AddDocumentDB("documentdb");
+            var documentDB = appBuilder.AddDocumentDB("documentdb").WithoutUsageTelemetry();
 
             if (serviceName is null)
             {
@@ -1597,6 +1597,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
             appBuilder.AddDocumentDB("documentdb")
+                .WithoutUsageTelemetry()
                 .WithEnvironment("CONFIG_DIR", "/custom-config")
                 .WithOpenTelemetryMetrics(enabled: false)
                 .WithImageTag(ReleasedTag(17)));
@@ -1855,9 +1856,11 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Theory]
     [Trait("Shard", "3")]
-    // 0.116.0 defaulted TOAST compression to lz4; 0.117.0 was cut without that change.
+    // 0.116.0 defaulted TOAST compression to lz4; 0.117.0 was cut without that change, and
+    // 1.0.0 restores it.
     [InlineData("pg17-0.116.0", "lz4")]
     [InlineData("pg17-0.117.0", "pglz")]
+    [InlineData("pg17-1.0.0", "lz4")]
     public async Task PostgresEndpointReportsTheImageToastCompressionDefault(string imageTag, string expected)
     {
         await AssertPostgresExtrasAsync(imageTag, expected);
@@ -1905,12 +1908,24 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         // WithoutExtendedRum: the access method must not be installed in the backend. Asserting
         // this through PostgreSQL is the only way to see the effect of DISABLE_EXTENDED_RUM.
-        var accessMethods = await QueryPostgresAsync(
-            postgresConnectionString!,
-            "SELECT count(*) FROM pg_am WHERE amname = 'extended_rum'",
-            cts.Token);
-
-        Assert.Equal(0L, Convert.ToInt64(accessMethods));
+        var version = Version.Parse(imageTag?.Split('-', 2)[1] ?? DocumentDBVersions.Latest);
+        if (version >= new Version(1, 0, 0))
+        {
+            // 1.0.0 ignores the variable and keeps indexing through extended RUM.
+            var handler = await QueryPostgresAsync(
+                postgresConnectionString!,
+                "SHOW documentdb.alternate_index_handler_name",
+                cts.Token);
+            Assert.Equal("extended_rum", Convert.ToString(handler));
+        }
+        else
+        {
+            var accessMethods = await QueryPostgresAsync(
+                postgresConnectionString!,
+                "SELECT count(*) FROM pg_am WHERE amname = 'extended_rum'",
+                cts.Token);
+            Assert.Equal(0L, Convert.ToInt64(accessMethods));
+        }
 
         if (expectedToastCompression is not null)
         {

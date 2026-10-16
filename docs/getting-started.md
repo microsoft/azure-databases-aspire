@@ -59,6 +59,9 @@ This tells Aspire to:
 > [!NOTE]
 > `WaitFor` waits for DocumentDB's authenticated MongoDB `ping` health check, which confirms that the gateway is reachable. From DocumentDB `0.116.0`, custom one-shot initialization can continue after the gateway becomes healthy, so services that depend on seeded data should still retry until that data is available.
 
+> [!NOTE]
+> From DocumentDB `1.0.0`, the default image sends usage telemetry (image version, platform and CPU architecture) at startup and hourly. Add `.WithoutUsageTelemetry()` to turn it off. See [WithoutUsageTelemetry](configuration.md#withoutusagetelemetry).
+
 ## Install the MongoDB client package
 
 In your **service** project (for example, `MyApp.ApiService`), add the Aspire MongoDB driver integration:
