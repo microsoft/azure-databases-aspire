@@ -77,7 +77,8 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithLogLevel(level)` | Set gateway `DOCUMENTDB_LOG_LEVEL` and entrypoint-contract `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
 | `.WithInitData(source)` | Bind-mount initialization scripts to `/init_doc_db.d` and disable built-in sample data |
 | `.WithoutSampleData()` | Disable the built-in sample data initialization |
-| `.WithoutExtendedRum()` | Disable the `extended_rum` index access method (DocumentDB v0.111.0+) |
+| `.WithoutExtendedRum()` | Disable the `extended_rum` index access method (DocumentDB v0.111.0 through v0.114.0; no effect from v0.116.0) |
+| `.WithoutUsageTelemetry()` | Turn off the image's usage telemetry (DocumentDB v1.0.0+) |
 | `.WithoutUserCreation()` | Skip automatic user creation on container startup |
 | `.WithTlsCertificate(certPath, keyPath)` | Mount a custom TLS certificate and key into the container |
 | `.WithTelemetry(enabled?)` | **Obsolete.** No-op against gateway v0.112-0+; use `.WithOpenTelemetryMetrics(...)` instead. Kept for binary compatibility (`ASPIREDOCDB0001`). |
@@ -100,7 +101,7 @@ var documentdb = builder.AddDocumentDB("documentdb")
     .WithTlsCertificate("../certs/documentdb.pem", "../certs/documentdb.key")
     .WithOpenTelemetryMetrics(endpoint: "http://otel-collector:4317")
     .WithOwner("documentdb")
-    .WithoutExtendedRum();
+    .WithoutUsageTelemetry();
 
 var db = documentdb.AddDatabase("mydb");
 ```
@@ -122,7 +123,7 @@ configured through `WithInitData(...)`.
 For curated images 0.112.0 and older, built-in sample initialization is enabled
 by default, so `WithoutUserCreation()` must be paired with
 `WithoutSampleData()` on a fresh container. From 0.113.0 onward, including
-0.117.0, built-in sample initialization is opt-in and a fresh container can
+1.0.0, built-in sample initialization is opt-in and a fresh container can
 remain running without creating the user when no initialization requiring those
 credentials is requested. Generated connection strings still will not
 authenticate unless that user already exists, typically in persisted storage
@@ -133,6 +134,15 @@ initialization can fail if the skipped user does not already exist.
 `WithTlsCertificate(...)` mounts the certificate and key files at distinct
 container paths, so they can be supplied even when their host file names are
 identical.
+
+### Usage telemetry
+
+From DocumentDB `1.0.0`, the default image sends usage telemetry: its version, platform and CPU
+architecture at startup and then hourly. The receiving service also sees your network address, so
+don't treat it as anonymous. This package leaves the image default on. Turn it off with
+`.WithoutUsageTelemetry()`, or set `DO_NOT_TRACK=1` or `NO_ANALYTICS=1` on the resource with
+`.WithEnvironment(...)`. Variables set in your shell or CI job don't reach the container. See the
+upstream [privacy statement](https://github.com/documentdb/documentdb/blob/v1.0-0/documentdb-local/PRIVACY.md).
 
 ### Connection strings
 

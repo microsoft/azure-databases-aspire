@@ -3037,6 +3037,22 @@ public class AddDocumentDBTests
         Assert.Equal(2, arguments.Length);
     }
 
+    /// <summary>1.0.0 adds <c>--usage-telemetry</c>, which takes a value like the others.</summary>
+    [Fact]
+    public async Task ADeferredUsageTelemetryValueIsAnOperand()
+    {
+        var appBuilder = CreateAppBuilder();
+        var enabled = appBuilder.AddParameter("enabled", "false");
+        appBuilder.AddDocumentDB("DocumentDB").WithArgs("--usage-telemetry", enabled);
+
+        using var app = appBuilder.Build();
+
+        var arguments = await ConfigureArgumentsAsync(app, "DocumentDB");
+
+        Assert.Equal("--usage-telemetry", arguments[0]);
+        Assert.Equal(2, arguments.Length);
+    }
+
     /// <summary>
     /// The entrypoint consumes exactly one token after a value-taking option, whatever that token
     /// looks like. <c>--username --owner X</c> therefore feeds <c>--owner</c> to <c>--username</c>
@@ -4341,6 +4357,22 @@ public class AddDocumentDBTests
 
         var env = await BuildEnvironmentVariablesAsync(containerResource);
         Assert.Equal("true", env["DISABLE_EXTENDED_RUM"]);
+    }
+
+    [Fact]
+    public async Task WithoutUsageTelemetryAddsEnvironmentVariable()
+    {
+        var appBuilder = DistributedApplication.CreateBuilder();
+        appBuilder.AddDocumentDB("DocumentDB")
+            .WithoutUsageTelemetry();
+
+        using var app = appBuilder.Build();
+
+        var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var containerResource = Assert.Single(appModel.Resources.OfType<DocumentDBServerResource>());
+
+        var env = await BuildEnvironmentVariablesAsync(containerResource);
+        Assert.Equal("false", env["DOCUMENTDB_USAGE_TELEMETRY"]);
     }
 
     [Fact]

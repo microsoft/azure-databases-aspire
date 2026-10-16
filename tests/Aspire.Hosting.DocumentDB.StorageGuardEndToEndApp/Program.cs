@@ -312,6 +312,12 @@ public class Program
                     .WithVolume("documentdb-read-only-data", "/data", isReadOnly: true);
                 break;
         }
+        // Test containers must not report usage telemetry; a CI runner's variables never reach them.
+        foreach (var server in builder.Resources.OfType<Aspire.Hosting.ApplicationModel.DocumentDBServerResource>().ToList())
+        {
+            builder.CreateResourceBuilder(server).WithoutUsageTelemetry();
+        }
+
         using var app = builder.Build();
         await app.RunAsync();
     }

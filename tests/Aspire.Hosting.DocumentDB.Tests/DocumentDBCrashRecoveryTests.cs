@@ -91,6 +91,7 @@ public class DocumentDBCrashRecoveryTests
             "-e", $"USERNAME={UserName}",
             "-e", $"PASSWORD={Password}",
             "-e", "SKIP_INIT_DATA=true",
+            "-e", "DOCUMENTDB_USAGE_TELEMETRY=false",
             s_image);
         Assert.Equal(0, runExit);
 

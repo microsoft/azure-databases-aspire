@@ -226,7 +226,7 @@ jobs:
         env:
           IMAGES: ${{ matrix.images }}
         run: |
-          latest=$(grep -oE 'const string V0_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          latest=$(grep -oE 'const string V[0-9]+_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           read -ra tags <<< "${IMAGES//LATEST/$latest}"
           (
             if printf 'ghcr.io/documentdb/documentdb/documentdb-local:%s\n' "${tags[@]}" | xargs -P 4 -n 1 docker pull -q; then

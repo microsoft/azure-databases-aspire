@@ -36,7 +36,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Collection(DocumentDBFeatureMatrixAppHostCollection.Name)]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
-    private const string ReleasedVersion = DocumentDBVersions.V0_117_0;
+    private const string ReleasedVersion = DocumentDBVersions.V1_0_0;
     private const string QuietWindowControlMarker = "[ASPIRE-TEST] quiet-window-control";
     private static readonly Regex GatewayDebugInsertRegex = new(
         @"DEBUG[^\r\n]*documentdb_api\.insert",
@@ -340,9 +340,10 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Theory]
     [Trait("Shard", "2")]
-    // 0.116.0 compressed large values with lz4, which 0.117.0 no longer defaults to.
+    // 0.116.0 compressed large values with lz4, which 0.114.0 and 0.117.0 did not default to.
     [InlineData("0.114.0", "pglz")]
     [InlineData("0.116.0", "lz4")]
+    [InlineData("0.117.0", "pglz")]
     public async Task PersistedPg17DataUpgradesToTheReleasedVersion(string sourceVersion, string sourceCompression)
     {
         RequireDocker();
@@ -390,10 +391,14 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 await app.StopAsync(cts.Token);
             }
 
+            // Up to 0.114.0 the image never stops PostgreSQL, so 1.0.0 refuses the postmaster.pid it
+            // leaves until the documented override removes it.
             using (var scenario = new EnvironmentScope(
                        (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
-                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17))))
+                       (AppHost.ImageTagEnvironmentVariable, ReleasedTag(17)),
+                       (AppHost.ForceRemoveStalePostmasterPidEnvironmentVariable,
+                           Version.Parse(sourceVersion) < new Version(0, 116, 0) ? "true" : "false")))
             {
                 await using var app = await BuildAndStartAsync(cts.Token);
                 var connectionString = await app.GetConnectionStringAsync("appdb", cts.Token);
@@ -457,7 +462,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         }
     }
 
-    // "0.117.0" is catalog version "0.117-0".
+    // "0.117.0" is catalog version "0.117-0", "1.0.0" is "1.0-0".
     private static string ToCatalogVersion(string version)
     {
         var parsed = Version.Parse(version);
@@ -715,7 +720,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [Theory]
     [Trait("Shard", "3")]
     [InlineData("pg17-0.114.0", "pg17-0.114.0")]
-    [InlineData(null, "pg17-0.117.0")]
+    [InlineData(null, "pg17-1.0.0")]
     public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
     {
         RequireDocker();
@@ -1437,7 +1442,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
         {
-            var documentDB = appBuilder.AddDocumentDB("documentdb");
+            var documentDB = appBuilder.AddDocumentDB("documentdb").WithoutUsageTelemetry();
 
             if (serviceName is null)
             {
@@ -1597,6 +1602,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
         var manifest = await ManifestUtils.PublishManifestAsync(appBuilder =>
             appBuilder.AddDocumentDB("documentdb")
+                .WithoutUsageTelemetry()
                 .WithEnvironment("CONFIG_DIR", "/custom-config")
                 .WithOpenTelemetryMetrics(enabled: false)
                 .WithImageTag(ReleasedTag(17)));
@@ -1855,9 +1861,11 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Theory]
     [Trait("Shard", "3")]
-    // 0.116.0 defaulted TOAST compression to lz4; 0.117.0 was cut without that change.
+    // 0.116.0 defaulted TOAST compression to lz4; 0.117.0 was cut without that change, and
+    // 1.0.0 restores it.
     [InlineData("pg17-0.116.0", "lz4")]
     [InlineData("pg17-0.117.0", "pglz")]
+    [InlineData("pg17-1.0.0", "lz4")]
     public async Task PostgresEndpointReportsTheImageToastCompressionDefault(string imageTag, string expected)
     {
         await AssertPostgresExtrasAsync(imageTag, expected);
@@ -1903,14 +1911,15 @@ public class DocumentDBFeatureMatrixEndToEndTests
             postgresConnectionString!.Contains($":{allocatedPostgresPort}/", StringComparison.Ordinal),
             $"Expected the PostgreSQL URI to use the allocated port {allocatedPostgresPort}, but it was '{postgresConnectionString}'.");
 
-        // WithoutExtendedRum: the access method must not be installed in the backend. Asserting
-        // this through PostgreSQL is the only way to see the effect of DISABLE_EXTENDED_RUM.
+        // WithoutExtendedRum: asserting through PostgreSQL is the only way to see the effect of
+        // DISABLE_EXTENDED_RUM. It keeps the access method out through 0.114.0; from 0.116.0 the
+        // image installs it regardless.
+        var version = Version.Parse(imageTag?.Split('-', 2)[1] ?? DocumentDBVersions.Latest);
         var accessMethods = await QueryPostgresAsync(
             postgresConnectionString!,
-            "SELECT count(*) FROM pg_am WHERE amname = 'extended_rum'",
+            "SELECT count(*) FROM pg_am WHERE amname = 'documentdb_extended_rum'",
             cts.Token);
-
-        Assert.Equal(0L, Convert.ToInt64(accessMethods));
+        Assert.Equal(version >= new Version(0, 116, 0) ? 1L : 0L, Convert.ToInt64(accessMethods));
 
         if (expectedToastCompression is not null)
         {

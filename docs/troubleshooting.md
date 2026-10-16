@@ -20,7 +20,7 @@ docker info
 **Symptom:** Timeout or network error pulling `ghcr.io/documentdb/documentdb/documentdb-local`.
 
 **Solution:**
-1. Verify network connectivity: `docker pull ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0`
+1. Verify network connectivity: `docker pull ghcr.io/documentdb/documentdb/documentdb-local:pg17-1.0.0`
 2. Check if you need to authenticate to GitHub Container Registry (public images should not require auth)
 3. If behind a corporate proxy, configure Docker's proxy settings
 
@@ -53,7 +53,7 @@ DocumentDB resource 'documentdb' changed the container image it will run after t
 package sealed it: the image reference it will run changed. Aspire snapshots a
 container's image into the DCP container spec while it prepares resources, ...
 Sealed reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.111.0'.
-Current reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0'.
+Current reference: 'ghcr.io/documentdb/documentdb/documentdb-local:pg17-1.0.0'.
 ```
 
 The clause after the colon says what changed: `the image reference it will run changed`,
@@ -106,7 +106,7 @@ manifest is written from the model as usual.
 **Symptom:** `UseTls(false)` is set, but the client or health check cannot connect to the container.
 
 **Causes and solutions:**
-1. **Container image is older than `0.114.0`.** Images up to and including `0.113.0` always enforced TLS on the gateway and rejected plain connections, regardless of the `TLS_MODE` setting. Use the default (`0.117.0`) image tag, another `0.114.0` or newer image, or keep TLS enabled in the connection string.
+1. **Container image is older than `0.114.0`.** Images up to and including `0.113.0` always enforced TLS on the gateway and rejected plain connections, regardless of the `TLS_MODE` setting. Use the default (`1.0.0`) image tag, another `0.114.0` or newer image, or keep TLS enabled in the connection string.
 2. **`TLS_MODE` is set to `requireTLS`.** This makes the container reject plain connections by design, which contradicts `UseTls(false)`. Remove the environment variable to fall back to the default `allowTLS` (accepts both plain and TLS connections), or re-enable TLS with `UseTls(true)`.
 
    ```csharp
@@ -382,11 +382,19 @@ Or the application fails to start with an `InvalidOperationException` saying two
 3. **Do not run the AppHost twice against the same volume.** Only one instance can hold the data directory at a time.
 4. **`WithExplicitStart()` is not an escape hatch on older images.** The pair is downgraded to a warning only when both resources resolve to a recognised `0.116.0`-or-later tag, where the container itself refuses the overlap. Otherwise it remains a hard failure.
 
+### "postmaster.pid exists ... Refusing to start" after an upgrade
+
+DocumentDB `1.0.0` will not remove a `postmaster.pid` it cannot prove is stale. Images up to
+`0.114.0` leave one behind on every stop, and `0.116.0` or `0.117.0` when killed rather than
+stopped. See
+[Moving persisted data to a newer image](configuration.md#moving-persisted-data-to-a-newer-image)
+for the one-time override, and update the extension catalog while you are there.
+
 ### Read-only data volume or bind mount is rejected
 
 **Symptom:** `WithDataVolume(isReadOnly: true)` or `WithDataBindMount(..., isReadOnly: true)` throws an `ArgumentException`; a read-only mount added with the raw `WithVolume`/`WithBindMount` APIs fails the resource start with an `InvalidOperationException`.
 
-**Cause:** DocumentDB cannot run against a read-only data directory. The entrypoint takes ownership of it, and `initdb` must change its permissions before PostgreSQL can create the cluster or write WAL. Allowed through, the container logs `chown: changing ownership of '/data': Read-only file system` and `initdb: error: could not change permissions of directory "/data": Read-only file system` inside interleaved log streams, then waits a full minute before exiting with the misleading `PostgreSQL failed to start within 60 seconds` banner.
+**Cause:** DocumentDB cannot run against a read-only data directory. The entrypoint takes ownership of it, and `initdb` must change its permissions before PostgreSQL can create the cluster or write WAL. Allowed through, `1.0.0` stops with `Error: cannot set permissions on data directory /data`. Older images log `chown: changing ownership of '/data': Read-only file system` and `initdb: error: could not change permissions of directory "/data": Read-only file system` inside interleaved log streams, then waits a full minute before exiting with the misleading `PostgreSQL failed to start within 60 seconds` banner.
 
 **Solution:** Mount the data directory writable. Read-only mounts are correct for *input* only — `WithInitData(...)` mounts seed scripts read-only at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and key read-only.
 
@@ -507,9 +515,9 @@ Warning: Directory /data exists but doesn't appear to contain a valid PostgreSQL
 Use -c flag to force cleanup and re-initialization, or specify a different directory with -d.
 ```
 
-then never becomes healthy and exits `1` about a minute later with `PostgreSQL failed to start within 60 seconds`.
+then exits with `Error: start_oss_server.sh failed (status 1)` on `1.0.0`, or never becomes healthy and exits `1` about a minute later with `PostgreSQL failed to start within 60 seconds` on older images.
 
-**Cause:** The data directory is not empty but does not hold a PostgreSQL cluster (no `PG_VERSION` file). The container refuses to initialise over unrecognised contents rather than deleting them, and PostgreSQL never starts — so the only failure you see is the generic 60-second timeout banner. One stray file is enough. Common culprits are a `.gitkeep` committed so the empty directory survives in source control, a `.DS_Store` written by macOS Finder, or leftovers from an unrelated tool.
+**Cause:** The data directory is not empty but does not hold a PostgreSQL cluster (no `PG_VERSION` file). The container refuses to initialise over unrecognised contents rather than deleting them, and PostgreSQL never starts — so before `1.0.0` the only failure you see is the generic 60-second timeout banner. One stray file is enough. Common culprits are a `.gitkeep` committed so the empty directory survives in source control, a `.DS_Store` written by macOS Finder, or leftovers from an unrelated tool.
 
 **Solutions:**
 1. **Empty the host directory** (or point `WithDataBindMount(...)` at a genuinely empty one) and start again. Nothing was deleted, so anything you need is still there.

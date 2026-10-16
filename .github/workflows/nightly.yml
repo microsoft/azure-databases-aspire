@@ -148,7 +148,7 @@ jobs:
       - name: Check for an arm64 image
         id: manifest
         run: |
-          latest=$(grep -oE 'const string V0_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          latest=$(grep -oE 'const string V[0-9]+_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           image="ghcr.io/documentdb/documentdb/documentdb-local:pg17-$latest"
           # Inspect and parse outside the if, so a registry or parse error fails the job instead of reading as "no arm64".
           manifest=$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}')
