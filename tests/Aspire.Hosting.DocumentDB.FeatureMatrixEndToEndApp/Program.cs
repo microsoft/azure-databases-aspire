@@ -40,6 +40,7 @@ public class Program
     public const string DocumentDBVersionEnvironmentVariable = "DOCUMENTDB_FEATURE_DOCUMENTDB_VERSION";
     public const string PostgresVersionEnvironmentVariable = "DOCUMENTDB_FEATURE_POSTGRES_VERSION";
     public const string PostgresEndpointEnvironmentVariable = "DOCUMENTDB_FEATURE_POSTGRES_ENDPOINT";
+    public const string ForceRemoveStalePostmasterPidEnvironmentVariable = "DOCUMENTDB_FEATURE_FORCE_REMOVE_STALE_PID";
 
     /// <summary>Custom credential parameters, two databases, one with a distinct database name.</summary>
     public const string CustomCredentialsMultiDbScenario = "custom-credentials-multi-db";
@@ -211,6 +212,11 @@ public class Program
         {
             case DataVolumeScenario:
                 documentDB.WithDataVolume(GetRequired(VolumeNameEnvironmentVariable));
+                if (Environment.GetEnvironmentVariable(ForceRemoveStalePostmasterPidEnvironmentVariable) == "true")
+                {
+                    documentDB.WithEnvironment("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", "true");
+                }
+
                 break;
 
             case DataBindMountScenario:

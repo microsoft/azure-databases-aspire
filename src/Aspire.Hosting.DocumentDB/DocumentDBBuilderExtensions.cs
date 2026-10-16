@@ -212,10 +212,6 @@ public static class DocumentDBBuilderExtensions
     private const string GatewayConfigurationShell = "/bin/bash";
     private const string GatewayConfigurationShellCommandOption = "-c";
     private const string GatewayConfigurationShellArgumentZero = "--";
-    private const string GatewayValueTakingOptionsShellPattern =
-        "--allow-external-connections|--cert-path|--create-user|--documentdb-port|--enable-telemetry|" +
-        "--init-data|--init-data-path|--key-file|--log-level|--owner|--password|--pg-port|--start-pg|" +
-        "--tlsMode|--toast-compression|--usage-telemetry|--username";
 
     /// <summary>
     /// Builds the wrapper script that makes the OpenTelemetry environment variables this package
@@ -280,7 +276,7 @@ public static class DocumentDBBuilderExtensions
             "if [ \"$q\" = \"v\" ]; then q=\"\"; continue; fi; " +
             "case \"$a\" in " +
                 "-d|--data-path) q=\"d\";; " +
-                $"{GatewayValueTakingOptionsShellPattern}) q=\"v\";; " +
+                $"{string.Join('|', s_valueTakingEntrypointOptions.Order(StringComparer.Ordinal))}) q=\"v\";; " +
             "esac; " +
         "done; " +
         "if [ \"$q\" = \"d\" ]; then echo \"aspire-documentdb -- --data-path requires a value before telemetry configuration can be prepared\" >&2; exit 1; fi; " +
@@ -4227,9 +4223,9 @@ public static class DocumentDBBuilderExtensions
     /// by setting <c>DISABLE_EXTENDED_RUM=true</c>.
     /// </summary>
     /// <remarks>
-    /// Available in DocumentDB <c>v0.111-0</c> through <c>v0.117-0</c>. Older images ignore the
-    /// environment variable, and from <c>v1.0-0</c> the image ignores it with a deprecation
-    /// warning and always installs <c>documentdb_extended_rum</c> on a new data volume.
+    /// Effective in DocumentDB <c>v0.111-0</c> through <c>v0.114-0</c>. Older images ignore the
+    /// environment variable. From <c>v0.116-0</c> the image installs <c>documentdb_extended_rum</c>
+    /// on a new data volume regardless, and <c>v1.0-0</c> also logs a deprecation warning.
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>

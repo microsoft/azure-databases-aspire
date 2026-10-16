@@ -40,6 +40,17 @@ public class DocumentDBStorageBehaviorTests
     /// <summary>From <c>1.0.0</c> a data directory the image cannot use stops it at once with an explicit error.</summary>
     private static bool FailsFast(string version) => Version.Parse(version) >= new Version(1, 0, 0);
 
+    // Well short of the 60-second start-up timeout older images wait out first.
+    private static void AssertFailedFastWhereExpected(string version, Stopwatch started)
+    {
+        if (FailsFast(version))
+        {
+            Assert.True(
+                started.Elapsed < TimeSpan.FromSeconds(30),
+                $"DocumentDB {version} took {started.Elapsed} to exit; it should stop at once.");
+        }
+    }
+
     private static readonly string s_baselineImage = DocumentDBImageDigestLock.PinnedReference($"pg17-{BaselineVersion}");
 
     /// <summary>
@@ -281,6 +292,7 @@ public class DocumentDBStorageBehaviorTests
                 var (createExit, _) = await RunDockerAsync("volume", "create", volumeName);
                 Assert.Equal(0, createExit);
 
+                var started = Stopwatch.StartNew();
                 var (runExit, _) = await RunDockerAsync(
                     ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
                 Assert.Equal(0, runExit);
@@ -307,6 +319,7 @@ public class DocumentDBStorageBehaviorTests
                 // The banner is logged before the entrypoint unwinds, so the exit code is only stable
                 // once the container has actually stopped.
                 Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
+                AssertFailedFastWhereExpected(version, started);
             }
             finally
             {
@@ -559,6 +572,7 @@ public class DocumentDBStorageBehaviorTests
             var containerName = UniqueName("stray");
             try
             {
+                var started = Stopwatch.StartNew();
                 var (runExit, _) = await RunDockerAsync(
                     ["run", "-d", "--name", containerName, "-v", $"{hostDirectory}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
                 Assert.Equal(0, runExit);
@@ -573,6 +587,7 @@ public class DocumentDBStorageBehaviorTests
                     StringComparison.Ordinal);
 
                 Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
+                AssertFailedFastWhereExpected(version, started);
 
                 // The refusal is not destructive. The directory is read back through a container
                 // running as root rather than with System.IO: the entrypoint chowns the bind mount to

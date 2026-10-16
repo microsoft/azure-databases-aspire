@@ -518,10 +518,10 @@ This still applies to `1.0.0`, which ships it as a known issue
 ([documentdb#773](https://github.com/documentdb/documentdb/issues/773)). Until the catalog is
 updated, commands that need `1.0.0` catalog objects can fail, for example with `InternalError`.
 
-A `1.0.0` image also refuses a data directory whose `postmaster.pid` it cannot vouch for, which is
-what an unclean stop of an older image leaves behind (a crash or a `docker kill`; a normal stop
-does not). The container exits with `postmaster.pid exists ... Refusing to start`. Once nothing
-else uses the volume, start it once with
+A `1.0.0` image also refuses a data directory whose `postmaster.pid` it cannot vouch for. Images
+up to `0.114.0` leave one behind on every stop, because they never stop PostgreSQL, and `0.116.0`
+or `0.117.0` leave one after a crash or a `docker kill`. The container exits with
+`postmaster.pid exists ... Refusing to start`. Once nothing else uses the volume, start it once with
 `.WithEnvironment("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", "true")`, then remove that line:
 while it is set, the image skips this check on every start.
 
@@ -594,7 +594,7 @@ var server = builder.AddDocumentDB("documentdb")
                     .WithoutExtendedRum();
 ```
 
-This sets `DISABLE_EXTENDED_RUM=true` on the container. On container images older than v0.111-0 the environment variable is ignored. From `1.0.0` it is deprecated: the image logs a warning, ignores it, and always installs `documentdb_extended_rum` on a new data volume.
+This sets `DISABLE_EXTENDED_RUM=true` on the container. It only takes effect from v0.111-0 through v0.114-0; older images ignore the variable. From `0.116.0` the image installs `documentdb_extended_rum` on a new data volume regardless, and `1.0.0` also logs a deprecation warning.
 
 ## WithoutUsageTelemetry
 
@@ -610,12 +610,13 @@ var server = builder.AddDocumentDB("documentdb")
 ```
 
 This sets `DOCUMENTDB_USAGE_TELEMETRY=false` on the container. The image also honours
-`DO_NOT_TRACK=1` and `NO_ANALYTICS=1`, which you can set with `.WithEnvironment(...)`, and the
-`--disable-usage-telemetry` or `--usage-telemetry false` arguments through `.WithArgs(...)`. Set it
-on the resource: the image only skips reporting under `CI`, `GITHUB_ACTIONS` or `TF_BUILD` when the
+`DO_NOT_TRACK=1` and `NO_ANALYTICS=1`, which you can set with `.WithEnvironment(...)`. Set it on the
+resource: the image only skips reporting under `CI`, `GITHUB_ACTIONS` or `TF_BUILD` when the
 container itself has them, and neither your shell nor a CI job passes its variables to the
-container. Older images ignore all of these. This is separate from the gateway metrics configured
-by [`WithOpenTelemetryMetrics`](#withopentelemetrymetrics).
+container. Older images ignore these variables. Prefer them to the `--disable-usage-telemetry` and
+`--usage-telemetry false` arguments: images before `1.0.0` stop with `Unknown option` on either.
+This is separate from the gateway metrics configured by
+[`WithOpenTelemetryMetrics`](#withopentelemetrymetrics).
 
 ## WithoutUserCreation
 
@@ -1380,7 +1381,7 @@ The extension passes these environment variables to the DocumentDB container:
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC endpoint | Read by gateway as fallback when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is unset; not set by the typed API |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | Milliseconds (integer) | Read by gateway as fallback when `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` is unset; not set by the typed API |
 | `OWNER` | The configured owner string | Set by `WithOwner(...)` |
-| `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()`; ignored from `1.0.0` |
+| `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()`; no effect from `0.116.0` |
 | `DOCUMENTDB_USAGE_TELEMETRY` | `false` | Set by `WithoutUsageTelemetry()`; read from `1.0.0` |
 | `CREATE_USER` | `false` | Set by `WithoutUserCreation()` |
 

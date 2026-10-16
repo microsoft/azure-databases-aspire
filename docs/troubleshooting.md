@@ -384,8 +384,9 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 ### "postmaster.pid exists ... Refusing to start" after an upgrade
 
-DocumentDB `1.0.0` will not remove a `postmaster.pid` it cannot prove is stale, and an older image
-that was killed rather than stopped leaves one behind. See
+DocumentDB `1.0.0` will not remove a `postmaster.pid` it cannot prove is stale. Images up to
+`0.114.0` leave one behind on every stop, and `0.116.0` or `0.117.0` when killed rather than
+stopped. See
 [Moving persisted data to a newer image](configuration.md#moving-persisted-data-to-a-newer-image)
 for the one-time override, and update the extension catalog while you are there.
 

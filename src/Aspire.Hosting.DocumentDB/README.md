@@ -77,7 +77,7 @@ The Aspire integration handles connection string resolution, TLS configuration, 
 | `.WithLogLevel(level)` | Set gateway `DOCUMENTDB_LOG_LEVEL` and entrypoint-contract `LOG_LEVEL` (`Quiet`, `Error`, `Warn`, `Info`, `Debug`, `Trace`) |
 | `.WithInitData(source)` | Bind-mount initialization scripts to `/init_doc_db.d` and disable built-in sample data |
 | `.WithoutSampleData()` | Disable the built-in sample data initialization |
-| `.WithoutExtendedRum()` | Disable the `extended_rum` index access method (DocumentDB v0.111.0 through v0.117.0; ignored from v1.0.0) |
+| `.WithoutExtendedRum()` | Disable the `extended_rum` index access method (DocumentDB v0.111.0 through v0.114.0; no effect from v0.116.0) |
 | `.WithoutUsageTelemetry()` | Turn off the image's usage telemetry (DocumentDB v1.0.0+) |
 | `.WithoutUserCreation()` | Skip automatic user creation on container startup |
 | `.WithTlsCertificate(certPath, keyPath)` | Mount a custom TLS certificate and key into the container |
