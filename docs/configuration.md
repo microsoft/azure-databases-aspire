@@ -369,10 +369,12 @@ no value, so the next token is read as an option name) and `WithArgs("--log-leve
 Aspire `WithVolume`/`WithBindMount` APIs fails the resource start with an `InvalidOperationException`.
 
 A read-only data directory can never work: the entrypoint takes ownership of the directory, and
-`initdb` has to change its permissions before PostgreSQL can create the cluster or write WAL. The
-container does not report that clearly — it fails with `initdb: error: could not change permissions
-of directory "/data": Read-only file system` buried in interleaved log streams, then spends 60
-seconds before printing the misleading `PostgreSQL failed to start within 60 seconds` banner.
+`initdb` has to change its permissions before PostgreSQL can create the cluster or write WAL.
+`1.0.0` stops at once with `Error: cannot set permissions on data directory /data`, or with a
+`chown ... Read-only file system` error when the directory belongs to another user. Older images
+do not report it clearly: they fail with `initdb: error: could not change permissions of directory
+"/data": Read-only file system` buried in interleaved log streams, then spend 60 seconds before
+printing the misleading `PostgreSQL failed to start within 60 seconds` banner.
 
 Read-only mounts are still correct for *input*: `WithInitData(...)` mounts seed scripts read-only
 at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and key read-only.
@@ -435,10 +437,16 @@ starting another one on it, including `docker run` sessions and a second AppHost
 ### Ownership and permissions
 
 The container runs as its own `documentdb` user and takes ownership of the data directory
-(`chown -R` followed by `chmod -R 750`) on every start, and `initdb` leaves the cluster directory
-mode `0700`. Consequences:
+(`chown -R` followed by `chmod -R 750`), and `initdb` leaves the cluster directory mode `0700`.
+Images before `1.0.0` do this on every start. `1.0.0` does it only when the directory or its
+`PG_VERSION` file belongs to another user, so a cluster whose top level is correct but whose
+interior files are not (a partial restore, an interrupted repair) fails with a PostgreSQL
+permission error. Start once with
+`.WithEnvironment("DOCUMENTDB_FORCE_OWNERSHIP_REPAIR", "true")`, then remove that line.
+Consequences:
 
-- **Volumes** need nothing from you; Docker seeds the volume and the container adjusts it.
+- **Volumes** need nothing from you; Docker seeds the volume and the container adjusts it. The
+  exception on `1.0.0` is a volume whose files something else re-owned, as above.
 - **Bind mounts** must point at a host directory the container may take ownership of. On Linux the
   host directory changes uid/gid on disk, so after the first run the files usually belong to a uid
   your host user is not, and reading them back needs `sudo` or a container. Docker Desktop on macOS
@@ -448,8 +456,8 @@ mode `0700`. Consequences:
   (a `.gitkeep` committed to keep the directory in source control, or a `.DS_Store` written by
   macOS) is enough to produce `Warning: Directory /data exists but doesn't appear to contain a
   valid PostgreSQL data directory`, after which PostgreSQL never starts and the container exits
-  non-zero a minute later behind the `PostgreSQL failed to start within 60 seconds` banner. Your
-  files are left where they are.
+  non-zero: at once on `1.0.0`, a minute later behind the `PostgreSQL failed to start within 60
+  seconds` banner on older images. Your files are left where they are.
 - Do not put two mounts on the directory that backs the data path (for example `WithDataVolume()`
   *and* `WithDataBindMount(...)`, or two spellings of one path); the container runtime rejects
   duplicate mount targets, so the integration fails the start with a clear message instead.
@@ -512,6 +520,17 @@ user, which PostgreSQL refuses with `must be owner of extension documentdb`. Ins
 `docker exec <container> psql -X -p 9712 -h localhost -U documentdb -d postgres -c "..."`. Upstream
 ships no downgrade scripts, so an older image on an updated catalog is unsupported. If you may need
 to go back, pin the older version with `WithDocumentDBVersion(...)` or keep a copy of the volume.
+
+This still applies to `1.0.0`, which ships it as a known issue
+([documentdb#773](https://github.com/documentdb/documentdb/issues/773)). Until the catalog is
+updated, commands that need `1.0.0` catalog objects can fail, for example with `InternalError`.
+
+A `1.0.0` image also refuses a data directory whose `postmaster.pid` it cannot vouch for. Images
+up to `0.114.0` leave one behind on every stop, because they never stop PostgreSQL, and `0.116.0`
+or `0.117.0` leave one after a crash or a `docker kill`. The container exits with
+`postmaster.pid exists ... Refusing to start`. Once nothing else uses the volume, start it once with
+`.WithEnvironment("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", "true")`, then remove that line:
+while it is set, the image skips this check on every start.
 
 ## WithLogLevel
 
@@ -582,7 +601,29 @@ var server = builder.AddDocumentDB("documentdb")
                     .WithoutExtendedRum();
 ```
 
-This sets `DISABLE_EXTENDED_RUM=true` on the container. On container images older than v0.111-0 the environment variable is ignored.
+This sets `DISABLE_EXTENDED_RUM=true` on the container. It only takes effect from v0.111-0 through v0.114-0; older images ignore the variable. From `0.116.0` the image installs `documentdb_extended_rum` on a new data volume regardless, and `1.0.0` also logs a deprecation warning.
+
+## WithoutUsageTelemetry
+
+From `1.0.0` the `documentdb-local` image sends usage telemetry by default: its version, platform
+and CPU architecture at startup and then hourly, to an analytics provider. The receiving service
+also observes the deployment's network address, so the upstream
+[privacy statement](https://github.com/documentdb/documentdb/blob/v1.0-0/documentdb-local/PRIVACY.md) says not to assume
+it is anonymous. This package leaves the image default as it is. To turn it off:
+
+```csharp
+var server = builder.AddDocumentDB("documentdb")
+                    .WithoutUsageTelemetry();
+```
+
+This sets `DOCUMENTDB_USAGE_TELEMETRY=false` on the container. The image also honours
+`DO_NOT_TRACK=1` and `NO_ANALYTICS=1`, which you can set with `.WithEnvironment(...)`. Set it on the
+resource: the image only skips reporting under `CI`, `GITHUB_ACTIONS` or `TF_BUILD` when the
+container itself has them, and neither your shell nor a CI job passes its variables to the
+container. Older images ignore these variables. Prefer them to the `--disable-usage-telemetry` and
+`--usage-telemetry false` arguments: images before `1.0.0` stop with `Unknown option` on either.
+This is separate from the gateway metrics configured by
+[`WithOpenTelemetryMetrics`](#withopentelemetrymetrics).
 
 ## WithoutUserCreation
 
@@ -594,7 +635,7 @@ by default. On a fresh container, `WithoutUserCreation()` must be paired with
 `WithoutSampleData()` so the default initialization does not require the
 skipped credentials.
 
-For images from 0.113.0 onward, including 0.117.0, built-in sample
+For images from 0.113.0 onward, including 1.0.0, built-in sample
 initialization does not run unless requested. A fresh container can therefore
 remain running with `CREATE_USER=false` when no initialization requiring those
 credentials is requested. The generated connection strings still will not
@@ -890,6 +931,11 @@ Candidates are tried in the order `/tmp`, `/var/tmp`, `/dev/shm`; if every candi
 `DATA_PATH` or cannot be proven independent, the container fails clearly. Raw runtime mounts are
 rejected because they never enter this model.
 
+From `1.0.0` the image itself writes its health-state file to `/tmp` as the `documentdb` user before
+it takes ownership of the data directory, so a host directory you mount at `/tmp` must already be
+writable by that user (as a real `/tmp`, mode `1777`, is); otherwise the container stops at once with
+`cannot reset or write the runtime state file`.
+
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
 larger granularities.
@@ -1166,11 +1212,11 @@ What remains must be `documentdb/documentdb-local` exactly. So all of these are 
 builder.AddDocumentDB("documentdb");                                   // ghcr.io/documentdb + documentdb/documentdb-local
 
 builder.AddDocumentDB("documentdb")
-       .WithImage("ghcr.io/documentdb/documentdb/documentdb-local", "pg17-0.117.0")
+       .WithImage("ghcr.io/documentdb/documentdb/documentdb-local", "pg17-1.0.0")
        .WithImageRegistry(null);                                       // the whole reference in one field
 
 builder.AddDocumentDB("documentdb")
-       .WithImage("documentdb/documentdb/documentdb-local", "pg17-0.117.0")
+       .WithImage("documentdb/documentdb/documentdb-local", "pg17-1.0.0")
        .WithImageRegistry("ghcr.io");                                  // the boundary moved one segment
 ```
 
@@ -1201,7 +1247,7 @@ A digest is read whether it arrives through `WithImageSHA256(...)` or inline as
 `repository@sha256:...`, and a `:` is a tag only in the last path segment, so a registry port is
 never mistaken for one.
 
-**A digest beats every tag.** A reference can carry both — `repository:pg17-0.117.0@sha256:...`, or
+**A digest beats every tag.** A reference can carry both — `repository:pg17-1.0.0@sha256:...`, or
 an inline tag beside a `WithImageSHA256(...)` digest, or the reverse — and the runtime resolves the
 digest and ignores the tag. The version is therefore unknown for such a reference no matter what the
 tag reads, so no version-dependent behaviour is applied to it: no declared-`/data`-volume warning,
@@ -1217,7 +1263,7 @@ it; a digest on a repository this package does not publish is left alone as any 
 Aspire to *build* the resource's container image instead of pulling one. Aspire keeps the
 resource's `ContainerImageAnnotation` when you do that, and you can set it yourself afterwards, so
 a Dockerfile-built resource may be labelled
-`ghcr.io/documentdb/documentdb/documentdb-local:pg17-0.117.0` while running something else
+`ghcr.io/documentdb/documentdb/documentdb-local:pg17-1.0.0` while running something else
 entirely. The published manifest makes this explicit: it emits a `build` object and no `image` at
 all.
 
@@ -1306,7 +1352,7 @@ guarantee every publisher matches the RFC 3986 escaping described above.
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-0.117.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-1.0.0`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
@@ -1318,6 +1364,7 @@ guarantee every publisher matches the RFC 3986 escaping described above.
 | Container default data path | `/data` (declared as an image `VOLUME` from `0.116.0`) |
 | Persistence helper default path | `/data` |
 | Data directory access | Writable, empty or an existing cluster; from `0.116.0` also initialized once and exclusive to one running container |
+| Usage telemetry | On from `1.0.0`, sent by the image; see [`WithoutUsageTelemetry`](#withoutusagetelemetry) |
 | Auth mechanism | `SCRAM-SHA-256` |
 | Auth database | `admin` |
 
@@ -1347,7 +1394,8 @@ The extension passes these environment variables to the DocumentDB container:
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC endpoint | Read by gateway as fallback when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is unset; not set by the typed API |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | Milliseconds (integer) | Read by gateway as fallback when `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` is unset; not set by the typed API |
 | `OWNER` | The configured owner string | Set by `WithOwner(...)` |
-| `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()` |
+| `DISABLE_EXTENDED_RUM` | `true` | Set by `WithoutExtendedRum()`; no effect from `0.116.0` |
+| `DOCUMENTDB_USAGE_TELEMETRY` | `false` | Set by `WithoutUsageTelemetry()`; read from `1.0.0` |
 | `CREATE_USER` | `false` | Set by `WithoutUserCreation()` |
 
 ## Resource model

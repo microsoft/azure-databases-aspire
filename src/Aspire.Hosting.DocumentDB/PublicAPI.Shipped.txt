@@ -27,6 +27,8 @@ Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_112_0 = 4 -> Aspire.Hosting
 Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_113_0 = 5 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
 Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_114_0 = 6 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
 Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_116_0 = 7 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_117_0 = 8 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V1_0_0 = 9 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
 Aspire.Hosting.ApplicationModel.DocumentDBVersions
 Aspire.Hosting.DocumentDBBuilderExtensions
 Aspire.Hosting.DocumentDBLogLevel
@@ -43,6 +45,8 @@ const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_112_0 = "0.112.0" ->
 const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_113_0 = "0.113.0" -> string!
 const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_114_0 = "0.114.0" -> string!
 const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_116_0 = "0.116.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_117_0 = "0.117.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V1_0_0 = "1.0.0" -> string!
 static Aspire.Hosting.ApplicationModel.DocumentDBVersions.All.get -> System.Collections.Generic.IReadOnlyList<string!>!
 static Aspire.Hosting.ApplicationModel.DocumentDBVersions.Latest.get -> string!
 static Aspire.Hosting.DocumentDBBuilderExtensions.AddDatabase(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! name, string? databaseName = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource!>!
@@ -58,6 +62,7 @@ static Aspire.Hosting.DocumentDBBuilderExtensions.WithInitData(this Aspire.Hosti
 static Aspire.Hosting.DocumentDBBuilderExtensions.WithLogLevel(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, Aspire.Hosting.DocumentDBLogLevel logLevel) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
 static Aspire.Hosting.DocumentDBBuilderExtensions.WithOpenTelemetryMetrics(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string? endpoint = null, bool enabled = true, System.TimeSpan? exportInterval = null, System.TimeSpan? timeout = null, string? serviceName = null, string? serviceVersion = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
 static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutExtendedRum(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
+static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutUsageTelemetry(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
 static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutSampleData(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
 static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutUserCreation(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!
 static Aspire.Hosting.DocumentDBBuilderExtensions.WithOwner(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! owner) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!

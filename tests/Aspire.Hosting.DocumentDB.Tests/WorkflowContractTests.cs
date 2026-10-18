@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Text.RegularExpressions;
+using Aspire.Hosting.ApplicationModel;
 using Xunit;
 using YamlDotNet.RepresentationModel;
 
@@ -16,6 +17,40 @@ public class WorkflowContractTests
 {
     private static readonly YamlMappingNode s_buildAndTest = LoadWorkflow("build-and-test.yml");
     private static readonly YamlMappingNode s_nightly = LoadWorkflow("nightly.yml");
+
+    [Fact]
+    public async Task LatestVersionSelectorsReadTheCatalogDefault()
+    {
+        // The workflows run on Ubuntu; Windows runners have no bash with these semantics.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var selectors = new[] { s_buildAndTest, s_nightly }
+            .SelectMany(workflow => workflow.AllNodes.OfType<YamlScalarNode>())
+            .SelectMany(node => (node.Value ?? string.Empty).Split('\n'))
+            .Where(line => line.TrimStart().StartsWith("latest=$(", StringComparison.Ordinal))
+            .ToList();
+        Assert.Equal(2, selectors.Count);
+
+        foreach (var selector in selectors)
+        {
+            var start = new System.Diagnostics.ProcessStartInfo("bash")
+            {
+                WorkingDirectory = VersionAutomationScriptTests.s_repoRoot,
+                RedirectStandardOutput = true,
+            };
+            start.ArgumentList.Add("-c");
+            start.ArgumentList.Add($"set -eo pipefail; {selector.Trim()}; printf '%s' \"$latest\"");
+            using var process = System.Diagnostics.Process.Start(start)!;
+            var output = await process.StandardOutput.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            Assert.Equal(0, process.ExitCode);
+            Assert.Equal(DocumentDBVersions.Latest, output);
+        }
+    }
 
     [Fact]
     public void BuildAndTestRunsOnEveryPullRequestAndPushToMain()

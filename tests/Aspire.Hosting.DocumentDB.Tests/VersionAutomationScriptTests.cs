@@ -21,7 +21,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Trait("Category", "Unit")]
 public class VersionAutomationScriptTests
 {
-    private static readonly string s_repoRoot = FindRepoRoot();
+    internal static readonly string s_repoRoot = FindRepoRoot();
 
     /// <summary>
     /// Walks up from the test assembly location until it finds the repository root. Avoids

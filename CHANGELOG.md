@@ -10,6 +10,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
+## [1.0.0] - 2026-10-19
+
+### Added
+- `DocumentDBVersion.V1_0_0` curated enum member and `DocumentDBVersions.V1_0_0 = "1.0.0"` constant.
+- `WithoutUsageTelemetry()`, which sets `DOCUMENTDB_USAGE_TELEMETRY=false` to turn off the image's usage telemetry. See [WithoutUsageTelemetry](docs/configuration.md#withoutusagetelemetry).
+
+### Changed
+- `DocumentDBVersions.Latest` and the default `documentdb-local` image now resolve to `1.0.0` and `ghcr.io/documentdb/documentdb/documentdb-local:pg17-1.0.0`.
+- **Usage telemetry is on by default in the `1.0.0` image.** It reports the image version, platform and CPU architecture at startup and hourly to a third-party analytics provider, which also sees the network address, so it should not be assumed to be anonymous. This package keeps the image default. Turn it off with `WithoutUsageTelemetry()`, or `DO_NOT_TRACK=1` / `NO_ANALYTICS=1` on the resource; the image's `CI`/`GITHUB_ACTIONS`/`TF_BUILD` skip only sees the container's own environment, so it does not cover AppHosts run in CI. See the upstream [privacy statement](https://github.com/documentdb/documentdb/blob/v1.0-0/documentdb-local/PRIVACY.md). This package's own tests turn it off.
+- New out-of-line values are compressed with `lz4` again, and `--toast-compression` / `DOCUMENTDB_TOAST_COMPRESSION` are back (`lz4`, `pglz` or `default`). Values `0.117.0` wrote with `pglz` stay readable.
+- `WithoutExtendedRum()` has had no effect since `0.116.0`: those images install `documentdb_extended_rum` on a new data volume regardless of `DISABLE_EXTENDED_RUM`, and `1.0.0` now also logs a deprecation warning. The docs used to say it worked on every image from `0.111.0`.
+- A persisted data directory still keeps its old extension catalog on `1.0.0` until `ALTER EXTENSION ... UPDATE` is run ([documentdb#773](https://github.com/documentdb/documentdb/issues/773)); commands can fail until then. `1.0.0` also refuses a data directory with a `postmaster.pid` left by an older image: every stop of `0.114.0` and earlier leaves one, as does a crash of `0.116.0` or `0.117.0`. See [Moving persisted data to a newer image](docs/configuration.md#moving-persisted-data-to-a-newer-image). Docker-backed tests cover the move from `0.114.0`, `0.116.0` and `0.117.0` to `1.0.0`.
+- The container now exits when PostgreSQL stops, instead of leaving the gateway running without a backend.
+- A read-only or non-empty, non-cluster data directory now stops the container at once with an explicit error instead of the misleading `PostgreSQL failed to start within 60 seconds` banner a minute later.
+
 ## [0.117.0] - 2026-09-28
 
 ### Added

@@ -14,6 +14,12 @@ public class Program
         builder.AddDocumentDB("documentdb")
             .AddDatabase("appdb");
 
+        // Test containers must not report usage telemetry; a CI runner's variables never reach them.
+        foreach (var server in builder.Resources.OfType<Aspire.Hosting.ApplicationModel.DocumentDBServerResource>().ToList())
+        {
+            builder.CreateResourceBuilder(server).WithoutUsageTelemetry();
+        }
+
         var app = builder.Build();
 
         await app.RunAsync();

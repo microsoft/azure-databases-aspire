@@ -9,7 +9,8 @@ using MongoDB.Driver;
 using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
 var builder = DistributedApplication.CreateBuilder(new DistributedApplicationOptions { Args = args, DisableDashboard = true });
-var database = builder.AddDocumentDB("documentdb").AddDatabase("smokedb");
+// A CI runner's variables never reach the container, so turn usage telemetry off explicitly.
+var database = builder.AddDocumentDB("documentdb").WithoutUsageTelemetry().AddDatabase("smokedb");
 
 await using var app = builder.Build();
 await app.StartAsync(cts.Token);

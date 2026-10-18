@@ -412,6 +412,17 @@ public class DocumentDBPublicApiTests
     }
 
     [Fact]
+    public void WithoutUsageTelemetryShouldThrowWhenBuilderIsNull()
+    {
+        IResourceBuilder<DocumentDBServerResource> builder = null!;
+
+        var action = () => builder.WithoutUsageTelemetry();
+
+        var exception = Assert.Throws<ArgumentNullException>(action);
+        Assert.Equal(nameof(builder), exception.ParamName);
+    }
+
+    [Fact]
     public void WithoutExtendedRumShouldThrowWhenBuilderIsNull()
     {
         IResourceBuilder<DocumentDBServerResource> builder = null!;

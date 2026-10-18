@@ -207,9 +207,9 @@ jobs:
           - shard: '1'
             images: pg17-LATEST pg17-0.114.0
           - shard: '2'
-            images: pg15-LATEST pg16-LATEST pg17-LATEST pg18-LATEST pg15-0.114.0 pg16-0.114.0 pg17-0.114.0
+            images: pg15-LATEST pg16-LATEST pg17-LATEST pg18-LATEST pg15-0.114.0 pg16-0.114.0 pg17-0.114.0 pg17-0.117.0
           - shard: '3'
-            images: pg17-LATEST pg17-0.114.0 pg17-0.112.0 pg17-0.111.0
+            images: pg17-LATEST pg17-0.117.0 pg17-0.114.0 pg17-0.112.0 pg17-0.111.0
           - shard: '4'
             images: pg17-LATEST pg17-0.114.0
           - shard: '5'
@@ -226,7 +226,7 @@ jobs:
         env:
           IMAGES: ${{ matrix.images }}
         run: |
-          latest=$(grep -oE 'const string V0_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          latest=$(grep -oE 'const string V[0-9]+_[0-9_]+ = "[0-9.]+"' src/Aspire.Hosting.DocumentDB/DocumentDBVersion.cs | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           read -ra tags <<< "${IMAGES//LATEST/$latest}"
           (
             if printf 'ghcr.io/documentdb/documentdb/documentdb-local:%s\n' "${tags[@]}" | xargs -P 4 -n 1 docker pull -q; then

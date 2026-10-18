@@ -7,7 +7,7 @@ This guide walks you through adding [DocumentDB](https://github.com/documentdb/d
 | Requirement | Details |
 |---|---|
 | .NET 10 SDK or later | [Download](https://dotnet.microsoft.com/download) |
-| Aspire workload | `dotnet workload install aspire` |
+| Aspire CLI | [Install](https://aspire.dev/get-started/install-cli/#install-with-a-package-manager) |
 | Docker | DocumentDB runs as a Linux container. [Docker Desktop](https://www.docker.com/products/docker-desktop/) or any Docker-compatible runtime works. |
 | IDE (optional) | Visual Studio 2022 17.9+, VS Code with C# Dev Kit, or JetBrains Rider |
 
@@ -16,7 +16,7 @@ This guide walks you through adding [DocumentDB](https://github.com/documentdb/d
 If you already have an Aspire project, skip to [Install the package](#install-the-package).
 
 ```bash
-dotnet new aspire-starter -o MyApp
+aspire new aspire-starter --name MyApp --output MyApp
 cd MyApp
 ```
 
@@ -58,6 +58,9 @@ This tells Aspire to:
 
 > [!NOTE]
 > `WaitFor` waits for DocumentDB's authenticated MongoDB `ping` health check, which confirms that the gateway is reachable. From DocumentDB `0.116.0`, custom one-shot initialization can continue after the gateway becomes healthy, so services that depend on seeded data should still retry until that data is available.
+
+> [!NOTE]
+> From DocumentDB `1.0.0`, the default image sends usage telemetry (image version, platform and CPU architecture) at startup and hourly. Add `.WithoutUsageTelemetry()` to turn it off. See [WithoutUsageTelemetry](configuration.md#withoutusagetelemetry).
 
 ## Install the MongoDB client package
 
