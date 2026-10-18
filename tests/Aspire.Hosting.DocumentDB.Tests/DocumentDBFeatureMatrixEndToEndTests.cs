@@ -963,6 +963,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         using var cts = CreateEndToEndTimeoutSource();
         var bindMountPath = Path.Combine(Path.GetTempPath(), "aspire-documentdb-e2e", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(bindMountPath);
+        MakeWritableAsTemporaryRoot(bindMountPath);
 
         using var scenario = new EnvironmentScope(
             (AppHost.ScenarioEnvironmentVariable, AppHost.TelemetryAliasedTemporaryRootScenario),
@@ -1007,6 +1008,19 @@ public class DocumentDBFeatureMatrixEndToEndTests
     }
 
     /// <summary>
+    /// From <c>1.0.0</c> the image writes its health-state file to <c>/tmp</c> as the
+    /// <c>documentdb</c> user before it takes ownership of <c>/data</c>, so a host directory mounted
+    /// at both has to be writable by that user from the start, as a real <c>/tmp</c> is.
+    /// </summary>
+    private static void MakeWritableAsTemporaryRoot(string hostPath)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(hostPath, (UnixFileMode)0b1_111_111_111);
+        }
+    }
+
+    /// <summary>
     /// Exact reproduction of the physical-alias hole: the two bind source strings differ, but the
     /// second is a symbolic link to the first. Docker resolves that link on the publish host or
     /// daemon, so both container mount points expose one directory.
@@ -1025,6 +1039,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
         var dataPath = Path.Combine(root, "data");
         var scratchAlias = Path.Combine(root, "scratch-alias");
         Directory.CreateDirectory(dataPath);
+        MakeWritableAsTemporaryRoot(dataPath);
         Directory.CreateSymbolicLink(scratchAlias, dataPath);
 
         var resolvedAlias = Directory.ResolveLinkTarget(scratchAlias, returnFinalTarget: true);

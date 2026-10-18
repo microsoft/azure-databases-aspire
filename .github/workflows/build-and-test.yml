@@ -207,9 +207,9 @@ jobs:
           - shard: '1'
             images: pg17-LATEST pg17-0.114.0
           - shard: '2'
-            images: pg15-LATEST pg16-LATEST pg17-LATEST pg18-LATEST pg15-0.114.0 pg16-0.114.0 pg17-0.114.0
+            images: pg15-LATEST pg16-LATEST pg17-LATEST pg18-LATEST pg15-0.114.0 pg16-0.114.0 pg17-0.114.0 pg17-0.117.0
           - shard: '3'
-            images: pg17-LATEST pg17-0.114.0 pg17-0.112.0 pg17-0.111.0
+            images: pg17-LATEST pg17-0.117.0 pg17-0.114.0 pg17-0.112.0 pg17-0.111.0
           - shard: '4'
             images: pg17-LATEST pg17-0.114.0
           - shard: '5'

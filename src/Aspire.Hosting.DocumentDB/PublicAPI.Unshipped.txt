@@ -1,6 +1,1 @@
 #nullable enable
-Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_117_0 = 8 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
-const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_117_0 = "0.117.0" -> string!
-Aspire.Hosting.ApplicationModel.DocumentDBVersion.V1_0_0 = 9 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
-const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V1_0_0 = "1.0.0" -> string!
-static Aspire.Hosting.DocumentDBBuilderExtensions.WithoutUsageTelemetry(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>!

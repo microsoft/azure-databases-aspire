@@ -370,7 +370,8 @@ Aspire `WithVolume`/`WithBindMount` APIs fails the resource start with an `Inval
 
 A read-only data directory can never work: the entrypoint takes ownership of the directory, and
 `initdb` has to change its permissions before PostgreSQL can create the cluster or write WAL.
-`1.0.0` stops at once with `Error: cannot set permissions on data directory /data`. Older images
+`1.0.0` stops at once with `Error: cannot set permissions on data directory /data`, or with a
+`chown ... Read-only file system` error when the directory belongs to another user. Older images
 do not report it clearly: they fail with `initdb: error: could not change permissions of directory
 "/data": Read-only file system` buried in interleaved log streams, then spend 60 seconds before
 printing the misleading `PostgreSQL failed to start within 60 seconds` banner.
@@ -436,10 +437,16 @@ starting another one on it, including `docker run` sessions and a second AppHost
 ### Ownership and permissions
 
 The container runs as its own `documentdb` user and takes ownership of the data directory
-(`chown -R` followed by `chmod -R 750`) on every start, and `initdb` leaves the cluster directory
-mode `0700`. Consequences:
+(`chown -R` followed by `chmod -R 750`), and `initdb` leaves the cluster directory mode `0700`.
+Images before `1.0.0` do this on every start. `1.0.0` does it only when the directory or its
+`PG_VERSION` file belongs to another user, so a cluster whose top level is correct but whose
+interior files are not (a partial restore, an interrupted repair) fails with a PostgreSQL
+permission error. Start once with
+`.WithEnvironment("DOCUMENTDB_FORCE_OWNERSHIP_REPAIR", "true")`, then remove that line.
+Consequences:
 
-- **Volumes** need nothing from you; Docker seeds the volume and the container adjusts it.
+- **Volumes** need nothing from you; Docker seeds the volume and the container adjusts it. The
+  exception on `1.0.0` is a volume whose files something else re-owned, as above.
 - **Bind mounts** must point at a host directory the container may take ownership of. On Linux the
   host directory changes uid/gid on disk, so after the first run the files usually belong to a uid
   your host user is not, and reading them back needs `sudo` or a container. Docker Desktop on macOS
@@ -924,6 +931,11 @@ Candidates are tried in the order `/tmp`, `/var/tmp`, `/dev/shm`; if every candi
 `DATA_PATH` or cannot be proven independent, the container fails clearly. Raw runtime mounts are
 rejected because they never enter this model.
 
+From `1.0.0` the image itself writes its health-state file to `/tmp` as the `documentdb` user before
+it takes ownership of the data directory, so a host directory you mount at `/tmp` must already be
+writable by that user (as a real `/tmp`, mode `1777`, is); otherwise the container stops at once with
+`cannot reset or write the runtime state file`.
+
 `exportInterval` and `timeout` are written as integer milliseconds via the invariant culture.
 Values smaller than one millisecond (sub-ms ticks) truncate to `0`; pass whole-millisecond or
 larger granularities.
@@ -1352,6 +1364,7 @@ guarantee every publisher matches the RFC 3986 escaping described above.
 | Container default data path | `/data` (declared as an image `VOLUME` from `0.116.0`) |
 | Persistence helper default path | `/data` |
 | Data directory access | Writable, empty or an existing cluster; from `0.116.0` also initialized once and exclusive to one running container |
+| Usage telemetry | On from `1.0.0`, sent by the image; see [`WithoutUsageTelemetry`](#withoutusagetelemetry) |
 | Auth mechanism | `SCRAM-SHA-256` |
 | Auth database | `admin` |
 

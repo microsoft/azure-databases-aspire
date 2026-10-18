@@ -647,6 +647,7 @@ public static class DocumentDBBuilderExtensions
     /// using the <see cref="ResourceBuilderExtensions.WaitFor{T}(IResourceBuilder{T}, IResourceBuilder{IResource})"/>
     /// extension method then the dependent resource will wait until the DocumentDB server responds to ping.
     /// This version of the package defaults to the <inheritdoc cref="DocumentDBContainerImageTags.Tag"/> tag of the <inheritdoc cref="DocumentDBContainerImageTags.Image"/> container image.
+    /// From <c>v1.0-0</c> that image sends usage telemetry by default; see <see cref="WithoutUsageTelemetry"/>.
     /// </remarks>
     /// <param name="builder">The <see cref="IDistributedApplicationBuilder"/>.</param>
     /// <param name="name">The name of the resource. This name will be used as the connection string name when referenced in a dependency.</param>
@@ -1931,7 +1932,7 @@ public static class DocumentDBBuilderExtensions
         $"{methodName}(isReadOnly: true) is not supported: DocumentDB requires a writable data " +
         $"directory. The container entrypoint takes ownership of '{targetPath}' and lets " +
         $"PostgreSQL initialise and write WAL there, so a read-only mount fails at startup. " +
-        $"DocumentDB 1.0.0 stops with 'Error: cannot set permissions on data directory'; older " +
+        $"DocumentDB 1.0.0 stops at once with a 'Read-only file system' error; older " +
         $"images fail about a minute in behind the misleading banner 'PostgreSQL failed to start " +
         $"within 60 seconds' (the real cause, 'initdb: error: could not change permissions of " +
         $"directory \"{targetPath}\": Read-only file system', is buried in interleaved container logs). " +
@@ -3344,8 +3345,8 @@ public static class DocumentDBBuilderExtensions
         return
             $"DocumentDB resource '{resource.Name}' mounts {backing} read-only. DocumentDB requires " +
             $"a writable data directory: the container entrypoint takes ownership of it and " +
-            $"PostgreSQL initialises and writes WAL there. DocumentDB 1.0.0 would stop with 'Error: " +
-            $"cannot set permissions on data directory'; older images run for about a minute and " +
+            $"PostgreSQL initialises and writes WAL there. DocumentDB 1.0.0 would stop at once with a " +
+            $"'Read-only file system' error; older images run for about a minute and " +
             $"then fail with the misleading banner 'PostgreSQL failed to start within 60 seconds', " +
             $"hiding the real cause ('initdb: error: could not change permissions of directory " +
             $"\"{dataPath}\": Read-only file system'). Recovery: mount {source} writable, " +
@@ -4245,7 +4246,8 @@ public static class DocumentDBBuilderExtensions
     /// </summary>
     /// <remarks>
     /// From <c>v1.0-0</c> the image reports its version, platform and CPU architecture at
-    /// startup and hourly unless told not to. Older images ignore the variable. This is separate
+    /// startup and hourly to an analytics provider, which also sees the host's network address.
+    /// Older images ignore the variable. This is separate
     /// from the gateway's OpenTelemetry metrics configured by <see cref="WithOpenTelemetryMetrics"/>.
     /// </remarks>
     /// <param name="builder">The resource builder for DocumentDB.</param>

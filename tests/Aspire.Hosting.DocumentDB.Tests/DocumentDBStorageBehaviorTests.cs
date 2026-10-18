@@ -197,11 +197,13 @@ public class DocumentDBStorageBehaviorTests
     /// way fails the first container; the next one on the same directory neither retries it nor
     /// refuses to serve — it warns and keeps what the failed attempt applied.
     /// </summary>
-    [Fact]
-    public async Task ACustomSeedThatFailsPartWayIsNotRetriedOnTheSameDataDirectory()
+    [Theory]
+    [MemberData(nameof(InterlockedVersions))]
+    public async Task ACustomSeedThatFailsPartWayIsNotRetriedOnTheSameDataDirectory(string version)
     {
         RequireDocker();
-        await EnsureImageAsync(s_candidateImage);
+        var image = InterlockedImage(version);
+        await EnsureImageAsync(image);
 
         using var cts = CreateEndToEndTimeoutSource();
         var volumeName = UniqueName("seed-vol");
@@ -228,7 +230,7 @@ public class DocumentDBStorageBehaviorTests
             Assert.Equal(0, createExit);
 
             var (firstExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", firstContainer, .. storage, .. s_credentialEnvironment, .. KeepingLastLogLines(s_candidateImage)]);
+                ["run", "-d", "--name", firstContainer, .. storage, .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
             Assert.Equal(0, firstExit);
 
             Assert.NotEqual(0, await WaitForContainerExitCodeAsync(firstContainer));
@@ -238,7 +240,7 @@ public class DocumentDBStorageBehaviorTests
                 StringComparison.Ordinal);
 
             var (secondExit, _) = await RunDockerAsync(
-                ["run", "-d", "--name", secondContainer, .. storage, .. s_publishGateway, .. s_credentialEnvironment, s_candidateImage]);
+                ["run", "-d", "--name", secondContainer, .. storage, .. s_publishGateway, .. s_credentialEnvironment, image]);
             Assert.Equal(0, secondExit);
 
             var logs = await WaitForLogAsync(secondContainer, "=== DocumentDB is ready ===");
@@ -326,6 +328,169 @@ public class DocumentDBStorageBehaviorTests
                 await RunDockerAsync("rm", "-f", "-v", containerName);
                 await RemoveVolumeAsync(volumeName);
             }
+        }
+
+        /// <summary>
+        /// From <c>1.0.0</c> a read-only cluster owned by someone else, such as a backup restored as
+        /// root, fails the ownership repair instead of the permission change, just as fast.
+        /// </summary>
+        [Fact]
+        public async Task ReadOnlyForeignOwnedDataDirectoryFailsAtOnce()
+        {
+            RequireDocker();
+            var version = DocumentDBVersions.Latest;
+            var image = InterlockedImage(version);
+            await EnsureImageAsync(image);
+            await EnsureImageAsync(s_probeImage);
+
+            var volumeName = UniqueName("ro-foreign-vol");
+            var containerName = UniqueName("ro-foreign");
+
+            try
+            {
+                var (createExit, _) = await RunDockerAsync("volume", "create", volumeName);
+                Assert.Equal(0, createExit);
+
+                // A root-owned PG_VERSION sends the entrypoint down its recursive chown. A writable
+                // copy of this volume gets past it, so the log line below proves the mount was read-only.
+                var (seedExit, _) = await RunDockerAsync(
+                    "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh", "-v", $"{volumeName}:/data",
+                    s_probeImage, "-c", "echo 17 > /data/PG_VERSION && chown -R 0:0 /data");
+                Assert.Equal(0, seedExit);
+
+                var started = Stopwatch.StartNew();
+                var (runExit, _) = await RunDockerAsync(
+                    ["run", "-d", "--name", containerName, "-v", $"{volumeName}:/data:ro", .. s_credentialEnvironment, .. KeepingLastLogLines(image)]);
+                Assert.Equal(0, runExit);
+
+                await WaitForLogAsync(containerName, "chown: changing ownership of '/data': Read-only file system");
+                Assert.Equal(1, await WaitForContainerExitCodeAsync(containerName));
+                AssertFailedFastWhereExpected(version, started);
+            }
+            finally
+            {
+                await RunDockerAsync("rm", "-f", "-v", containerName);
+                await RemoveVolumeAsync(volumeName);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Up to <c>0.114.0</c> the image never stops PostgreSQL, so every stop leaves a
+    /// <c>postmaster.pid</c> that <c>1.0.0</c> cannot vouch for. It must refuse that file until the
+    /// documented override removes it once, and then start without the override.
+    /// </summary>
+    [Fact]
+    public async Task UnvouchedPostmasterPidIsRefusedUntilTheOverrideRemovesIt()
+    {
+        RequireDocker();
+        var image = InterlockedImage(DocumentDBVersions.Latest);
+        await EnsureImageAsync(s_baselineImage);
+        await EnsureImageAsync(image);
+
+        var volumeName = UniqueName("stale-pid-vol");
+        var oldContainer = UniqueName("stale-pid-old");
+        var refusedContainer = UniqueName("stale-pid-refused");
+        var forcedContainer = UniqueName("stale-pid-forced");
+        var restartedContainer = UniqueName("stale-pid-restarted");
+
+        try
+        {
+            Assert.Equal(0, (await RunDockerAsync("volume", "create", volumeName)).ExitCode);
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", oldContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, s_baselineImage])).ExitCode);
+            await WaitForLogAsync(oldContainer, "=== DocumentDB is ready ===");
+            Assert.Equal(0, (await RunDockerAsync("stop", oldContainer)).ExitCode);
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", refusedContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, .. KeepingLastLogLines(image)])).ExitCode);
+            await WaitForLogAsync(refusedContainer, "/data/postmaster.pid exists");
+            Assert.Equal(1, await WaitForContainerExitCodeAsync(refusedContainer));
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", forcedContainer, "-v", $"{volumeName}:/data", "-e", "DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID=true", .. s_credentialEnvironment, image])).ExitCode);
+            await WaitForLogAsync(forcedContainer, "=== DocumentDB is ready ===");
+            Assert.Equal(0, (await RunDockerAsync("stop", forcedContainer)).ExitCode);
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", restartedContainer, "-v", $"{volumeName}:/data", .. s_credentialEnvironment, image])).ExitCode);
+            await WaitForLogAsync(restartedContainer, "=== DocumentDB is ready ===");
+        }
+        finally
+        {
+            foreach (var container in new[] { oldContainer, refusedContainer, forcedContainer, restartedContainer })
+            {
+                await RunDockerAsync("rm", "-f", "-v", container);
+            }
+
+            await RemoveVolumeAsync(volumeName);
+        }
+    }
+
+    /// <summary>
+    /// From <c>1.0.0</c> the image repairs ownership only when the directory or <c>PG_VERSION</c> is
+    /// foreign-owned, so a foreign-owned file deeper in the cluster stops PostgreSQL until
+    /// <c>DOCUMENTDB_FORCE_OWNERSHIP_REPAIR</c> forces the full repair once.
+    /// </summary>
+    [Fact]
+    public async Task ForeignOwnedClusterFilesNeedTheForcedOwnershipRepair()
+    {
+        RequireDocker();
+        var image = InterlockedImage(DocumentDBVersions.Latest);
+        await EnsureImageAsync(image);
+        await EnsureImageAsync(s_probeImage);
+
+        using var cts = CreateEndToEndTimeoutSource();
+        var volumeName = UniqueName("repair-vol");
+        var seededContainer = UniqueName("repair-seeded");
+        var failedContainer = UniqueName("repair-failed");
+        var forcedContainer = UniqueName("repair-forced");
+        var restartedContainer = UniqueName("repair-restarted");
+        string[] storage = ["-v", $"{volumeName}:/data"];
+
+        try
+        {
+            Assert.Equal(0, (await RunDockerAsync("volume", "create", volumeName)).ExitCode);
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", seededContainer, .. storage, .. s_publishGateway, .. s_credentialEnvironment, image])).ExitCode);
+            await WaitForLogAsync(seededContainer, "=== DocumentDB is ready ===");
+            var seeded = await ConnectAsync(await GetGatewayConnectionStringAsync(seededContainer), "repair", cts.Token);
+            await seeded.GetCollection<BsonDocument>("items").InsertOneAsync(new BsonDocument { ["_id"] = "kept" }, cancellationToken: cts.Token);
+            Assert.Equal(0, (await RunDockerAsync("stop", seededContainer)).ExitCode);
+
+            // As a restore or an interrupted repair leaves it: the top level is still correct.
+            Assert.Equal(0, (await RunDockerAsync(
+                "run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh", "-v", $"{volumeName}:/data",
+                s_probeImage, "-c", "chown 0:0 /data/global/pg_control && chmod 600 /data/global/pg_control")).ExitCode);
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", failedContainer, .. storage, .. s_credentialEnvironment, .. KeepingLastLogLines(image)])).ExitCode);
+            Assert.NotEqual(0, await WaitForContainerExitCodeAsync(failedContainer));
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", forcedContainer, .. storage, "-e", "DOCUMENTDB_FORCE_OWNERSHIP_REPAIR=true", .. s_credentialEnvironment, image])).ExitCode);
+            await WaitForLogAsync(forcedContainer, "=== DocumentDB is ready ===");
+            Assert.Equal(0, (await RunDockerAsync("stop", forcedContainer)).ExitCode);
+
+            Assert.Equal(0, (await RunDockerAsync(
+                ["run", "-d", "--name", restartedContainer, .. storage, .. s_publishGateway, .. s_credentialEnvironment, image])).ExitCode);
+            await WaitForLogAsync(restartedContainer, "=== DocumentDB is ready ===");
+            var restarted = await ConnectAsync(await GetGatewayConnectionStringAsync(restartedContainer), "repair", cts.Token);
+            Assert.Equal(
+                1,
+                await restarted.GetCollection<BsonDocument>("items")
+                    .CountDocumentsAsync(FilterDefinition<BsonDocument>.Empty, cancellationToken: cts.Token));
+        }
+        finally
+        {
+            foreach (var container in new[] { seededContainer, failedContainer, forcedContainer, restartedContainer })
+            {
+                await RunDockerAsync("rm", "-f", "-v", container);
+            }
+
+            await RemoveVolumeAsync(volumeName);
         }
     }
 

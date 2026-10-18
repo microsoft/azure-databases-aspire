@@ -7,7 +7,7 @@ This guide walks you through adding [DocumentDB](https://github.com/documentdb/d
 | Requirement | Details |
 |---|---|
 | .NET 10 SDK or later | [Download](https://dotnet.microsoft.com/download) |
-| Aspire workload | `dotnet workload install aspire` |
+| Aspire CLI | [Install](https://aspire.dev/get-started/install-cli/#install-with-a-package-manager) |
 | Docker | DocumentDB runs as a Linux container. [Docker Desktop](https://www.docker.com/products/docker-desktop/) or any Docker-compatible runtime works. |
 | IDE (optional) | Visual Studio 2022 17.9+, VS Code with C# Dev Kit, or JetBrains Rider |
 
@@ -16,7 +16,7 @@ This guide walks you through adding [DocumentDB](https://github.com/documentdb/d
 If you already have an Aspire project, skip to [Install the package](#install-the-package).
 
 ```bash
-dotnet new aspire-starter -o MyApp
+aspire new aspire-starter --name MyApp --output MyApp
 cd MyApp
 ```
 
