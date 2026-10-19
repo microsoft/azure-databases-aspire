@@ -172,7 +172,7 @@ jobs:
       - name: Pack with API validation against the last release
         run: >-
           dotnet pack src/Aspire.Hosting.DocumentDB/Aspire.Hosting.DocumentDB.csproj -c Release -o ./artifacts
-          -p:EnablePackageValidation=true -p:PackageValidationBaselineVersion=0.116.0
+          -p:EnablePackageValidation=true -p:PackageValidationBaselineVersion=1.0.0
 
       - name: Validate packed package
         run: python3 eng/scripts/validate-nuget-package.py --artifacts ./artifacts
