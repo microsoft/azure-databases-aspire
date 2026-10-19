@@ -709,7 +709,7 @@ var server = builder.AddDocumentDB("documentdb")
                         endpoint: "http://otel-collector:4317",
                         exportInterval: TimeSpan.FromSeconds(30),
                         serviceName: "documentdb-local",
-                        serviceVersion: "0.112.0");
+                        serviceVersion: "1.0.0");
 ```
 
 | Parameter | Type | Default | Description |
@@ -1020,7 +1020,7 @@ Pins the DocumentDB version to a specific release known to this build of the pac
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
-                    .WithDocumentDBVersion(DocumentDBVersion.V0_111_0);
+                    .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
 ```
 
 | Parameter | Type | Default | Description |
@@ -1034,8 +1034,8 @@ Selects the PostgreSQL backend variant of the `documentdb-local` container image
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
                     .WithPostgresVersion(DocumentDBPostgresVersion.Pg16)
-                    .WithDocumentDBVersion(DocumentDBVersion.V0_111_0);
-// -> image tag "pg16-0.111.0"
+                    .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
+// -> image tag "pg16-1.0.0"
 ```
 
 | Parameter | Type | Default | Description |
@@ -1081,19 +1081,14 @@ builder.AddProject<Projects.Worker>("worker")
 > after AddDocumentDB(...). See https://github.com/microsoft/azure-databases-aspire/issues/71.
 > ```
 >
-> **Recovery recipe:**
+> **Recovery recipe:** drop the older pin, since the default image clears the floor, or pin a
+> newer version:
 >
 > ```csharp
 > var db = builder.AddDocumentDB("documentdb")
->                 .WithImageTag("pg17-0.112.0")   // or any newer tag
+>                 .WithDocumentDBVersion(DocumentDBVersion.V1_0_0)
 >                 .WithPostgresEndpoint();
 > ```
->
-> Once `DocumentDBVersion.V0_112_0` is added to the curated enum
-> (tracked by issue [#70](https://github.com/microsoft/azure-databases-aspire/issues/70)),
-> the typed form `.WithDocumentDBVersion(DocumentDBVersion.V0_112_0)` becomes
-> available as an equivalent recovery. Until then, prefer the free-form
-> `.WithImageTag(...)` shown above.
 >
 > **Scope of the guard:**
 > - **Judged on the image that will actually run.** In run mode the integration
@@ -1162,7 +1157,7 @@ You can enumerate the full list at runtime via `DocumentDBVersions.All`, and rea
 
 | Symbol | Notes |
 |---|---|
-| `enum DocumentDBVersion` | Curated members like `V0_109_0`, `V0_110_0`, `V0_111_0`. Stable forever once shipped. |
+| `enum DocumentDBVersion` | Curated members like `V0_116_0`, `V0_117_0`, `V1_0_0`. Stable forever once shipped. |
 | `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`, `Pg18`. Default `Pg17`. `Pg18` requires DocumentDB `0.114.0` or newer — enforced against the image that will actually run, at startup and again at container creation and manifest serialization, so an unpublished combination fails with an actionable message. |
 | `DocumentDBVersions.All` | All known version strings, ascending semver. |
 | `DocumentDBVersions.Latest` | The newest version known to *this build* of the package. |
@@ -1173,7 +1168,7 @@ Aspire's framework `WithImageTag` is the free-form escape hatch. Use it to pin t
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
-                    .WithImageTag("pg17-0.999.0");
+                    .WithImageTag("pg17-1.1.0");
 ```
 
 ### Precedence (last-call-wins)
@@ -1181,15 +1176,15 @@ var server = builder.AddDocumentDB("documentdb")
 `WithDocumentDBVersion`, `WithPostgresVersion`, `WithImage`, and `WithImageTag` all converge on the same single `ContainerImageAnnotation`. The most recent call wins, regardless of which API was used:
 
 ```csharp
-// Final tag is "pg17-0.111.0" -- the typed call wins because it came last.
+// Final tag is "pg17-1.0.0" -- the typed call wins because it came last.
 builder.AddDocumentDB("documentdb")
-       .WithImageTag("pg15-0.999.0")
-       .WithDocumentDBVersion(DocumentDBVersion.V0_111_0);
+       .WithImageTag("pg15-1.1.0")
+       .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
 
-// Final tag is "pg17-0.999.0" -- the free-form call wins because it came last.
+// Final tag is "pg17-1.1.0" -- the free-form call wins because it came last.
 builder.AddDocumentDB("documentdb")
-       .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
-       .WithImageTag("pg17-0.999.0");
+       .WithDocumentDBVersion(DocumentDBVersion.V1_0_0)
+       .WithImageTag("pg17-1.1.0");
 ```
 
 ### How the image is recognised
@@ -1425,11 +1420,10 @@ All configuration methods return the builder, so they can be chained:
 var db = builder.AddDocumentDB("documentdb")
                 .WithHostPort(10260)
                 .WithDataVolume()
-                .WithDocumentDBVersion(DocumentDBVersion.V0_111_0)
+                .WithDocumentDBVersion(DocumentDBVersion.V1_0_0)
                 .WithPostgresVersion(DocumentDBPostgresVersion.Pg17)
                 .WithLogLevel(DocumentDBLogLevel.Debug)
                 .WithoutSampleData()
-                .WithoutExtendedRum()
                 .WithoutUserCreation()
                 .UseTls(true)
                 .AllowInsecureTls(true)
