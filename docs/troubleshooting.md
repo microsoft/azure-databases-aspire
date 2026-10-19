@@ -73,7 +73,7 @@ refuses the run.
 
 ```csharp
 var db = builder.AddDocumentDB("documentdb")
-                .WithDocumentDBVersion(DocumentDBVersion.V0_116_0);
+                .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
 ```
 
 `WithImageTag(...)`, `WithImageRegistry(...)`, `WithImage(...)`, `WithImageSHA256(...)`
