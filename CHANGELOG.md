@@ -16,7 +16,7 @@ _No upstream DocumentDB versions detected since the last release. This block is 
 - `DocumentDBVersion.V1_0_1` curated enum member and `DocumentDBVersions.V1_0_1 = "1.0.1"` constant.
 
 ### Changed
-- The package now depends on `Aspire.Hosting` `13.6.3` (was `13.6.1`).
+- The package now depends on `Aspire.Hosting` `13.6.4` (was `13.6.1`).
 
 ### Security
 - `DocumentDBVersions.Latest` and the default image now resolve to `1.0.1` (`pg17-1.0.1`), a rebuild of `1.0.0` that fixes CVE-2026-111497 (`libbrotli1`) and CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). The `pg15`-`pg18-1.0.0` tags still serve the original `1.0.0` images with those libraries. A `1.0.0` data volume runs under `1.0.1` as it is; Docker-backed tests cover that move.
