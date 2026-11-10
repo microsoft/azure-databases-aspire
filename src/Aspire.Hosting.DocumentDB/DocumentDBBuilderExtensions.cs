@@ -648,6 +648,10 @@ public static class DocumentDBBuilderExtensions
     /// extension method then the dependent resource will wait until the DocumentDB server responds to ping.
     /// This version of the package defaults to the <inheritdoc cref="DocumentDBContainerImageTags.Tag"/> tag of the <inheritdoc cref="DocumentDBContainerImageTags.Image"/> container image.
     /// From <c>v1.0-0</c> that image sends usage telemetry by default; see <see cref="WithoutUsageTelemetry"/>.
+    /// The official image is pulled on every start (<see cref="ImagePullPolicy.Always"/>), because upstream
+    /// rebuilds a published tag in place to ship security fixes; call
+    /// <see cref="ContainerResourceBuilderExtensions.WithImagePullPolicy{T}(IResourceBuilder{T}, ImagePullPolicy)"/>
+    /// to change that. A custom image or a Dockerfile build keeps the container runtime's default.
     /// </remarks>
     /// <param name="builder">The <see cref="IDistributedApplicationBuilder"/>.</param>
     /// <param name="name">The name of the resource. This name will be used as the connection string name when referenced in a dependency.</param>
@@ -695,6 +699,10 @@ public static class DocumentDBBuilderExtensions
 
         var DocumentDBContainer = new DocumentDBServerResource(name, userName?.Resource, passwordParameter);
 
+        // Upstream rebuilds a tag in place for security fixes; only a fresh pull picks them up.
+        var defaultPullPolicy = new ContainerImagePullPolicyAnnotation { ImagePullPolicy = ImagePullPolicy.Always };
+        DocumentDBContainer.DefaultImagePullPolicy = defaultPullPolicy;
+
         // One hook per application, however many DocumentDB resources it has: the hook walks the
         // model rather than closing over a resource. See DocumentDBImageSealLifecycleHook.
 #pragma warning disable CS0618 // The lifecycle-hook phase has no eventing equivalent that runs after every BeforeStartEvent subscriber.
@@ -724,6 +732,7 @@ public static class DocumentDBBuilderExtensions
             .WithEndpoint(port: port, targetPort: DefaultContainerPort, name: DocumentDBServerResource.PrimaryEndpointName)
             .WithImage(DocumentDBContainerImageTags.Image, DocumentDBContainerImageTags.Tag)
             .WithImageRegistry(DocumentDBContainerImageTags.Registry)
+            .WithAnnotation(defaultPullPolicy, ResourceAnnotationMutationBehavior.Replace)
             .WithEnvironment(context =>
             {
                 context.EnvironmentVariables[UserEnvVarName] = DocumentDBContainer.UserNameReference;
@@ -1249,6 +1258,7 @@ public static class DocumentDBBuilderExtensions
 
             foreach (var resource in appModel.Resources.OfType<DocumentDBServerResource>())
             {
+                DropDefaultPullPolicyForCallerImage(resource);
                 SealLaunchImage(resource);
             }
 
@@ -1256,6 +1266,16 @@ public static class DocumentDBBuilderExtensions
         }
     }
 #pragma warning restore CS0618
+
+    // A caller's own build or repository may exist only locally, where Always would fail the start.
+    private static void DropDefaultPullPolicyForCallerImage(DocumentDBServerResource resource)
+    {
+        if (resource.DefaultImagePullPolicy is { } defaultPullPolicy &&
+            ResolveModelImage(resource).Origin is DocumentDBImageOrigin.DockerfileBuild or DocumentDBImageOrigin.CustomRepository)
+        {
+            resource.Annotations.Remove(defaultPullPolicy);
+        }
+    }
 
     private static void SealLaunchImage(DocumentDBServerResource resource)
     {
@@ -5374,8 +5394,8 @@ public static class DocumentDBBuilderExtensions
     /// <para>
     /// The affected range is open-ended from
     /// <see cref="FirstGatewayTelemetryConfigurationVersion"/>: the JSON-over-environment
-    /// precedence arrived in that release, it is the newest published DocumentDB version, and
-    /// nothing upstream retracts it. Tags outside the strict <c>pg{NN}-X.Y.Z</c> grammar and
+    /// precedence arrived in that release and every later release keeps it. Tags outside the
+    /// strict <c>pg{NN}-X.Y.Z</c> grammar and
     /// images other than the official one are exempt, so forks and custom images keep the stock
     /// behaviour. So is any resource built from the caller's own Dockerfile, whose image
     /// annotation describes the build at best and may name the official image exactly. Private

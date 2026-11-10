@@ -10,33 +10,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
-### Security
-- The `pg15`-`pg18-1.0.0` images were rebuilt again on 2026-11-10 and now also fix CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). The package pulls by tag, so 1.0.2 already gets them.
-
-## [1.0.2] - 2026-11-10
+## [1.0.3] - 2026-11-10
 
 ### Changed
-- `DocumentDBVersions.Latest` and the default image are back on `1.0.0` (`pg17-1.0.0`). Upstream withdrew `1.0.1`: its extension version `1.0-1` has no upgrade path to later releases.
-- A data volume created by `1.0.1` still starts on `1.0.0`, and reads, writes, unique indexes and aggregation work, but its catalog stays at `1.0-1`, which `ALTER EXTENSION ... UPDATE` cannot move. Docker-backed tests cover that move.
-
-### Deprecated
-- `DocumentDBVersion.V1_0_1` and `DocumentDBVersions.V1_0_1` are obsolete. They still select the `pgN-1.0.1` images.
+- The official image is now pulled on every start (`ImagePullPolicy.Always`), so a cached copy of an older build of the same tag is replaced. A start therefore needs the registry; `.WithImagePullPolicy(ImagePullPolicy.Missing)` starts from the cached image instead, and any `.WithImagePullPolicy(...)` call wins over the default. A custom image or a `WithDockerfile(...)` build keeps the container runtime's default. See [Supported versions](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#supported-versions).
 
 ### Security
-- The `pg15`-`pg18-1.0.0` tags now serve the 2026-11-06 rebuilds of `1.0.0` (same source, extension `1.0-0`), which fix CVE-2026-111497 (`libbrotli1`). Unlike `1.0.1`, they still carry CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). A subsequent rebuild on 2026-11-10 fixes those two as well.
+- The default `pg17-1.0.0` image, like the other `pg15`-`pg18-1.0.0` tags, is now the 2026-11-10 rebuild of `1.0.0` (same source, extension `1.0-0`). It fixes CVE-2026-111497 (`libbrotli1`) and CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`).
 
-## [1.0.1] - 2026-11-10
-
-**Withdrawn, superseded by 1.0.2:** DocumentDB `1.0.1`'s extension version `1.0-1` has no upgrade path to later releases.
-
-### Added
-- `DocumentDBVersion.V1_0_1` curated enum member and `DocumentDBVersions.V1_0_1 = "1.0.1"` constant.
+## [1.0.2] - 2026-11-10
 
 ### Changed
 - The package now depends on `Aspire.Hosting` `13.6.4` (was `13.6.1`).
 
 ### Security
-- `DocumentDBVersions.Latest` and the default image now resolve to `1.0.1` (`pg17-1.0.1`), a rebuild of `1.0.0` that fixes CVE-2026-111497 (`libbrotli1`) and CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). The `pg15`-`pg18-1.0.0` tags still serve the original `1.0.0` images with those libraries. A `1.0.0` data volume runs under `1.0.1` as it is; Docker-backed tests cover that move.
+- The `pg15`-`pg18-1.0.0` tags serve rebuilds of `1.0.0` (same source, extension `1.0-0`). The 2026-11-10 rebuild fixes CVE-2026-111497 (`libbrotli1`) and CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). This version pulls by tag, so a machine that cached an earlier build keeps it until the image is pulled again; 1.0.3 pulls on every start.
 
 ## [1.0.0] - 2026-10-19
 

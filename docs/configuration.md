@@ -1153,6 +1153,8 @@ The `DocumentDBVersion` enum is the **curated, append-only** list of versions kn
 
 The package pulls these images by tag, and GHCR tags are mutable: the digests recorded when a version is adopted (`eng/documentdb-image-digests.json`) are checked in this repository's CI, not at your pull — pin with `WithImageSHA256(...)` if you need immutable bytes.
 
+Upstream rebuilds a published tag in place to ship security fixes, so the official image is pulled on every start (`ImagePullPolicy.Always`) and a cached copy of an older build is replaced. That start needs the registry to be reachable; to start from the local copy instead, for example offline, call `.WithImagePullPolicy(ImagePullPolicy.Missing)`, which wins over the default. A custom image (`WithImage(...)` naming another repository) or a `WithDockerfile(...)` build keeps the container runtime's default policy.
+
 You can enumerate the full list at runtime via `DocumentDBVersions.All`, and read the newest version known to the current package build via `DocumentDBVersions.Latest` (a property, not a `const`, so it is re-resolved after a package upgrade rather than inlined).
 
 | Symbol | Notes |
@@ -1348,6 +1350,7 @@ guarantee every publisher matches the RFC 3986 escaping described above.
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
 | Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-1.0.0`) |
+| Image pull policy | `Always` for the official image; see [Supported versions](#supported-versions) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
