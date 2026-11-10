@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Reflection;
 using Aspire.Hosting.ApplicationModel;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
@@ -41,7 +42,9 @@ public class DocumentDBVersionSelectionTests
         { DocumentDBVersion.V0_116_0, "pg17-0.116.0" },
         { DocumentDBVersion.V0_117_0, "pg17-0.117.0" },
         { DocumentDBVersion.V1_0_0, "pg17-1.0.0" },
+#pragma warning disable CS0618 // Withdrawn, but still selectable.
         { DocumentDBVersion.V1_0_1, "pg17-1.0.1" },
+#pragma warning restore CS0618
     };
 
     [Fact]
@@ -207,11 +210,17 @@ public class DocumentDBVersionSelectionTests
     }
 
     [Fact]
-    public void DocumentDBVersionsListIsNonEmptyAndLatestIsLast()
+    public void LatestIsTheNewestVersionThatIsNotObsolete()
     {
+        // An [Obsolete] version stays selectable but must never become the default.
+        var obsolete = typeof(DocumentDBVersions)
+            .GetFields(BindingFlags.Public | BindingFlags.Static)
+            .Where(field => field.IsLiteral && field.IsDefined(typeof(ObsoleteAttribute)))
+            .Select(field => (string)field.GetRawConstantValue()!)
+            .ToHashSet();
+
         Assert.NotEmpty(DocumentDBVersions.All);
-        Assert.Equal(DocumentDBVersions.All[DocumentDBVersions.All.Count - 1], DocumentDBVersions.Latest);
-        Assert.Contains(DocumentDBVersions.Latest, DocumentDBVersions.All);
+        Assert.Equal(DocumentDBVersions.All.Last(version => !obsolete.Contains(version)), DocumentDBVersions.Latest);
     }
 
     [Fact]
