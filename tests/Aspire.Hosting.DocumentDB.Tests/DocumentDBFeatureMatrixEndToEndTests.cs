@@ -36,7 +36,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Collection(DocumentDBFeatureMatrixAppHostCollection.Name)]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
-    private const string ReleasedVersion = DocumentDBVersions.V1_0_0;
+    private const string ReleasedVersion = DocumentDBVersions.V1_0_1;
     private const string QuietWindowControlMarker = "[ASPIRE-TEST] quiet-window-control";
     private static readonly Regex GatewayDebugInsertRegex = new(
         @"DEBUG[^\r\n]*documentdb_api\.insert",
@@ -340,10 +340,11 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Theory]
     [Trait("Shard", "2")]
-    // 0.116.0 compressed large values with lz4, which 0.114.0 and 0.117.0 did not default to.
+    // 0.116.0 and 1.0.0 compressed large values with lz4, which 0.114.0 and 0.117.0 did not default to.
     [InlineData("0.114.0", "pglz")]
     [InlineData("0.116.0", "lz4")]
     [InlineData("0.117.0", "pglz")]
+    [InlineData("1.0.0", "lz4")]
     public async Task PersistedPg17DataUpgradesToTheReleasedVersion(string sourceVersion, string sourceCompression)
     {
         RequireDocker();
@@ -720,7 +721,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [Theory]
     [Trait("Shard", "3")]
     [InlineData("pg17-0.114.0", "pg17-0.114.0")]
-    [InlineData(null, "pg17-1.0.0")]
+    [InlineData(null, "pg17-1.0.1")]
     public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
     {
         RequireDocker();
@@ -1881,6 +1882,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [InlineData("pg17-0.116.0", "lz4")]
     [InlineData("pg17-0.117.0", "pglz")]
     [InlineData("pg17-1.0.0", "lz4")]
+    [InlineData("pg17-1.0.1", "lz4")]
     public async Task PostgresEndpointReportsTheImageToastCompressionDefault(string imageTag, string expected)
     {
         await AssertPostgresExtrasAsync(imageTag, expected);
