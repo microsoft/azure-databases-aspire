@@ -85,6 +85,9 @@ public class DocumentDBServerResource(string name) : ContainerResource(name), IR
     /// </summary>
     internal DocumentDBPostgresVersion PgVersion { get; private set; } = DocumentDBPostgresVersion.Pg17;
 
+    // The pull policy AddDocumentDB installs; a caller's WithImagePullPolicy replaces it.
+    internal ContainerImagePullPolicyAnnotation? DefaultImagePullPolicy { get; set; }
+
     /// <summary>
     /// The raw, unencoded user name. This is the form the container expects in its
     /// <c>USERNAME</c> environment variable, so it must never be percent-encoded.

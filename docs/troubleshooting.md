@@ -23,6 +23,7 @@ docker info
 1. Verify network connectivity: `docker pull ghcr.io/documentdb/documentdb/documentdb-local:pg17-1.0.0`
 2. Check if you need to authenticate to GitHub Container Registry (public images should not require auth)
 3. If behind a corporate proxy, configure Docker's proxy settings
+4. The official image is pulled on every start, so a start needs the registry even when the image is cached. To start from the cached image, add `.WithImagePullPolicy(ImagePullPolicy.Missing)`
 
 ### Container fails to start
 

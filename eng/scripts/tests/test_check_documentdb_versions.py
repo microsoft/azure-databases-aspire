@@ -527,6 +527,17 @@ class ObsoleteAttributeTests(ScriptTestCase):
         self.assertEqual(2, text.count(self.ATTRIBUTE))
         self.assertIn("V0_102_0 = 3,", text)
 
+    def test_obsolete_member_summary_names_no_version(self):
+        repo = self._repo_with_obsolete_member()
+
+        code, _, _ = repo.run_main([_semver("0.102.0")], _full_variants("0.102.0"))
+
+        self.assertEqual(0, code)
+        text = repo.versions_text()
+        self.assertNotIn("<c>0.100.0</c>", text)
+        self.assertEqual(2, text.count(script.OBSOLETE_SUMMARY + f"\n    {self.ATTRIBUTE}\n"))
+        self.assertIn("<c>0.101.0</c>", text)
+
     def test_multi_line_attribute_is_a_hard_error(self):
         repo = self.make_repo()
         repo.versions_file.write_text(
