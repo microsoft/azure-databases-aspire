@@ -117,17 +117,30 @@ public class DocumentDBImagePullPolicyTests
         Assert.Equal(ImagePullPolicy.Always, Assert.Single(PullPolicies(documentDB.Resource)).ImagePullPolicy);
     }
 
-    [Fact]
-    public async Task APublishKeepsTheDefault()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task APublishTreatsTheImageAsARunDoes(bool callersOwnImage)
     {
         var appBuilder = DistributedApplication.CreateBuilder(
             ["--operation", "publish", "--publisher", "manifest", "--output-path", "./"]);
-        var documentDB = appBuilder.AddDocumentDB("DocumentDB").WithImage("my-documentdb", "dev");
+        var documentDB = appBuilder.AddDocumentDB("DocumentDB");
+        if (callersOwnImage)
+        {
+            documentDB.WithImage("my-documentdb", "dev");
+        }
 
         using var app = appBuilder.Build();
         await RunBeforeStartPhaseAsync(app);
 
-        Assert.Equal(ImagePullPolicy.Always, Assert.Single(PullPolicies(documentDB.Resource)).ImagePullPolicy);
+        if (callersOwnImage)
+        {
+            Assert.Empty(PullPolicies(documentDB.Resource));
+        }
+        else
+        {
+            Assert.Equal(ImagePullPolicy.Always, Assert.Single(PullPolicies(documentDB.Resource)).ImagePullPolicy);
+        }
     }
 
     private static ContainerImagePullPolicyAnnotation[] PullPolicies(IResource resource) =>

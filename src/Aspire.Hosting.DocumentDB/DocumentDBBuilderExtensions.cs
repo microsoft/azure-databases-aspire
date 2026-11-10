@@ -1251,15 +1251,15 @@ public static class DocumentDBBuilderExtensions
         {
             RegisterManifestCheckpointPrerequisite(services, appModel);
 
-            if (!executionContext.IsRunMode)
-            {
-                return Task.CompletedTask;
-            }
-
             foreach (var resource in appModel.Resources.OfType<DocumentDBServerResource>())
             {
+                // Publish too: a deployment target may read the pull policy from the model.
                 DropDefaultPullPolicyForCallerImage(resource);
-                SealLaunchImage(resource);
+
+                if (executionContext.IsRunMode)
+                {
+                    SealLaunchImage(resource);
+                }
             }
 
             return Task.CompletedTask;
