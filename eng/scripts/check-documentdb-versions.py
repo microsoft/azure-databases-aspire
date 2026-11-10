@@ -640,6 +640,14 @@ def assign_numeric_values(
     return out
 
 
+# An obsolete member's own summary points at the default; its [Obsolete] message says the rest.
+OBSOLETE_SUMMARY = "    /// <summary>Obsolete. Use the default version.</summary>"
+
+
+def _is_obsolete(attributes) -> bool:
+    return any(attribute.startswith("[Obsolete") for attribute in attributes)
+
+
 def render_versions_file(
     assignments: dict[SemVer, int],
     enum_attributes: dict[SemVer, list[str]] | None = None,
@@ -666,7 +674,10 @@ def render_versions_file(
     enum_lines.append("    // Updated by .github/workflows/check-documentdb-version.yml.")
     enum_lines.append("")
     for v in versions:
-        enum_lines.append(f"    /// <summary>DocumentDB <c>{v}</c>.</summary>")
+        enum_lines.append(
+            OBSOLETE_SUMMARY if _is_obsolete(enum_attributes.get(v, ()))
+            else f"    /// <summary>DocumentDB <c>{v}</c>.</summary>"
+        )
         enum_lines.extend(f"    {attribute}" for attribute in enum_attributes.get(v, ()))
         enum_lines.append(f"    {v.enum_member} = {assignments[v]},")
         enum_lines.append("")
@@ -677,7 +688,10 @@ def render_versions_file(
     const_lines.append("    // Updated by .github/workflows/check-documentdb-version.yml.")
     const_lines.append("")
     for v in versions:
-        const_lines.append(f"    /// <summary>DocumentDB version string <c>{v}</c>.</summary>")
+        const_lines.append(
+            OBSOLETE_SUMMARY if _is_obsolete(const_attributes.get(v, ()))
+            else f"    /// <summary>DocumentDB version string <c>{v}</c>.</summary>"
+        )
         const_lines.extend(f"    {attribute}" for attribute in const_attributes.get(v, ()))
         const_lines.append(f'    public const string {v.enum_member} = "{v}";')
         const_lines.append("")

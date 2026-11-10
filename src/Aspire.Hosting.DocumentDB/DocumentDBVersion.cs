@@ -57,7 +57,7 @@ public enum DocumentDBVersion
     /// <summary>DocumentDB <c>1.0.0</c>.</summary>
     V1_0_0 = 9,
 
-    /// <summary>DocumentDB <c>1.0.1</c>.</summary>
+    /// <summary>Obsolete. Use the default version.</summary>
     [Obsolete("Use V1_0_0 or the default version."), EditorBrowsable(EditorBrowsableState.Never)]
     V1_0_1 = 10,
 
@@ -134,7 +134,7 @@ public static class DocumentDBVersions
     /// <summary>DocumentDB version string <c>1.0.0</c>.</summary>
     public const string V1_0_0 = "1.0.0";
 
-    /// <summary>DocumentDB version string <c>1.0.1</c>.</summary>
+    /// <summary>Obsolete. Use the default version.</summary>
     [Obsolete("Use V1_0_0 or the default version."), EditorBrowsable(EditorBrowsableState.Never)]
     public const string V1_0_1 = "1.0.1";
 
