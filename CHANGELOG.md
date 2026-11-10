@@ -23,7 +23,7 @@ _No upstream DocumentDB versions detected since the last release. This block is 
 - `DocumentDBVersion.V1_0_1` and `DocumentDBVersions.V1_0_1` are obsolete. They still select the `pgN-1.0.1` images.
 
 ### Security
-- The `pg15`-`pg18-1.0.0` tags now serve the 2026-11-06 rebuilds of `1.0.0` (same source, extension `1.0-0`), which fix CVE-2026-111497 (`libbrotli1`). Unlike `1.0.1`, they still carry CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`).
+- The `pg15`-`pg18-1.0.0` tags now serve the 2026-11-06 rebuilds of `1.0.0` (same source, extension `1.0-0`), which fix CVE-2026-111497 (`libbrotli1`). Unlike `1.0.1`, they still carry CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). A subsequent rebuild on 2026-11-10 fixes those two as well.
 
 ## [1.0.1] - 2026-11-10
 
