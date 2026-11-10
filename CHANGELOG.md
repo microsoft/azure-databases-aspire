@@ -7,10 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 <!-- auto-generated:documentdb-versions-start -->
-### Added (auto-detected upstream DocumentDB versions)
-
-- DocumentDB `1.0.1` upstream release detected on 2026-11-10 (container tags `pg15-1.0.1`, `pg16-1.0.1`, `pg17-1.0.1`, `pg18-1.0.1`).
+_No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
+
+## [1.0.1] - 2026-11-10
+
+### Added
+- `DocumentDBVersion.V1_0_1` curated enum member and `DocumentDBVersions.V1_0_1 = "1.0.1"` constant.
+
+### Changed
+- The package now depends on `Aspire.Hosting` `13.6.3` (was `13.6.1`).
 
 ### Security
 - `DocumentDBVersions.Latest` and the default image now resolve to `1.0.1` (`pg17-1.0.1`), a rebuild of `1.0.0` that fixes CVE-2026-111497 (`libbrotli1`) and CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). The `pg15`-`pg18-1.0.0` tags still serve the original `1.0.0` images with those libraries. A `1.0.0` data volume runs under `1.0.1` as it is; Docker-backed tests cover that move.
