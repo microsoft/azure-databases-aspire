@@ -1020,7 +1020,7 @@ Pins the DocumentDB version to a specific release known to this build of the pac
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
-                    .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
+                    .WithDocumentDBVersion(DocumentDBVersion.V1_0_1);
 ```
 
 | Parameter | Type | Default | Description |
@@ -1034,8 +1034,8 @@ Selects the PostgreSQL backend variant of the `documentdb-local` container image
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
                     .WithPostgresVersion(DocumentDBPostgresVersion.Pg16)
-                    .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
-// -> image tag "pg16-1.0.0"
+                    .WithDocumentDBVersion(DocumentDBVersion.V1_0_1);
+// -> image tag "pg16-1.0.1"
 ```
 
 | Parameter | Type | Default | Description |
@@ -1086,7 +1086,7 @@ builder.AddProject<Projects.Worker>("worker")
 >
 > ```csharp
 > var db = builder.AddDocumentDB("documentdb")
->                 .WithDocumentDBVersion(DocumentDBVersion.V1_0_0)
+>                 .WithDocumentDBVersion(DocumentDBVersion.V1_0_1)
 >                 .WithPostgresEndpoint();
 > ```
 >
@@ -1176,14 +1176,14 @@ var server = builder.AddDocumentDB("documentdb")
 `WithDocumentDBVersion`, `WithPostgresVersion`, `WithImage`, and `WithImageTag` all converge on the same single `ContainerImageAnnotation`. The most recent call wins, regardless of which API was used:
 
 ```csharp
-// Final tag is "pg17-1.0.0" -- the typed call wins because it came last.
+// Final tag is "pg17-1.0.1" -- the typed call wins because it came last.
 builder.AddDocumentDB("documentdb")
        .WithImageTag("pg15-1.1.0")
-       .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
+       .WithDocumentDBVersion(DocumentDBVersion.V1_0_1);
 
 // Final tag is "pg17-1.1.0" -- the free-form call wins because it came last.
 builder.AddDocumentDB("documentdb")
-       .WithDocumentDBVersion(DocumentDBVersion.V1_0_0)
+       .WithDocumentDBVersion(DocumentDBVersion.V1_0_1)
        .WithImageTag("pg17-1.1.0");
 ```
 
@@ -1207,11 +1207,11 @@ What remains must be `documentdb/documentdb-local` exactly. So all of these are 
 builder.AddDocumentDB("documentdb");                                   // ghcr.io/documentdb + documentdb/documentdb-local
 
 builder.AddDocumentDB("documentdb")
-       .WithImage("ghcr.io/documentdb/documentdb/documentdb-local", "pg17-1.0.0")
+       .WithImage("ghcr.io/documentdb/documentdb/documentdb-local", "pg17-1.0.1")
        .WithImageRegistry(null);                                       // the whole reference in one field
 
 builder.AddDocumentDB("documentdb")
-       .WithImage("documentdb/documentdb/documentdb-local", "pg17-1.0.0")
+       .WithImage("documentdb/documentdb/documentdb-local", "pg17-1.0.1")
        .WithImageRegistry("ghcr.io");                                  // the boundary moved one segment
 ```
 
@@ -1347,7 +1347,7 @@ guarantee every publisher matches the RFC 3986 escaping described above.
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-1.0.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-1.0.1`) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
 | Container port | `10260` |
@@ -1420,7 +1420,7 @@ All configuration methods return the builder, so they can be chained:
 var db = builder.AddDocumentDB("documentdb")
                 .WithHostPort(10260)
                 .WithDataVolume()
-                .WithDocumentDBVersion(DocumentDBVersion.V1_0_0)
+                .WithDocumentDBVersion(DocumentDBVersion.V1_0_1)
                 .WithPostgresVersion(DocumentDBPostgresVersion.Pg17)
                 .WithLogLevel(DocumentDBLogLevel.Debug)
                 .WithoutSampleData()
