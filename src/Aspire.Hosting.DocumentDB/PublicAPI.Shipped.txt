@@ -29,6 +29,7 @@ Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_114_0 = 6 -> Aspire.Hosting
 Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_116_0 = 7 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
 Aspire.Hosting.ApplicationModel.DocumentDBVersion.V0_117_0 = 8 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
 Aspire.Hosting.ApplicationModel.DocumentDBVersion.V1_0_0 = 9 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
+Aspire.Hosting.ApplicationModel.DocumentDBVersion.V1_0_1 = 10 -> Aspire.Hosting.ApplicationModel.DocumentDBVersion
 Aspire.Hosting.ApplicationModel.DocumentDBVersions
 Aspire.Hosting.DocumentDBBuilderExtensions
 Aspire.Hosting.DocumentDBLogLevel
@@ -47,6 +48,7 @@ const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_114_0 = "0.114.0" ->
 const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_116_0 = "0.116.0" -> string!
 const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V0_117_0 = "0.117.0" -> string!
 const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V1_0_0 = "1.0.0" -> string!
+const Aspire.Hosting.ApplicationModel.DocumentDBVersions.V1_0_1 = "1.0.1" -> string!
 static Aspire.Hosting.ApplicationModel.DocumentDBVersions.All.get -> System.Collections.Generic.IReadOnlyList<string!>!
 static Aspire.Hosting.ApplicationModel.DocumentDBVersions.Latest.get -> string!
 static Aspire.Hosting.DocumentDBBuilderExtensions.AddDatabase(this Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBServerResource!>! builder, string! name, string? databaseName = null) -> Aspire.Hosting.ApplicationModel.IResourceBuilder<Aspire.Hosting.ApplicationModel.DocumentDBDatabaseResource!>!
