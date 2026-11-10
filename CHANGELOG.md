@@ -14,7 +14,7 @@ _No upstream DocumentDB versions detected since the last release. This block is 
 
 ### Changed
 - `DocumentDBVersions.Latest` and the default image are back on `1.0.0` (`pg17-1.0.0`). Upstream withdrew `1.0.1`: its extension version `1.0-1` has no upgrade path to later releases.
-- A data volume created by `1.0.1` still starts on `1.0.0`, and reads, writes, unique indexes and aggregation work, but its catalog stays at `1.0-1`, which `ALTER EXTENSION ... UPDATE` cannot move. This was checked by hand; the test suite does not cover it.
+- A data volume created by `1.0.1` still starts on `1.0.0`, and reads, writes, unique indexes and aggregation work, but its catalog stays at `1.0-1`, which `ALTER EXTENSION ... UPDATE` cannot move. Docker-backed tests cover that move.
 
 ### Deprecated
 - `DocumentDBVersion.V1_0_1` and `DocumentDBVersions.V1_0_1` are obsolete. They still select the `pgN-1.0.1` images.
@@ -23,6 +23,8 @@ _No upstream DocumentDB versions detected since the last release. This block is 
 - The `pg15`-`pg18-1.0.0` tags now serve the 2026-11-06 rebuilds of `1.0.0` (same source, extension `1.0-0`), which fix CVE-2026-111497 (`libbrotli1`). Unlike `1.0.1`, they still carry CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`).
 
 ## [1.0.1] - 2026-11-10
+
+**Withdrawn, superseded by 1.0.2:** DocumentDB `1.0.1`'s extension version `1.0-1` has no upgrade path to later releases.
 
 ### Added
 - `DocumentDBVersion.V1_0_1` curated enum member and `DocumentDBVersions.V1_0_1 = "1.0.1"` constant.

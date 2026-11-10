@@ -340,10 +340,12 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Theory]
     [Trait("Shard", "2")]
-    // 0.116.0 compressed large values with lz4, which 0.114.0 and 0.117.0 did not default to.
+    // 0.116.0 and 1.0.1 compressed large values with lz4, which 0.114.0 and 0.117.0 did not default to.
     [InlineData("0.114.0", "pglz")]
     [InlineData("0.116.0", "lz4")]
     [InlineData("0.117.0", "pglz")]
+    // Newer than the released version: an Aspire 1.0.1 volume moves back to 1.0.0 with the package.
+    [InlineData("1.0.1", "lz4")]
     public async Task PersistedPg17DataUpgradesToTheReleasedVersion(string sourceVersion, string sourceCompression)
     {
         RequireDocker();
@@ -421,13 +423,26 @@ public class DocumentDBFeatureMatrixEndToEndTests
                     ToCatalogVersion(sourceVersion),
                     await QueryBundledPostgresAsync(containerId, "SELECT extversion FROM pg_extension WHERE extname = 'documentdb'"));
 
-                await QueryBundledPostgresAsync(
-                    containerId,
-                    "ALTER EXTENSION documentdb_core UPDATE; ALTER EXTENSION documentdb UPDATE; " +
-                    "ALTER EXTENSION documentdb_extended_rum UPDATE;");
-                Assert.Equal(
-                    ToCatalogVersion(ReleasedVersion),
-                    await QueryBundledPostgresAsync(containerId, "SELECT extversion FROM pg_extension WHERE extname = 'documentdb'"));
+                if (Version.Parse(sourceVersion) > Version.Parse(ReleasedVersion))
+                {
+                    // Withdrawn 1.0.1's catalog has no path back to the released one, but its data still serves.
+                    var (exitCode, output) = await RunDockerAsync(
+                        "exec", containerId, "sh", "-c",
+                        "psql -X -v ON_ERROR_STOP=1 -p 9712 -h localhost -U documentdb -d postgres -tA " +
+                        "-c 'ALTER EXTENSION documentdb UPDATE' 2>&1");
+                    Assert.NotEqual(0, exitCode);
+                    Assert.Contains("has no update path", output, StringComparison.Ordinal);
+                }
+                else
+                {
+                    await QueryBundledPostgresAsync(
+                        containerId,
+                        "ALTER EXTENSION documentdb_core UPDATE; ALTER EXTENSION documentdb UPDATE; " +
+                        "ALTER EXTENSION documentdb_extended_rum UPDATE;");
+                    Assert.Equal(
+                        ToCatalogVersion(ReleasedVersion),
+                        await QueryBundledPostgresAsync(containerId, "SELECT extversion FROM pg_extension WHERE extname = 'documentdb'"));
+                }
 
                 await AssertPayloadAsync(collection, payload, cts.Token);
                 Assert.Equal(
