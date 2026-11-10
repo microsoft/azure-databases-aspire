@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
+### Security
+- The `pg15`-`pg18-1.0.0` images were rebuilt again on 2026-11-10 and now also fix CVE-2026-76844 and CVE-2026-85091 (`zlib1g`, `libminizip1t64`). The package pulls by tag, so 1.0.2 already gets them.
+
 ## [1.0.2] - 2026-11-10
 
 ### Changed
