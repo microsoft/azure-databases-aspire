@@ -50,6 +50,10 @@ jobs:
     needs: [test, nightly-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      checks: read
+      contents: write
+      id-token: write  # nuget.org Trusted Publishing
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,9 +106,17 @@ jobs:
           name: nuget-package
           path: ./artifacts/*.nupkg
 
+      # The key it returns lasts an hour, so log in right before the push.
+      - name: NuGet login
+        id: nuget-login
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
       - name: Push to NuGet
         if: github.event_name == 'push' && github.ref_type == 'tag'
-        run: dotnet nuget push ./artifacts/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_API_KEY }} --skip-duplicate
+        run: dotnet nuget push ./artifacts/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} --skip-duplicate
 
       - name: Create GitHub Release
         if: github.event_name == 'push' && github.ref_type == 'tag'
