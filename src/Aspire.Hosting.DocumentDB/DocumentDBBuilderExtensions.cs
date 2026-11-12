@@ -4169,8 +4169,8 @@ public static class DocumentDBBuilderExtensions
     /// <c>DOCUMENTDB_LOG_LEVEL</c> as a tracing filter. This makes the API observably effective on
     /// the current default image. The legacy <c>LOG_LEVEL</c> variable is also set
     /// because the Local image entrypoint validates that contract; from <c>1.2.0</c> the entrypoint
-    /// copies it into <c>DOCUMENTDB_LOG_LEVEL</c> only when that is unset, which this method never
-    /// leaves it. Images through <c>0.113.0</c> treat this API as a verbosity no-op.
+    /// copies it into <c>DOCUMENTDB_LOG_LEVEL</c> only when neither that nor <c>RUST_LOG</c> is set,
+    /// and this method always sets <c>DOCUMENTDB_LOG_LEVEL</c>. Images through <c>0.113.0</c> treat this API as a verbosity no-op.
     /// <see cref="DocumentDBLogLevel.Quiet"/> remains mapped to <c>quiet</c> for API compatibility.
     /// It is not a tracing level: on <c>0.114.0</c> and later it becomes newly effective because
     /// the gateway parses it as an unmatched target directive, which suppresses gateway output but

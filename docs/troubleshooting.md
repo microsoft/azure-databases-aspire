@@ -394,12 +394,13 @@ for the one-time override.
 ### "Updating the DocumentDB extensions on this data volume"
 
 From `1.2.0` the image logs this when it starts on a data directory from an older release, and
-updates the extensions before the gateway starts. The update is one way: `1.0.0` and older images do
-not work on the directory afterwards. To stay on `1.0.0`, pin `DocumentDBVersion.V1_0_0`, or copy
+updates the extensions before the gateway starts. The update is one way: `1.0.0` and older images
+still start on the directory afterwards, but some commands fail. To stay on `1.0.0`, pin `DocumentDBVersion.V1_0_0`, or copy
 the volume before the first `1.2.0` start. See
 [Moving persisted data to a newer image](configuration.md#moving-persisted-data-to-a-newer-image).
 
-If the update fails, the container exits with `Error: updating the DocumentDB extensions failed and
+If it cannot read the extension versions, the container exits with `Error: could not read the
+DocumentDB extension versions on this data volume`. If the update itself fails, it exits with `Error: updating the DocumentDB extensions failed and
 was rolled back; the data volume is unchanged.` The reason is in `pglog.log` in the data directory.
 Nothing was changed, so the version that created the data still serves it.
 

@@ -509,7 +509,8 @@ gateway starts, and logs `Updating the DocumentDB extensions on this data volume
 update is rolled back and stops the container, leaving the data directory as it was.
 
 **The update is one way.** Upstream ships no downgrade scripts, so once a `1.2.0` image has started
-on a data directory, `1.0.0` and older images no longer work on it. To stay on `1.0.0`, pin it with
+on a data directory, `1.0.0` and older images still start on it, but some commands fail. To stay on
+`1.0.0`, pin it with
 `.WithDocumentDBVersion(DocumentDBVersion.V1_0_0)` before you update this package, or copy the
 volume before the first `1.2.0` start.
 
@@ -549,8 +550,8 @@ default image. Gateways through `0.113.0` consume neither variable for verbosity
 
 `LOG_LEVEL` is retained to preserve the Local entrypoint contract: the entrypoint validates its six
 legal values. Before `1.2.0` no Local image uses it to select gateway verbosity; from `1.2.0` the
-entrypoint copies `LOG_LEVEL` (or `--log-level`) into `DOCUMENTDB_LOG_LEVEL` only when that is
-unset, which this API never leaves it. Both variables receive the same lowercase public-API value.
+entrypoint copies `LOG_LEVEL` (or `--log-level`) into `DOCUMENTDB_LOG_LEVEL` only when neither that
+nor `RUST_LOG` is set, and this API always sets `DOCUMENTDB_LOG_LEVEL`. Both variables receive the same lowercase public-API value.
 In particular, `Quiet` remains `quiet` and becomes newly effective on `0.114.0` and later. Upstream
 tracing does not define `quiet` as a level; it currently parses the value as an unmatched tracing
 target, which suppresses all gateway output, errors included. The image's own `--log-level quiet`
@@ -1182,9 +1183,8 @@ You can enumerate the full list at runtime via `DocumentDBVersions.All`, and rea
 Aspire's framework `WithImageTag` is the free-form escape hatch. Use it to pin to a brand-new upstream release this package has not been updated to know about, or to a custom build:
 
 ```csharp
-// A package built before 1.2.0 can run it this way.
 var server = builder.AddDocumentDB("documentdb")
-                    .WithImageTag("pg17-1.2.0");
+                    .WithImageTag("pg17-1.3.0");
 ```
 
 ### Precedence (last-call-wins)
@@ -1391,7 +1391,7 @@ The extension passes these environment variables to the DocumentDB container:
 | `DATA_PATH` | Path inside the container for the mounted data directory | Set by `WithDataVolume` and `WithDataBindMount`; can also be set directly with `WithEnvironment("DATA_PATH", ...)`, in which case the last caller wins and the storage guards follow it. The integration rewrites the value to its canonical form before the container receives it. When nothing sets it — or it is set empty — the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
 | `INIT_DATA` | `false` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `DOCUMENTDB_LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Gateway tracing filter set by `WithLogLevel(...)` and consumed in DocumentDB `0.114.0`+ |
-| `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Retained for the Local entrypoint's value-validation contract; from `1.2.0` the entrypoint copies it into `DOCUMENTDB_LOG_LEVEL` only when that is unset |
+| `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Retained for the Local entrypoint's value-validation contract; from `1.2.0` the entrypoint copies it into `DOCUMENTDB_LOG_LEVEL` only when neither that nor `RUST_LOG` is set |
 | `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `CERT_PATH` | Container path of the mounted certificate file | Set by `WithTlsCertificate(...)` |
