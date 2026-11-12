@@ -168,12 +168,11 @@ jobs:
         run: python3 eng/scripts/check-test-results.py TestResults
 
       # Pinned to a published release, advanced by hand after each publish. Not --no-build:
-      # restore has to see the baseline version to download it. 1.0.2 is skipped: its only API
-      # beyond 1.0.0 has since been removed.
+      # restore has to see the baseline version to download it.
       - name: Pack with API validation against the last release
         run: >-
           dotnet pack src/Aspire.Hosting.DocumentDB/Aspire.Hosting.DocumentDB.csproj -c Release -o ./artifacts
-          -p:EnablePackageValidation=true -p:PackageValidationBaselineVersion=1.0.0
+          -p:EnablePackageValidation=true -p:PackageValidationBaselineVersion=1.2.0
 
       - name: Validate packed package
         run: python3 eng/scripts/validate-nuget-package.py --artifacts ./artifacts
