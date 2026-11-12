@@ -1387,7 +1387,7 @@ The extension passes these environment variables to the DocumentDB container:
 | Variable | Value | Purpose |
 |---|---|---|
 | `USERNAME` | The configured username | Container creates this user on startup |
-| `PASSWORD` | The configured password | Password for the created user. From `1.2.0` the image refuses to start without one |
+| `PASSWORD` | The configured password | Password for the created user. From `1.2.0` the image refuses to start without one, unless `WithoutUserCreation()` is set |
 | `DATA_PATH` | Path inside the container for the mounted data directory | Set by `WithDataVolume` and `WithDataBindMount`; can also be set directly with `WithEnvironment("DATA_PATH", ...)`, in which case the last caller wins and the storage guards follow it. The integration rewrites the value to its canonical form before the container receives it. When nothing sets it — or it is set empty — the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
 | `INIT_DATA` | `false` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `DOCUMENTDB_LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Gateway tracing filter set by `WithLogLevel(...)` and consumed in DocumentDB `0.114.0`+ |

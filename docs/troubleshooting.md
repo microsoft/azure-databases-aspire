@@ -402,7 +402,8 @@ the volume before the first `1.2.0` start. See
 If it cannot read the extension versions, the container exits with `Error: could not read the
 DocumentDB extension versions on this data volume`. If the update itself fails, it exits with `Error: updating the DocumentDB extensions failed and
 was rolled back; the data volume is unchanged.` The reason is in `pglog.log` in the data directory.
-Nothing was changed, so the version that created the data still serves it.
+Nothing was changed. If the log says an extension `has no update path` from the volume's version,
+upstream cannot move this volume to `1.2.0`: pin `DocumentDBVersion.V1_0_0` to keep serving it.
 
 ### Read-only data volume or bind mount is rejected
 
