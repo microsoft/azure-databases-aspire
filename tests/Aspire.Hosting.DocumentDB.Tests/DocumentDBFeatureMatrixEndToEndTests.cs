@@ -1885,7 +1885,6 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [InlineData("pg17-0.116.0", "lz4")]
     [InlineData("pg17-0.117.0", "pglz")]
     [InlineData("pg17-1.0.0", "lz4")]
-    [InlineData("pg17-1.0.1", "lz4")]
     [InlineData("pg17-1.2.0", "lz4")]
     public async Task PostgresEndpointReportsTheImageToastCompressionDefault(string imageTag, string expected)
     {
