@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
+### Security
+- The package now depends on `Aspire.Hosting` `13.6.5` (was `13.6.4`), which fixes CVE-2026-120006 ([GHSA-f7vh-h5g3-7jrh](https://github.com/advisories/GHSA-f7vh-h5g3-7jrh)).
+
 ## [1.0.3] - 2026-11-10
 
 ### Changed
