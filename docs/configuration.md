@@ -370,11 +370,11 @@ Aspire `WithVolume`/`WithBindMount` APIs fails the resource start with an `Inval
 
 A read-only data directory can never work: the entrypoint takes ownership of the directory, and
 `initdb` has to change its permissions before PostgreSQL can create the cluster or write WAL.
-`1.0.0` stops at once with `Error: cannot set permissions on data directory /data`, or with a
-`chown ... Read-only file system` error when the directory belongs to another user. Older images
-do not report it clearly: they fail with `initdb: error: could not change permissions of directory
-"/data": Read-only file system` buried in interleaved log streams, then spend 60 seconds before
-printing the misleading `PostgreSQL failed to start within 60 seconds` banner.
+From `1.0.0` the image stops at once with `Error: cannot set permissions on data directory /data`,
+or with a `chown ... Read-only file system` error when the directory belongs to another user. Older
+images do not report it clearly: they fail with `initdb: error: could not change permissions of
+directory "/data": Read-only file system` buried in interleaved log streams, then spend 60 seconds
+before printing the misleading `PostgreSQL failed to start within 60 seconds` banner.
 
 Read-only mounts are still correct for *input*: `WithInitData(...)` mounts seed scripts read-only
 at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and key read-only.
@@ -438,15 +438,15 @@ starting another one on it, including `docker run` sessions and a second AppHost
 
 The container runs as its own `documentdb` user and takes ownership of the data directory
 (`chown -R` followed by `chmod -R 750`), and `initdb` leaves the cluster directory mode `0700`.
-Images before `1.0.0` do this on every start. `1.0.0` does it only when the directory or its
-`PG_VERSION` file belongs to another user, so a cluster whose top level is correct but whose
+Images before `1.0.0` do this on every start. From `1.0.0` it happens only when the directory or
+its `PG_VERSION` file belongs to another user, so a cluster whose top level is correct but whose
 interior files are not (a partial restore, an interrupted repair) fails with a PostgreSQL
 permission error. Start once with
 `.WithEnvironment("DOCUMENTDB_FORCE_OWNERSHIP_REPAIR", "true")`, then remove that line.
 Consequences:
 
 - **Volumes** need nothing from you; Docker seeds the volume and the container adjusts it. The
-  exception on `1.0.0` is a volume whose files something else re-owned, as above.
+  exception from `1.0.0` is a volume whose files something else re-owned, as above.
 - **Bind mounts** must point at a host directory the container may take ownership of. On Linux the
   host directory changes uid/gid on disk, so after the first run the files usually belong to a uid
   your host user is not, and reading them back needs `sudo` or a container. Docker Desktop on macOS
@@ -456,7 +456,7 @@ Consequences:
   (a `.gitkeep` committed to keep the directory in source control, or a `.DS_Store` written by
   macOS) is enough to produce `Warning: Directory /data exists but doesn't appear to contain a
   valid PostgreSQL data directory`, after which PostgreSQL never starts and the container exits
-  non-zero: at once on `1.0.0`, a minute later behind the `PostgreSQL failed to start within 60
+  non-zero: at once from `1.0.0`, a minute later behind the `PostgreSQL failed to start within 60
   seconds` banner on older images. Your files are left where they are.
 - Do not put two mounts on the directory that backs the data path (for example `WithDataVolume()`
   *and* `WithDataBindMount(...)`, or two spellings of one path); the container runtime rejects
@@ -503,8 +503,20 @@ script that failed part way is simply run again on the next start.
 ### Moving persisted data to a newer image
 
 Updating this package moves the default image forward, and a persisted data directory follows it.
-The newer image serves the existing cluster, but it never updates the DocumentDB extensions inside
-it: the catalog keeps the version that created it until you update it yourself.
+
+From `1.2.0` the image updates the DocumentDB extensions in an existing cluster itself, before the
+gateway starts, and logs `Updating the DocumentDB extensions on this data volume: ...`. A failed
+update is rolled back and stops the container, leaving the data directory as it was.
+
+**The update is one way.** Upstream ships no downgrade scripts, so once a `1.2.0` image has started
+on a data directory, `1.0.0` and older images no longer work on it. To stay on `1.0.0`, pin it with
+`.WithDocumentDBVersion(DocumentDBVersion.V1_0_0)` before you update this package, or copy the
+volume before the first `1.2.0` start.
+
+Older images never update the extensions: the catalog keeps the version that created the cluster,
+and commands that need newer catalog objects can fail, for example with `InternalError`
+([documentdb#773](https://github.com/documentdb/documentdb/issues/773)). If you pin one of them on
+data from an even older image, update the catalog yourself:
 
 ```sql
 SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'documentdb%';
@@ -517,17 +529,12 @@ ALTER EXTENSION documentdb_extended_rum UPDATE; -- only if installed
 Run it as `documentdb`, the role that owns the extensions in the bundled PostgreSQL. The
 generated connection strings, including the `WithPostgresEndpoint()` one, log in as your DocumentDB
 user, which PostgreSQL refuses with `must be owner of extension documentdb`. Inside the container:
-`docker exec <container> psql -X -p 9712 -h localhost -U documentdb -d postgres -c "..."`. Upstream
-ships no downgrade scripts, so an older image on an updated catalog is unsupported. If you may need
-to go back, pin the older version with `WithDocumentDBVersion(...)` or keep a copy of the volume.
+`docker exec <container> psql -X -p 9712 -h localhost -U documentdb -d postgres -c "..."`. This
+update is one way too.
 
-This still applies to `1.0.0`, which ships it as a known issue
-([documentdb#773](https://github.com/documentdb/documentdb/issues/773)). Until the catalog is
-updated, commands that need `1.0.0` catalog objects can fail, for example with `InternalError`.
-
-A `1.0.0` image also refuses a data directory whose `postmaster.pid` it cannot vouch for. Images
-up to `0.114.0` leave one behind on every stop, because they never stop PostgreSQL, and `0.116.0`
-or `0.117.0` leave one after a crash or a `docker kill`. The container exits with
+From `1.0.0` the image also refuses a data directory whose `postmaster.pid` it cannot vouch for.
+Images up to `0.114.0` leave one behind on every stop, because they never stop PostgreSQL, and
+`0.116.0` or `0.117.0` leave one after a crash or a `docker kill`. The container exits with
 `postmaster.pid exists ... Refusing to start`. Once nothing else uses the volume, start it once with
 `.WithEnvironment("DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID", "true")`, then remove that line:
 while it is set, the image skips this check on every start.
@@ -541,11 +548,14 @@ default image. Gateways through `0.113.0` consume neither variable for verbosity
 `WithLogLevel(...)` remains a verbosity no-op on those images.
 
 `LOG_LEVEL` is retained to preserve the Local entrypoint contract: the entrypoint validates its six
-legal values, but no Local image uses it to select gateway verbosity. Both variables receive the
-same lowercase public-API value. In particular, `Quiet` remains `quiet` and becomes newly effective
-on `0.114.0` and later. Upstream tracing does not define `quiet` as a level; it currently parses the
-value as an unmatched tracing target, which suppresses gateway output. That preserves the existing
-Aspire API contract, but the mechanism depends on upstream tracing-filter semantics.
+legal values. Before `1.2.0` no Local image uses it to select gateway verbosity; from `1.2.0` the
+entrypoint copies `LOG_LEVEL` (or `--log-level`) into `DOCUMENTDB_LOG_LEVEL` only when that is
+unset, which this API never leaves it. Both variables receive the same lowercase public-API value.
+In particular, `Quiet` remains `quiet` and becomes newly effective on `0.114.0` and later. Upstream
+tracing does not define `quiet` as a level; it currently parses the value as an unmatched tracing
+target, which suppresses all gateway output, errors included. The image's own `--log-level quiet`
+keeps errors from `1.2.0`, but `WithLogLevel(DocumentDBLogLevel.Quiet)` does not. That preserves the
+existing Aspire API contract, but the mechanism depends on upstream tracing-filter semantics.
 
 ```csharp
 var server = builder.AddDocumentDB("documentdb")
@@ -601,14 +611,14 @@ var server = builder.AddDocumentDB("documentdb")
                     .WithoutExtendedRum();
 ```
 
-This sets `DISABLE_EXTENDED_RUM=true` on the container. It only takes effect from v0.111-0 through v0.114-0; older images ignore the variable. From `0.116.0` the image installs `documentdb_extended_rum` on a new data volume regardless, and `1.0.0` also logs a deprecation warning.
+This sets `DISABLE_EXTENDED_RUM=true` on the container. It only takes effect from v0.111-0 through v0.114-0; older images ignore the variable. From `0.116.0` the image installs `documentdb_extended_rum` on a new data volume regardless, and from `1.0.0` it also logs a deprecation warning.
 
 ## WithoutUsageTelemetry
 
 From `1.0.0` the `documentdb-local` image sends usage telemetry by default: its version, platform
 and CPU architecture at startup and then hourly, to an analytics provider. The receiving service
 also observes the deployment's network address, so the upstream
-[privacy statement](https://github.com/documentdb/documentdb/blob/v1.0-0/documentdb-local/PRIVACY.md) says not to assume
+[privacy statement](https://github.com/documentdb/documentdb/blob/v1.2-0/documentdb-local/PRIVACY.md) says not to assume
 it is anonymous. This package leaves the image default as it is. To turn it off:
 
 ```csharp
@@ -995,7 +1005,7 @@ var server = builder.AddDocumentDB("documentdb")
 ```
 
 > [!WARNING]
-> Combining `.WithEnvironment("TLS_MODE", "requireTLS")` with `UseTls(false)` is self-contradictory: the generated connection string omits `tls=true` while the container rejects plain connections, so health checks and client connections will fail. `TLS_MODE=disabled` behaves identically to `allowTLS` — the gateway has no plain-only mode — and the container entrypoint prints a warning when it is used. The value is case-sensitive and must be exactly `allowTLS`, `requireTLS`, or `disabled`; the entrypoint exits with an error on anything else (for example `requiretls`), so the container fails at startup.
+> Combining `.WithEnvironment("TLS_MODE", "requireTLS")` with `UseTls(false)` is self-contradictory: the generated connection string omits `tls=true` while the container rejects plain connections, so health checks and client connections will fail. `TLS_MODE=disabled` behaves identically to `allowTLS` — the gateway has no plain-only mode — and the container entrypoint prints a warning when it is used. The value is case-sensitive and must be exactly `allowTLS`, `requireTLS`, or `disabled`; the entrypoint exits with an error on anything else (for example `requiretls`), so the container fails at startup. From `1.2.0` that includes an empty value and a comma-separated list such as `allowTLS,requireTLS`, which older images started without enforcing TLS.
 
 ## AllowInsecureTls
 
@@ -1026,6 +1036,9 @@ var server = builder.AddDocumentDB("documentdb")
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `version` | `DocumentDBVersion` | (required) | One of the supported versions enumerated by `DocumentDBVersion`. |
+
+Pinning `V1_0_0` also keeps a persisted data directory on `1.0.0`: the first `1.2.0` start updates
+it one way. See [Moving persisted data to a newer image](#moving-persisted-data-to-a-newer-image).
 
 ## WithPostgresVersion
 
@@ -1159,7 +1172,7 @@ You can enumerate the full list at runtime via `DocumentDBVersions.All`, and rea
 
 | Symbol | Notes |
 |---|---|
-| `enum DocumentDBVersion` | Curated members like `V0_116_0`, `V0_117_0`, `V1_0_0`. Stable forever once shipped. |
+| `enum DocumentDBVersion` | Curated members like `V0_117_0`, `V1_0_0`, `V1_2_0`. Stable forever once shipped. |
 | `enum DocumentDBPostgresVersion` | `Pg15`, `Pg16`, `Pg17`, `Pg18`. Default `Pg17`. `Pg18` requires DocumentDB `0.114.0` or newer — enforced against the image that will actually run, at startup and again at container creation and manifest serialization, so an unpublished combination fails with an actionable message. |
 | `DocumentDBVersions.All` | All known version strings, ascending semver. |
 | `DocumentDBVersions.Latest` | The newest version known to *this build* of the package. |
@@ -1169,8 +1182,9 @@ You can enumerate the full list at runtime via `DocumentDBVersions.All`, and rea
 Aspire's framework `WithImageTag` is the free-form escape hatch. Use it to pin to a brand-new upstream release this package has not been updated to know about, or to a custom build:
 
 ```csharp
+// A package built before 1.2.0 can run it this way.
 var server = builder.AddDocumentDB("documentdb")
-                    .WithImageTag("pg17-1.1.0");
+                    .WithImageTag("pg17-1.2.0");
 ```
 
 ### Precedence (last-call-wins)
@@ -1180,13 +1194,13 @@ var server = builder.AddDocumentDB("documentdb")
 ```csharp
 // Final tag is "pg17-1.0.0" -- the typed call wins because it came last.
 builder.AddDocumentDB("documentdb")
-       .WithImageTag("pg15-1.1.0")
+       .WithImageTag("pg15-1.2.0")
        .WithDocumentDBVersion(DocumentDBVersion.V1_0_0);
 
-// Final tag is "pg17-1.1.0" -- the free-form call wins because it came last.
+// Final tag is "pg17-1.2.0" -- the free-form call wins because it came last.
 builder.AddDocumentDB("documentdb")
        .WithDocumentDBVersion(DocumentDBVersion.V1_0_0)
-       .WithImageTag("pg17-1.1.0");
+       .WithImageTag("pg17-1.2.0");
 ```
 
 ### How the image is recognised
@@ -1373,11 +1387,11 @@ The extension passes these environment variables to the DocumentDB container:
 | Variable | Value | Purpose |
 |---|---|---|
 | `USERNAME` | The configured username | Container creates this user on startup |
-| `PASSWORD` | The configured password | Password for the created user |
+| `PASSWORD` | The configured password | Password for the created user. From `1.2.0` the image refuses to start without one |
 | `DATA_PATH` | Path inside the container for the mounted data directory | Set by `WithDataVolume` and `WithDataBindMount`; can also be set directly with `WithEnvironment("DATA_PATH", ...)`, in which case the last caller wins and the storage guards follow it. The integration rewrites the value to its canonical form before the container receives it. When nothing sets it — or it is set empty — the container uses its default `/data`, which is an anonymous volume from `0.116.0` and a container-layer directory before that |
 | `INIT_DATA` | `false` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `DOCUMENTDB_LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Gateway tracing filter set by `WithLogLevel(...)` and consumed in DocumentDB `0.114.0`+ |
-| `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Retained for the Local entrypoint's value-validation contract; not consumed by a Local gateway for verbosity |
+| `LOG_LEVEL` | `quiet`, `error`, `warn`, `info`, `debug`, or `trace` | Retained for the Local entrypoint's value-validation contract; from `1.2.0` the entrypoint copies it into `DOCUMENTDB_LOG_LEVEL` only when that is unset |
 | `INIT_DATA_PATH` | `/init_doc_db.d` | Set by `WithInitData(...)` |
 | `SKIP_INIT_DATA` | `true` | Set by `WithInitData(...)` and `WithoutSampleData()` |
 | `CERT_PATH` | Container path of the mounted certificate file | Set by `WithTlsCertificate(...)` |

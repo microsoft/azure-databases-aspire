@@ -107,7 +107,7 @@ manifest is written from the model as usual.
 **Symptom:** `UseTls(false)` is set, but the client or health check cannot connect to the container.
 
 **Causes and solutions:**
-1. **Container image is older than `0.114.0`.** Images up to and including `0.113.0` always enforced TLS on the gateway and rejected plain connections, regardless of the `TLS_MODE` setting. Use the default (`1.0.0`) image tag, another `0.114.0` or newer image, or keep TLS enabled in the connection string.
+1. **Container image is older than `0.114.0`.** Images up to and including `0.113.0` always enforced TLS on the gateway and rejected plain connections, regardless of the `TLS_MODE` setting. Use the default (`1.2.0`) image tag, another `0.114.0` or newer image, or keep TLS enabled in the connection string.
 2. **`TLS_MODE` is set to `requireTLS`.** This makes the container reject plain connections by design, which contradicts `UseTls(false)`. Remove the environment variable to fall back to the default `allowTLS` (accepts both plain and TLS connections), or re-enable TLS with `UseTls(true)`.
 
    ```csharp
@@ -117,7 +117,7 @@ manifest is written from the model as usual.
    ```
 
    `TLS_MODE=disabled` is not a plain-only mode; the gateway treats it exactly like `allowTLS` and the entrypoint logs a warning.
-3. **`TLS_MODE` is misspelled.** The value is case-sensitive (`allowTLS`, `requireTLS`, `disabled`). The entrypoint rejects anything else and exits, so the container never starts — check the container logs for the rejected value.
+3. **`TLS_MODE` is misspelled.** The value is case-sensitive (`allowTLS`, `requireTLS`, `disabled`). The entrypoint rejects anything else and exits, so the container never starts — check the container logs for the rejected value. From `1.2.0` an empty `TLS_MODE` and a comma-separated list such as `allowTLS,requireTLS` are rejected too.
 
 ### Connection refused / timeout
 
@@ -385,17 +385,29 @@ Or the application fails to start with an `InvalidOperationException` saying two
 
 ### "postmaster.pid exists ... Refusing to start" after an upgrade
 
-DocumentDB `1.0.0` will not remove a `postmaster.pid` it cannot prove is stale. Images up to
+From `1.0.0` DocumentDB will not remove a `postmaster.pid` it cannot prove is stale. Images up to
 `0.114.0` leave one behind on every stop, and `0.116.0` or `0.117.0` when killed rather than
 stopped. See
 [Moving persisted data to a newer image](configuration.md#moving-persisted-data-to-a-newer-image)
-for the one-time override, and update the extension catalog while you are there.
+for the one-time override.
+
+### "Updating the DocumentDB extensions on this data volume"
+
+From `1.2.0` the image logs this when it starts on a data directory from an older release, and
+updates the extensions before the gateway starts. The update is one way: `1.0.0` and older images do
+not work on the directory afterwards. To stay on `1.0.0`, pin `DocumentDBVersion.V1_0_0`, or copy
+the volume before the first `1.2.0` start. See
+[Moving persisted data to a newer image](configuration.md#moving-persisted-data-to-a-newer-image).
+
+If the update fails, the container exits with `Error: updating the DocumentDB extensions failed and
+was rolled back; the data volume is unchanged.` The reason is in `pglog.log` in the data directory.
+Nothing was changed, so the version that created the data still serves it.
 
 ### Read-only data volume or bind mount is rejected
 
 **Symptom:** `WithDataVolume(isReadOnly: true)` or `WithDataBindMount(..., isReadOnly: true)` throws an `ArgumentException`; a read-only mount added with the raw `WithVolume`/`WithBindMount` APIs fails the resource start with an `InvalidOperationException`.
 
-**Cause:** DocumentDB cannot run against a read-only data directory. The entrypoint takes ownership of it, and `initdb` must change its permissions before PostgreSQL can create the cluster or write WAL. Allowed through, `1.0.0` stops at once: `Error: cannot set permissions on data directory /data`, or `chown: changing ownership of '/data': Read-only file system` when the directory belongs to another user. Older images log `chown: changing ownership of '/data': Read-only file system` and `initdb: error: could not change permissions of directory "/data": Read-only file system` inside interleaved log streams, then waits a full minute before exiting with the misleading `PostgreSQL failed to start within 60 seconds` banner.
+**Cause:** DocumentDB cannot run against a read-only data directory. The entrypoint takes ownership of it, and `initdb` must change its permissions before PostgreSQL can create the cluster or write WAL. Allowed through, from `1.0.0` the image stops at once: `Error: cannot set permissions on data directory /data`, or `chown: changing ownership of '/data': Read-only file system` when the directory belongs to another user. Older images log `chown: changing ownership of '/data': Read-only file system` and `initdb: error: could not change permissions of directory "/data": Read-only file system` inside interleaved log streams, then waits a full minute before exiting with the misleading `PostgreSQL failed to start within 60 seconds` banner.
 
 **Solution:** Mount the data directory writable. Read-only mounts are correct for *input* only — `WithInitData(...)` mounts seed scripts read-only at `/init_doc_db.d`, and `WithTlsCertificate(...)` mounts the certificate and key read-only.
 
@@ -516,7 +528,7 @@ Warning: Directory /data exists but doesn't appear to contain a valid PostgreSQL
 Use -c flag to force cleanup and re-initialization, or specify a different directory with -d.
 ```
 
-then exits with `Error: start_oss_server.sh failed (status 1)` on `1.0.0`, or never becomes healthy and exits `1` about a minute later with `PostgreSQL failed to start within 60 seconds` on older images.
+then exits with `Error: start_oss_server.sh failed (status 1)` from `1.0.0`, or never becomes healthy and exits `1` about a minute later with `PostgreSQL failed to start within 60 seconds` on older images.
 
 **Cause:** The data directory is not empty but does not hold a PostgreSQL cluster (no `PG_VERSION` file). The container refuses to initialise over unrecognised contents rather than deleting them, and PostgreSQL never starts — so before `1.0.0` the only failure you see is the generic 60-second timeout banner. One stray file is enough. Common culprits are a `.gitkeep` committed so the empty directory survives in source control, a `.DS_Store` written by macOS Finder, or leftovers from an unrelated tool.
 
