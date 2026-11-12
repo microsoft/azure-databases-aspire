@@ -42,9 +42,7 @@ public class DocumentDBVersionSelectionTests
         { DocumentDBVersion.V0_116_0, "pg17-0.116.0" },
         { DocumentDBVersion.V0_117_0, "pg17-0.117.0" },
         { DocumentDBVersion.V1_0_0, "pg17-1.0.0" },
-#pragma warning disable CS0618 // Obsolete, but still selectable.
-        { DocumentDBVersion.V1_0_1, "pg17-1.0.1" },
-#pragma warning restore CS0618
+        { DocumentDBVersion.V1_2_0, "pg17-1.2.0" },
     };
 
     [Fact]

@@ -4022,7 +4022,7 @@ public static class DocumentDBBuilderExtensions
     /// token in that position is an operand rather than a possible <c>--data-path</c>.
     /// </summary>
     /// <remarks>
-    /// Taken from the entrypoint's own argument loop from <c>0.112.0</c> through <c>1.0.0</c>.
+    /// Taken from the entrypoint's own argument loop from <c>0.112.0</c> through <c>1.2.0</c>.
     /// <c>--toast-compression</c> exists in <c>0.116.0</c> and from <c>1.0.0</c>, and
     /// <c>--usage-telemetry</c> from <c>1.0.0</c>; older images reject them as unexpected
     /// arguments, so keeping them here only affects which token is read as the operand.
@@ -4168,9 +4168,9 @@ public static class DocumentDBBuilderExtensions
     /// Starting with DocumentDB <c>0.114.0</c>, the gateway reads
     /// <c>DOCUMENTDB_LOG_LEVEL</c> as a tracing filter. This makes the API observably effective on
     /// the current default image. The legacy <c>LOG_LEVEL</c> variable is also set
-    /// because the Local image entrypoint validates that contract, although no Local image uses it
-    /// to select gateway verbosity. Images through <c>0.113.0</c> therefore treat this API as a
-    /// verbosity no-op.
+    /// because the Local image entrypoint validates that contract; from <c>1.2.0</c> the entrypoint
+    /// copies it into <c>DOCUMENTDB_LOG_LEVEL</c> only when neither that nor <c>RUST_LOG</c> is set,
+    /// and this method always sets <c>DOCUMENTDB_LOG_LEVEL</c>. Images through <c>0.113.0</c> treat this API as a verbosity no-op.
     /// <see cref="DocumentDBLogLevel.Quiet"/> remains mapped to <c>quiet</c> for API compatibility.
     /// It is not a tracing level: on <c>0.114.0</c> and later it becomes newly effective because
     /// the gateway parses it as an unmatched target directive, which suppresses gateway output but

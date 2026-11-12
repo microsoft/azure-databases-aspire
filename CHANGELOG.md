@@ -6,8 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- `DocumentDBVersion.V1_2_0` curated enum member and `DocumentDBVersions.V1_2_0 = "1.2.0"` constant. Upstream never released `1.1`, so there is intentionally no `V1_1_0` member.
+
+### Changed
+- `DocumentDBVersions.Latest` and the default `documentdb-local` image now resolve to `1.2.0` and `ghcr.io/documentdb/documentdb/documentdb-local:pg17-1.2.0`.
+- **On a persisted data directory from an older release, the `1.2.0` image updates the DocumentDB extensions when it starts, and the update is one way.** It logs `Updating the DocumentDB extensions on this data volume`; a failed update is rolled back and stops the container. Afterwards `1.0.0` and older images still start on that directory, but some commands fail. To stay on `1.0.0`, pin `WithDocumentDBVersion(DocumentDBVersion.V1_0_0)` before updating the package, or copy the volume before the first `1.2.0` start. The manual `ALTER EXTENSION ... UPDATE` step is no longer needed. Docker-backed tests cover the move from `0.114.0`, `0.116.0`, `0.117.0` and `1.0.0` to `1.2.0`. See [Moving persisted data to a newer image](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#moving-persisted-data-to-a-newer-image).
+- The `1.2.0` image refuses to start without a password (`PASSWORD` or `--password`) and keeps the `--password` value out of its process list. This package always sets `PASSWORD`, so only an empty password parameter is affected.
+- The `1.2.0` image rejects a `TLS_MODE` that is set but empty, or a comma-separated list such as `allowTLS,requireTLS`; older images started both without enforcing TLS. Comma-separated `LOG_LEVEL` and `DOCUMENTDB_TOAST_COMPRESSION` values are rejected too.
+- In `1.2.0`, `--log-level` and `LOG_LEVEL` set the gateway's log level, and `quiet` still logs errors. `WithLogLevel(...)` also sets `DOCUMENTDB_LOG_LEVEL`, which takes precedence, so it behaves as before: its `Quiet` hides errors too.
+- The `1.2.0` gateway renames its `db.client.*` metrics to `docdb.gateway.*`, for example `db.client.operations` to `docdb.gateway.operations` and `db.client.operation.duration` to `docdb.gateway.operation.duration`; `gateway.starts` keeps its name. Dashboards or alerts built on the old names need updating. It also adds `docdb.gateway.session.*`, `docdb.gateway.transaction.*`, `docdb.gateway.cursor.*` and `docdb.gateway.authentication.attempts`.
+- Upstream server changes in `1.2.0` that apply by default include `$dateTrunc` with `unit: "day"` computed with PostgreSQL `date_bin`, duplicate-key errors that descending unique indexes used to miss for null or missing values, rejection of `dropUser` and `updateUser` names of 64 bytes or more, and an explicit `simple` collation treated as no collation. The new collation support in `distinct`, `findAndModify` and updates returns error 115 until `documentdb_core.enableCollation` is on. See the [upstream release notes](https://github.com/documentdb/documentdb/releases/tag/v1.2-0).
+- `--enable-telemetry` has no effect in `1.2.0`, as this package already documents for the obsolete `WithTelemetry()`. Usage telemetry is still on by default, and `WithoutUsageTelemetry()` still turns it off.
+
 <!-- auto-generated:documentdb-versions-start -->
-_No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
+### Added (auto-detected upstream DocumentDB versions)
+
+- DocumentDB `1.2.0` upstream release detected on 2026-11-12 (container tags `pg15-1.2.0`, `pg16-1.2.0`, `pg17-1.2.0`, `pg18-1.2.0`).
 <!-- auto-generated:documentdb-versions-end -->
 
 ### Security

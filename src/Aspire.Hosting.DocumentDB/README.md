@@ -110,7 +110,8 @@ var db = documentdb.AddDatabase("mydb");
 `WithLogLevel(...)` becomes observably effective on DocumentDB `0.114.0` and later through
 `DOCUMENTDB_LOG_LEVEL`, including the current default image. On images through `0.113.0`,
 neither variable controls gateway verbosity; `LOG_LEVEL` is retained because the Local entrypoint
-validates its six-value contract, not because a Local image uses it to select gateway verbosity.
+validates its six-value contract. From `1.2.0` the entrypoint copies it into `DOCUMENTDB_LOG_LEVEL`
+only when neither that nor `RUST_LOG` is set, and `WithLogLevel(...)` always sets `DOCUMENTDB_LOG_LEVEL`.
 `Quiet` remains mapped to `quiet` for API compatibility and becomes newly effective on `0.114.0`
 and later. Because upstream tracing has no `quiet` level, current gateways suppress output by parsing
 it as an unmatched tracing target; that behavior depends on upstream filter semantics.
@@ -143,7 +144,7 @@ architecture at startup and then hourly. The receiving service also sees your ne
 don't treat it as anonymous. This package leaves the image default on. Turn it off with
 `.WithoutUsageTelemetry()`, or set `DO_NOT_TRACK=1` or `NO_ANALYTICS=1` on the resource with
 `.WithEnvironment(...)`. Variables set in your shell or CI job don't reach the container. See the
-upstream [privacy statement](https://github.com/documentdb/documentdb/blob/v1.0-0/documentdb-local/PRIVACY.md).
+upstream [privacy statement](https://github.com/documentdb/documentdb/blob/v1.2-0/documentdb-local/PRIVACY.md).
 
 ### Connection strings
 
@@ -181,6 +182,12 @@ there is no such marker: the requested initialization runs on every container st
 scripts used with persisted storage must be idempotent. See the
 [configuration reference](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#storage-requirements)
 for the full rules.
+
+Updating this package moves a persisted data directory to the new default image. From `1.2.0` the
+image updates the DocumentDB extensions in it when it starts, and that is one way: `1.0.0` and
+older images still start on the directory afterwards, but some commands fail. To stay on `1.0.0`, pin
+`.WithDocumentDBVersion(DocumentDBVersion.V1_0_0)`. See
+[Moving persisted data to a newer image](https://github.com/microsoft/azure-databases-aspire/blob/main/docs/configuration.md#moving-persisted-data-to-a-newer-image).
 
 `WithDataBindMount()` is not an equivalent choice on Docker Desktop. Its host file sharing does
 not apply ownership changes to the mounted path in time for PostgreSQL's data-directory check, so

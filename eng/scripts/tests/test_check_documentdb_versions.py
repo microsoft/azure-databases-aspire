@@ -635,7 +635,11 @@ class ParseKnownVersionsTests(ScriptTestCase):
         known = script.parse_known_versions(REAL_VERSIONS_FILE)
 
         self.assertIn(_semver("0.114.0"), known)
-        self.assertEqual(sorted(known.values()), list(range(1, len(known) + 1)))
+        # Values ascend with the version and are never reused, so a removed member leaves a gap.
+        values = [known[version] for version in sorted(known)]
+        self.assertEqual(values, sorted(set(values)))
+        members = re.findall(r"^\s+V\d+_\d+_\d+ = \d+,$", REAL_VERSIONS_FILE.read_text(encoding="utf-8"), re.M)
+        self.assertEqual(len(known), len(members))
 
     def test_member_without_numeric_value_is_a_hard_error(self):
         original = REAL_VERSIONS_FILE.read_text(encoding="utf-8")

@@ -36,7 +36,7 @@ namespace Aspire.Hosting.DocumentDB.Tests;
 [Collection(DocumentDBFeatureMatrixAppHostCollection.Name)]
 public class DocumentDBFeatureMatrixEndToEndTests
 {
-    private const string ReleasedVersion = DocumentDBVersions.V1_0_0;
+    private const string ReleasedVersion = DocumentDBVersions.V1_2_0;
     private const string QuietWindowControlMarker = "[ASPIRE-TEST] quiet-window-control";
     private static readonly Regex GatewayDebugInsertRegex = new(
         @"DEBUG[^\r\n]*documentdb_api\.insert",
@@ -340,10 +340,11 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
     [Theory]
     [Trait("Shard", "2")]
-    // 0.116.0 compressed large values with lz4, which 0.114.0 and 0.117.0 did not default to.
+    // 0.116.0 and 1.0.0 compressed large values with lz4, which 0.114.0 and 0.117.0 did not default to.
     [InlineData("0.114.0", "pglz")]
     [InlineData("0.116.0", "lz4")]
     [InlineData("0.117.0", "pglz")]
+    [InlineData("1.0.0", "lz4")]
     public async Task PersistedPg17DataUpgradesToTheReleasedVersion(string sourceVersion, string sourceCompression)
     {
         RequireDocker();
@@ -391,8 +392,8 @@ public class DocumentDBFeatureMatrixEndToEndTests
                 await app.StopAsync(cts.Token);
             }
 
-            // Up to 0.114.0 the image never stops PostgreSQL, so 1.0.0 refuses the postmaster.pid it
-            // leaves until the documented override removes it.
+            // Up to 0.114.0 the image never stops PostgreSQL, and from 1.0.0 the image refuses the
+            // postmaster.pid it leaves until the documented override removes it.
             using (var scenario = new EnvironmentScope(
                        (AppHost.ScenarioEnvironmentVariable, AppHost.DataVolumeScenario),
                        (AppHost.VolumeNameEnvironmentVariable, volumeName),
@@ -411,23 +412,25 @@ public class DocumentDBFeatureMatrixEndToEndTests
                     new BsonDocument { ["_id"] = "post-upgrade", ["version"] = ReleasedVersion },
                     cancellationToken: cts.Token);
 
-                // The image never updates the SQL catalog of an existing cluster, so the new
-                // binaries serve the old catalog until someone runs ALTER EXTENSION ... UPDATE.
-                // That is the step the docs tell users to take; prove it works on real data.
+                // From 1.2.0 the image updates the extensions of an existing cluster before the
+                // gateway starts, so nobody has to run ALTER EXTENSION ... UPDATE any more.
                 var appModel = app.Services.GetRequiredService<DistributedApplicationModel>();
                 var server = Assert.Single(Snapshot<DocumentDBServerResource>(appModel.Resources));
                 var containerId = await GetContainerIdAsync(app, server.Name, cts.Token);
-                Assert.Equal(
-                    ToCatalogVersion(sourceVersion),
-                    await QueryBundledPostgresAsync(containerId, "SELECT extversion FROM pg_extension WHERE extname = 'documentdb'"));
-
-                await QueryBundledPostgresAsync(
-                    containerId,
-                    "ALTER EXTENSION documentdb_core UPDATE; ALTER EXTENSION documentdb UPDATE; " +
-                    "ALTER EXTENSION documentdb_extended_rum UPDATE;");
+                var logs = await WaitForContainerLogAsync(containerId, "DocumentDB extensions updated.", cts.Token);
+                Assert.Contains(
+                    $"documentdb {ToCatalogVersion(sourceVersion)} -> {ToCatalogVersion(ReleasedVersion)}",
+                    logs,
+                    StringComparison.Ordinal);
                 Assert.Equal(
                     ToCatalogVersion(ReleasedVersion),
                     await QueryBundledPostgresAsync(containerId, "SELECT extversion FROM pg_extension WHERE extname = 'documentdb'"));
+                Assert.Equal(
+                    "0",
+                    await QueryBundledPostgresAsync(
+                        containerId,
+                        "SELECT count(*) FROM pg_extension e JOIN pg_available_extensions a ON a.name = e.extname " +
+                        "WHERE e.extname LIKE 'documentdb%' AND e.extversion <> a.default_version"));
 
                 await AssertPayloadAsync(collection, payload, cts.Token);
                 Assert.Equal(
@@ -720,7 +723,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [Theory]
     [Trait("Shard", "3")]
     [InlineData("pg17-0.114.0", "pg17-0.114.0")]
-    [InlineData(null, "pg17-1.0.0")]
+    [InlineData(null, "pg17-1.2.0")]
     public async Task DebugLogLevelEmitsGatewayOutput(string? imageTag, string expectedImageTag)
     {
         RequireDocker();
@@ -886,15 +889,16 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
             // The round trip above is what produces the per-operation metrics, and they have to
             // arrive under the configured service identity, not merely somewhere in the file.
+            // 1.2.0 renamed the db.client.* metrics to docdb.gateway.*.
             var metrics = await WaitForFileContainingAsync(
                 Path.Combine(otelOutputPath, "metrics.json"),
-                "db.client.documents.inserted",
+                "docdb.gateway.documents.inserted",
                 cts.Token);
             var exported = ReadExportedMetrics(metrics, "aspire-documentdb-e2e", "1.2.3");
             Assert.Equal("sum", exported.GetValueOrDefault("gateway.starts"));
-            Assert.Equal("sum", exported.GetValueOrDefault("db.client.operations"));
-            Assert.Equal("sum", exported.GetValueOrDefault("db.client.documents.inserted"));
-            Assert.Equal("sum", exported.GetValueOrDefault("db.client.documents.deleted"));
+            Assert.Equal("sum", exported.GetValueOrDefault("docdb.gateway.operations"));
+            Assert.Equal("sum", exported.GetValueOrDefault("docdb.gateway.documents.inserted"));
+            Assert.Equal("sum", exported.GetValueOrDefault("docdb.gateway.documents.deleted"));
         }
         finally
         {
@@ -1748,7 +1752,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             var exported = File.Exists(metricsPath) ? await File.ReadAllTextAsync(metricsPath, cts.Token) : string.Empty;
             Assert.False(
                 exported.Contains("gateway.starts", StringComparison.Ordinal) ||
-                exported.Contains("db.client.operations", StringComparison.Ordinal),
+                exported.Contains("docdb.gateway.operations", StringComparison.Ordinal),
                 "Metrics were exported even though WithOpenTelemetryMetrics(enabled: false) was configured.");
 
             // An absent file only means "off" if the collector was there to receive: the same
@@ -1881,7 +1885,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
     [InlineData("pg17-0.116.0", "lz4")]
     [InlineData("pg17-0.117.0", "pglz")]
     [InlineData("pg17-1.0.0", "lz4")]
-    [InlineData("pg17-1.0.1", "lz4")]
+    [InlineData("pg17-1.2.0", "lz4")]
     public async Task PostgresEndpointReportsTheImageToastCompressionDefault(string imageTag, string expected)
     {
         await AssertPostgresExtrasAsync(imageTag, expected);
