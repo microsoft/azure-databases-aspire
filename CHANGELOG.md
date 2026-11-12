@@ -7,7 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 <!-- auto-generated:documentdb-versions-start -->
-_No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
+### Added (auto-detected upstream DocumentDB versions)
+
+- DocumentDB `1.2.0` upstream release detected on 2026-11-12 (container tags `pg15-1.2.0`, `pg16-1.2.0`, `pg17-1.2.0`, `pg18-1.2.0`).
 <!-- auto-generated:documentdb-versions-end -->
 
 ### Security
