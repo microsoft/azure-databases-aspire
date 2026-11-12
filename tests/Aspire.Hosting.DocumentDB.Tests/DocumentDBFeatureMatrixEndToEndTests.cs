@@ -889,15 +889,16 @@ public class DocumentDBFeatureMatrixEndToEndTests
 
             // The round trip above is what produces the per-operation metrics, and they have to
             // arrive under the configured service identity, not merely somewhere in the file.
+            // 1.2.0 renamed the db.client.* metrics to docdb.gateway.*.
             var metrics = await WaitForFileContainingAsync(
                 Path.Combine(otelOutputPath, "metrics.json"),
-                "db.client.documents.inserted",
+                "docdb.gateway.documents.inserted",
                 cts.Token);
             var exported = ReadExportedMetrics(metrics, "aspire-documentdb-e2e", "1.2.3");
             Assert.Equal("sum", exported.GetValueOrDefault("gateway.starts"));
-            Assert.Equal("sum", exported.GetValueOrDefault("db.client.operations"));
-            Assert.Equal("sum", exported.GetValueOrDefault("db.client.documents.inserted"));
-            Assert.Equal("sum", exported.GetValueOrDefault("db.client.documents.deleted"));
+            Assert.Equal("sum", exported.GetValueOrDefault("docdb.gateway.operations"));
+            Assert.Equal("sum", exported.GetValueOrDefault("docdb.gateway.documents.inserted"));
+            Assert.Equal("sum", exported.GetValueOrDefault("docdb.gateway.documents.deleted"));
         }
         finally
         {
@@ -1751,7 +1752,7 @@ public class DocumentDBFeatureMatrixEndToEndTests
             var exported = File.Exists(metricsPath) ? await File.ReadAllTextAsync(metricsPath, cts.Token) : string.Empty;
             Assert.False(
                 exported.Contains("gateway.starts", StringComparison.Ordinal) ||
-                exported.Contains("db.client.operations", StringComparison.Ordinal),
+                exported.Contains("docdb.gateway.operations", StringComparison.Ordinal),
                 "Metrics were exported even though WithOpenTelemetryMetrics(enabled: false) was configured.");
 
             // An absent file only means "off" if the collector was there to receive: the same
