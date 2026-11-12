@@ -45,6 +45,7 @@ public class DocumentDBVersionSelectionTests
 #pragma warning disable CS0618 // Obsolete, but still selectable.
         { DocumentDBVersion.V1_0_1, "pg17-1.0.1" },
 #pragma warning restore CS0618
+        { DocumentDBVersion.V1_2_0, "pg17-1.2.0" },
     };
 
     [Fact]

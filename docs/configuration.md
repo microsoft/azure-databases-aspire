@@ -1349,7 +1349,7 @@ guarantee every publisher matches the RFC 3986 escaping described above.
 | Setting | Default Value |
 |---|---|
 | Container image | `ghcr.io/documentdb/documentdb/documentdb-local` |
-| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-1.0.0`) |
+| Image tag | `pg17-{DocumentDBVersions.Latest}` (currently `pg17-1.2.0`) |
 | Image pull policy | `Always` for the official image; see [Supported versions](#supported-versions) |
 | DocumentDB version | `DocumentDBVersions.Latest` (the newest version known to this build) |
 | PostgreSQL backend | `DocumentDBPostgresVersion.Pg17` |
