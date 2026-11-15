@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 _No upstream DocumentDB versions detected since the last release. This block is rewritten in place by `eng/scripts/check-documentdb-versions.py`; reset it to this line when cutting a release, after moving its contents into the dated section below._
 <!-- auto-generated:documentdb-versions-end -->
 
+### Changed
+- The package now depends on `MongoDB.Driver` `3.9.0` (was `3.8.1`) and `Microsoft.Extensions.*` `10.0.15` (was `10.0.14`).
+
 ## [1.2.0] - 2026-11-12
 
 ### Added
